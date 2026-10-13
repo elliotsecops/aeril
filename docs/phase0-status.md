@@ -40,17 +40,23 @@ Leyenda:
 
 ## Presupuestos
 
-| Métrica | Límite | Medición | Estado |
+Medición: 2026-10-13, ThinkPad X1 Carbon 6th (i7-8550U, 15.4 GiB, NVMe
+`/dev/nvme0n1p5`), build release (`lto=thin`, `strip=symbols`,
+`codegen-units=1`), dataset sintético completo (100 threads, 100.000 eventos,
+10 diffs por thread, DB de 84.1 MB), page cache **warm** del host (declarado;
+no se vació la caché del SO).
+
+| Métrica | Límite | Medido | Estado |
 |---|---|---|---|
-| Binario release stripped | ≤ 30 MB (decimal) | ver handoff §Mediciones | ver handoff |
-| RSS idle TUI | ≤ 50 MB | ídem | ídem |
-| Arranque p95 (entrada procesada, desde fuera) | ≤ 300 ms | ídem | ídem |
-| Dependencias de runtime | 0 de app | `ldd` con whitelist | ídem |
+| Binario release stripped | ≤ 30 MB (decimal) | **5.2 MB** | ✅ PASS |
+| RSS idle TUI (5 s, dataset completo) | ≤ 50 MB | **6.1 MB** | ✅ PASS |
+| Arranque p95 (entrada procesada, externo, n=30) | ≤ 300 ms | **16.9 ms** (p50 13.7, max 17.0) | ✅ PASS |
+| Dependencias de runtime | solo ABI del OS | linux-vdso, libc, libm, libgcc_s, ld-linux + **libz del sistema** (declarada) | ✅ PASS |
+| Caché residente por thread | ≤ 10 MiB | no medido como métrica aislada: la vista carga ≤100 eventos y el RSS total idle es 6.1 MB | ⚠️ **N** |
 | 5 agentes ≤ 500 MB | — | **UNVERIFIED**: Fase 0 mide 1 agente; sin claim | **N** |
 
-Condiciones de caché y dataset declaradas en `make budget-*` (ver
-`bench-data/*.json` tras correrlos). Los números son de esta máquina
-(ThinkPad X1C6, i7-8550U, 16 GB, NVMe) con page cache **warm** del host.
+Reproducible con `make budget` (ver `bench-data/*.json` y
+`docs/phase0-engineering-handoff.md` §Mediciones).
 
 ## Decisiones registradas (desviaciones o ajustes de Fase 0)
 

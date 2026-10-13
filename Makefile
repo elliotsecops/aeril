@@ -14,7 +14,7 @@ DATA_DIR ?= bench-data
 BENCH_DIR := $(DATA_DIR)/bench
 JOBS ?= 2
 
-.PHONY: all build test fmt clippy bench-seed budget budget-size budget-deps \
+.PHONY: all build test fmt clippy budget budget-size budget-deps \
         budget-mem budget-start budget-scale clean
 
 all: build
@@ -31,12 +31,17 @@ fmt:
 clippy:
 	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) clippy --all-targets -- -D warnings
 
-bench-seed: $(BIN)
-	@mkdir -p $(DATA_DIR)
-	$(BIN) bench seed --dir $(BENCH_DIR) --threads 100 --events 1000 --diffs 10 | tee $(DATA_DIR)/seed.json
-
 $(BIN):
 	$(MAKE) build
+
+# El seed corre una sola vez por binario (stamp): re-seed si el binario cambió.
+BENCH_STAMP := $(DATA_DIR)/.seeded
+bench-seed: $(BENCH_STAMP)
+
+$(BENCH_STAMP): $(BIN)
+	@mkdir -p $(DATA_DIR)
+	$(BIN) bench seed --dir $(BENCH_DIR) --threads 100 --events 1000 --diffs 10 | tee $(DATA_DIR)/seed.json
+	@touch $(BENCH_STAMP)
 
 budget-size: $(BIN)
 	@scripts/budget-size.sh $(BIN)
