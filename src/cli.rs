@@ -37,11 +37,11 @@ fn parse(args: &[String]) -> Parsed {
         }
         if let Some(key) = a.strip_prefix("--") {
             p.has.insert(key.to_string());
-            if let Some(next) = it.peek() {
-                if !next.starts_with("--") {
-                    p.flags.insert(key.to_string(), (*next).clone());
-                    it.next();
-                }
+            if let Some(next) = it.peek()
+                && !next.starts_with("--")
+            {
+                p.flags.insert(key.to_string(), (*next).clone());
+                it.next();
             }
         } else {
             p.pos.push(a.clone());
@@ -64,10 +64,10 @@ impl Parsed {
 }
 
 fn default_data_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("AERIL_DATA_DIR") {
-        if !d.is_empty() {
-            return PathBuf::from(d);
-        }
+    if let Ok(d) = std::env::var("AERIL_DATA_DIR")
+        && !d.is_empty()
+    {
+        return PathBuf::from(d);
     }
     let base = std::env::var("XDG_DATA_HOME")
         .ok()

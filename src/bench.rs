@@ -45,7 +45,8 @@ pub fn seed(
                 thread_id,
                 format!("Conversación sintética {t:03}: refactor del módulo de pagos + revisión de seguridad"),
                 format!("repoid{t:04}"),
-                format!("/tmp/aeril-bench/repo-{t:03}")
+                format!("/tmp/aeril-bench/repo-{t:03}"),
+                now_base
             ],
         )?;
         for (run_id, state) in [(&run1, "completed"), (&run2, "completed")] {
@@ -135,7 +136,7 @@ pub fn seed(
         let mut i = 0u64;
         while remaining > 0 {
             match i % 10 {
-                0 | 1 | 2 | 3 | 4 => {
+                0..=4 => {
                     push(
                         &tx,
                         Some(if i % 20 < 10 { &run1 } else { &run2 }),
@@ -233,9 +234,7 @@ fn fake_patch(t: u64, d: u64) -> String {
         ));
     }
     p.push_str("     let recibo = emitir(&valor_0, &valor_1, &valor_2)?;\n");
-    p.push_str(&format!(
-        "-    Ok(recibo.legacy())\n+    Ok(recibo.validado())\n"
-    ));
+    p.push_str("-    Ok(recibo.legacy())\n+    Ok(recibo.validado())\n");
     p
 }
 

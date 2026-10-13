@@ -54,7 +54,10 @@ fn run_sin_cambios_no_publica_checkpoint() {
     );
     let run = env.run_start(&thread, "no cambies nada", &script);
     assert_eq!(run["state"], "completed");
-    assert!(run["snapshot"].is_null(), "sin cambios no hay checkpoint: {run}");
+    assert!(
+        run["snapshot"].is_null(),
+        "sin cambios no hay checkpoint: {run}"
+    );
     assert!(
         env.checkpoint_list(&thread).is_empty(),
         "no debe existir ni prepared ni ready"

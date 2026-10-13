@@ -119,10 +119,10 @@ impl App {
                 if let Ok(p) = ev.parse::<events::payload::CheckpointReady>() {
                     detail.patch = p.patch.lines().map(str::to_string).collect();
                 }
-            } else if ev.kind == events::K_COMMENT_ADDED {
-                if let Some(c) = detail.comments.iter().find(|c| c.comment_id == ev.id) {
-                    detail.patch = c.original_patch.lines().map(str::to_string).collect();
-                }
+            } else if ev.kind == events::K_COMMENT_ADDED
+                && let Some(c) = detail.comments.iter().find(|c| c.comment_id == ev.id)
+            {
+                detail.patch = c.original_patch.lines().map(str::to_string).collect();
             }
         }
         Ok(())
@@ -514,15 +514,14 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
         while let Ok(note) = app.ui_rx.try_recv() {
             app.on_note(note);
         }
-        if event::poll(Duration::from_millis(80))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key)?;
-                    if !app.input_processed {
-                        app.input_processed = true;
-                        bench::beacon("input_processed", app.t0);
-                    }
-                }
+        if event::poll(Duration::from_millis(80))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            app.on_key(key)?;
+            if !app.input_processed {
+                app.input_processed = true;
+                bench::beacon("input_processed", app.t0);
             }
         }
     }

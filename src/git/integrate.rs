@@ -125,10 +125,11 @@ pub fn fast_forward(
 
 /// Devuelve una descripción del worktree que tiene la rama chequeada, si hay.
 fn checked_out_worktree(repo: &Repository, branch: &str) -> Option<String> {
-    if let Ok(head) = repo.head() {
-        if head.is_branch() && head.shorthand().ok() == Some(branch) {
-            return Some("checkout principal".to_string());
-        }
+    if let Ok(head) = repo.head()
+        && head.is_branch()
+        && head.shorthand().ok() == Some(branch)
+    {
+        return Some("checkout principal".to_string());
     }
     if let Ok(names) = repo.worktrees() {
         for name in names.iter() {
@@ -139,10 +140,11 @@ fn checked_out_worktree(repo: &Repository, branch: &str) -> Option<String> {
             let Ok(wr) = Repository::open_from_worktree(&wt) else {
                 continue;
             };
-            if let Ok(head) = wr.head() {
-                if head.is_branch() && head.shorthand().ok() == Some(branch) {
-                    return Some(format!("worktree {name}"));
-                }
+            if let Ok(head) = wr.head()
+                && head.is_branch()
+                && head.shorthand().ok() == Some(branch)
+            {
+                return Some(format!("worktree {name}"));
             }
         }
     }

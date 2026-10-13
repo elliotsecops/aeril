@@ -269,24 +269,24 @@ impl Runner {
 
         // Feedback sin evidencia de procesamiento = fallo explícito (jamás se
         // declara entregado sin ack del backend).
-        if delivered == Some(false) {
-            if let Some(ids) = &opts.feedback_comment_ids {
-                let reason = detail
-                    .clone()
-                    .unwrap_or_else(|| "el turno no dio evidencia de procesamiento".into());
-                let _ = events::append_typed(
-                    &mut store.conn,
-                    thread_id,
-                    Some(&run.id),
-                    events::K_FEEDBACK_FAILED,
-                    "system",
-                    &payload::FeedbackFailed {
-                        comment_ids: ids.clone(),
-                        run_id: Some(run.id.clone()),
-                        reason,
-                    },
-                );
-            }
+        if delivered == Some(false)
+            && let Some(ids) = &opts.feedback_comment_ids
+        {
+            let reason = detail
+                .clone()
+                .unwrap_or_else(|| "el turno no dio evidencia de procesamiento".into());
+            let _ = events::append_typed(
+                &mut store.conn,
+                thread_id,
+                Some(&run.id),
+                events::K_FEEDBACK_FAILED,
+                "system",
+                &payload::FeedbackFailed {
+                    comment_ids: ids.clone(),
+                    run_id: Some(run.id.clone()),
+                    reason,
+                },
+            );
         }
 
         let mut snapshot: Option<checkpoint::CaptureOutcome> = None;
@@ -454,15 +454,15 @@ impl Runner {
         }
 
         // Modelo explícito del run (si el usuario lo pidió).
-        if let Some(model) = &opts.model {
-            if let Err(e) = client.session_set_model(model).await {
-                let _ = client.kill().await;
-                return TurnResult {
-                    stop_reason: None,
-                    detail: Some(format!("no se pudo fijar el modelo `{model}`: {e}")),
-                    feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
-                };
-            }
+        if let Some(model) = &opts.model
+            && let Err(e) = client.session_set_model(model).await
+        {
+            let _ = client.kill().await;
+            return TurnResult {
+                stop_reason: None,
+                detail: Some(format!("no se pudo fijar el modelo `{model}`: {e}")),
+                feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+            };
         }
 
         let stop = {
@@ -571,16 +571,14 @@ fn compose_feedback_prompt(
         ));
     }
     // Contexto: objetivo original del run anterior.
-    if let Ok(events) = events::fetch_by_kind(&store.conn, thread_id, events::K_RUN_STARTED) {
-        if let Some(goal) = events
+    if let Ok(events) = events::fetch_by_kind(&store.conn, thread_id, events::K_RUN_STARTED)
+        && let Some(goal) = events
             .last()
             .and_then(|ev| ev.parse::<payload::RunStarted>().ok())
             .map(|p| p.goal)
-        {
-            if !goal.trim().is_empty() {
-                out.push_str(&format!("\nObjetivo original del trabajo: {goal}\n"));
-            }
-        }
+        && !goal.trim().is_empty()
+    {
+        out.push_str(&format!("\nObjetivo original del trabajo: {goal}\n"));
     }
     out.push_str("\nAplicá el feedback al código del directorio de trabajo y dejalo en un estado coherente. No deshagas cambios fuera de lo señalado.\n");
     Ok(out)
@@ -602,48 +600,48 @@ struct PersistingObserver<'a> {
 
 impl PersistingObserver<'_> {
     fn flush_message(&mut self) -> Result<()> {
-        if let Some((mid, text)) = self.current_message.take() {
-            if !text.trim().is_empty() {
-                let msg = payload::AgentMessage {
-                    text: truncate(&text, 200_000),
-                    message_id: mid,
-                };
-                events::append_typed(
-                    &mut self.store.conn,
-                    &self.thread_id,
-                    Some(&self.run_id),
-                    events::K_AGENT_MESSAGE,
-                    "agent",
-                    &msg,
-                )?;
-                if let Some(tx) = &self.ui {
-                    let _ = tx.send(UiNote::Event {
-                        thread_id: self.thread_id.clone(),
-                        kind: events::K_AGENT_MESSAGE.into(),
-                    });
-                }
+        if let Some((mid, text)) = self.current_message.take()
+            && !text.trim().is_empty()
+        {
+            let msg = payload::AgentMessage {
+                text: truncate(&text, 200_000),
+                message_id: mid,
+            };
+            events::append_typed(
+                &mut self.store.conn,
+                &self.thread_id,
+                Some(&self.run_id),
+                events::K_AGENT_MESSAGE,
+                "agent",
+                &msg,
+            )?;
+            if let Some(tx) = &self.ui {
+                let _ = tx.send(UiNote::Event {
+                    thread_id: self.thread_id.clone(),
+                    kind: events::K_AGENT_MESSAGE.into(),
+                });
             }
         }
         Ok(())
     }
 
     fn mark_delivered(&mut self) -> Result<()> {
-        if let Some((ids, delivered)) = self.feedback_pending.as_mut() {
-            if !*delivered {
-                *delivered = true;
-                let payload = payload::FeedbackDelivered {
-                    comment_ids: ids.clone(),
-                    run_id: self.run_id.clone(),
-                };
-                events::append_typed(
-                    &mut self.store.conn,
-                    &self.thread_id,
-                    Some(&self.run_id),
-                    events::K_FEEDBACK_DELIVERED,
-                    "system",
-                    &payload,
-                )?;
-            }
+        if let Some((ids, delivered)) = self.feedback_pending.as_mut()
+            && !*delivered
+        {
+            *delivered = true;
+            let payload = payload::FeedbackDelivered {
+                comment_ids: ids.clone(),
+                run_id: self.run_id.clone(),
+            };
+            events::append_typed(
+                &mut self.store.conn,
+                &self.thread_id,
+                Some(&self.run_id),
+                events::K_FEEDBACK_DELIVERED,
+                "system",
+                &payload,
+            )?;
         }
         Ok(())
     }
@@ -689,10 +687,10 @@ impl TurnObserver for PersistingObserver<'_> {
                     if !is_final {
                         return Ok(());
                     }
-                    if let Some((_, last)) = self.tools.get(&tool_call_id) {
-                        if Some(last) == status.as_ref() {
-                            return Ok(());
-                        }
+                    if let Some((_, last)) = self.tools.get(&tool_call_id)
+                        && Some(last) == status.as_ref()
+                    {
+                        return Ok(());
                     }
                 }
                 let title = update

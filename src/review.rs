@@ -60,6 +60,7 @@ fn lines_range(content: &str, start: u64, end: u64) -> Option<String> {
 
 /// Agrega un comentario contra un checkpoint `ready`. Falla si el checkpoint
 /// no está listo: los comentarios solo se habilitan tras `ready`.
+#[allow(clippy::too_many_arguments)]
 pub fn add_comment(
     store: &mut Store,
     repo: &Repository,
@@ -203,14 +204,14 @@ pub fn view_comment(
 
     let mut anchored_text = None;
     let mut blob_verified = false;
-    if let Some(repo) = repo {
-        if let Some((oid, bytes)) = git::diff::file_at(repo, &ready.oid, &added.anchor.path)? {
-            let content = String::from_utf8_lossy(&bytes).into_owned();
-            if let Some(expected) = &added.anchor.after_blob_oid {
-                blob_verified = oid == *expected;
-            }
-            anchored_text = lines_range(&content, added.anchor.start_line, added.anchor.end_line);
+    if let Some(repo) = repo
+        && let Some((oid, bytes)) = git::diff::file_at(repo, &ready.oid, &added.anchor.path)?
+    {
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        if let Some(expected) = &added.anchor.after_blob_oid {
+            blob_verified = oid == *expected;
         }
+        anchored_text = lines_range(&content, added.anchor.start_line, added.anchor.end_line);
     }
 
     let state = states_for(store, thread_id)?

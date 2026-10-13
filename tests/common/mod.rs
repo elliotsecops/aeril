@@ -2,6 +2,10 @@
 //!
 //! Todo test corre en directorios temporales aislados (repo y data dir
 //! propios). Nunca se toca el repositorio real de Aeril.
+//!
+//! Cada binario de test compila este módulo entero: no todos usan todos los
+//! helpers, por eso se permite dead_code localmente.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

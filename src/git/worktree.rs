@@ -73,7 +73,7 @@ pub fn create(
     let mut opts = WorktreeAddOptions::new();
     opts.reference(Some(&branch_ref));
     let wt_name = format!("aeril-{workspace_id}");
-    repo.worktree(&wt_name, &path, Some(&mut opts))?;
+    repo.worktree(&wt_name, &path, Some(&opts))?;
 
     // Verificación inmediata: el worktree existe, abre, y su HEAD es la base.
     let wt = repo.find_worktree(&wt_name)?;

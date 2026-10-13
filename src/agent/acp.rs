@@ -95,33 +95,31 @@ fn classify(line: &str) -> Result<ServerMsg> {
     let v: Value = serde_json::from_str(line)
         .map_err(|e| Error::backend(format!("línea ACP no parseable: {e}")))?;
     let has_method = v.get("method").is_some();
-    let id = v.get("id").cloned();
-    if has_method && id.is_some() {
-        Ok(ServerMsg::Request {
-            id: id.unwrap(),
+    match (has_method, v.get("id").cloned()) {
+        (true, Some(id)) => Ok(ServerMsg::Request {
+            id,
             method: v["method"].as_str().unwrap_or_default().to_string(),
             params: v.get("params").cloned().unwrap_or(Value::Null),
-        })
-    } else if has_method {
-        Ok(ServerMsg::Notification(v))
-    } else if let Some(id) = id {
-        let idnum = id
-            .as_u64()
-            .ok_or_else(|| Error::backend("respuesta con id no numérico"))?;
-        let result = match v.get("error") {
-            Some(err) => Err(RpcError {
-                code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
-                message: err
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            }),
-            None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
-        };
-        Ok(ServerMsg::Response { id: idnum, result })
-    } else {
-        Err(Error::backend("mensaje ACP sin método ni id"))
+        }),
+        (true, None) => Ok(ServerMsg::Notification(v)),
+        (false, Some(id)) => {
+            let idnum = id
+                .as_u64()
+                .ok_or_else(|| Error::backend("respuesta con id no numérico"))?;
+            let result = match v.get("error") {
+                Some(err) => Err(RpcError {
+                    code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
+                    message: err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                }),
+                None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
+            };
+            Ok(ServerMsg::Response { id: idnum, result })
+        }
+        (false, None) => Err(Error::backend("mensaje ACP sin método ni id")),
     }
 }
 
@@ -479,11 +477,10 @@ impl AcpClient {
                             return Err(Error::backend(format!("respuesta inesperada durante el turno (id {rid})")));
                         }
                         ServerMsg::Notification(v) => {
-                            if v["method"].as_str() == Some("session/update") {
-                                if let Some(update) = v.pointer("/params/update") {
+                            if v["method"].as_str() == Some("session/update")
+                                && let Some(update) = v.pointer("/params/update") {
                                     obs.on_update(update)?;
                                 }
-                            }
                         }
                         ServerMsg::Request { id, method, params } => {
                             self.dispatch_server_request(&id, &method, &params, obs).await?;

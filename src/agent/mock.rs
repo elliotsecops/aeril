@@ -71,11 +71,7 @@ pub fn run(script_path: &str) -> Result<()> {
     let mut cwd = std::env::current_dir()?;
     let mut cancelled = false;
 
-    loop {
-        let line = match rx.recv() {
-            Ok(l) => l,
-            Err(_) => break, // stdin cerrado
-        };
+    while let Ok(line) = rx.recv() {
         let v: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
@@ -313,10 +309,10 @@ fn sleep_polling(ms: u64, rx: &Receiver<String>, cancelled: &mut bool) -> bool {
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(line) => {
-                if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                    if v.get("method").and_then(Value::as_str) == Some("session/cancel") {
-                        *cancelled = true;
-                    }
+                if let Ok(v) = serde_json::from_str::<Value>(&line)
+                    && v.get("method").and_then(Value::as_str) == Some("session/cancel")
+                {
+                    *cancelled = true;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
