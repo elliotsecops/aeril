@@ -85,6 +85,25 @@ fn print_json(v: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Cancelación programada para E2E/demos: pide `session/cancel` al motor tras
+/// N ms de iniciado el run (`--cancel-after-ms`).
+fn cancel_receiver(p: &Parsed) -> Result<Option<tokio::sync::oneshot::Receiver<()>>> {
+    match p.flag("cancel-after-ms") {
+        Some(ms_str) => {
+            let ms: u64 = ms_str
+                .parse()
+                .map_err(|_| Error::invalid("--cancel-after-ms inválido"))?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                let _ = tx.send(());
+            });
+            Ok(Some(rx))
+        }
+        None => Ok(None),
+    }
+}
+
 pub fn run() -> i32 {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -126,7 +145,7 @@ fn dispatch(args: &[String], t0: Instant) -> Result<i32> {
         Some("recover") => cmd_recover(&p, &db_path),
         Some("worktree") => cmd_worktree(&p, &data_dir, &db_path),
         Some("integrate") => cmd_integrate(&p, &db_path),
-        Some("validate") => cmd_validate(&p, &db_path),
+        Some("validate") => cmd_validate(&p, &data_dir, &db_path),
         Some("export") => cmd_export(&p, &db_path),
         Some("bench") => cmd_bench(&p, &data_dir),
         Some("__mock-agent") => {
@@ -218,20 +237,7 @@ fn cmd_run(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
             checkpoint::recover_pending(&mut store, &|path: &str| git::open(Path::new(path)).ok())?;
             // Cancelación programada (para pruebas E2E y demos): pide
             // `session/cancel` al motor tras N ms de iniciado el run.
-            let cancel_rx = match p.flag("cancel-after-ms") {
-                Some(ms_str) => {
-                    let ms: u64 = ms_str
-                        .parse()
-                        .map_err(|_| Error::invalid("--cancel-after-ms inválido"))?;
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(ms));
-                        let _ = tx.send(());
-                    });
-                    Some(rx)
-                }
-                None => None,
-            };
+            let cancel_rx = cancel_receiver(p)?;
             let mut runner = Runner {
                 data_dir: data_dir.to_path_buf(),
                 db_path: db_path.to_path_buf(),
@@ -458,11 +464,12 @@ fn cmd_feedback(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
             if ids.is_empty() {
                 return Err(Error::invalid("no hay comentarios para enviar"));
             }
+            let cancel_rx = cancel_receiver(p)?;
             let mut runner = Runner {
                 data_dir: data_dir.to_path_buf(),
                 db_path: db_path.to_path_buf(),
                 ui: None,
-                cancel: None,
+                cancel: cancel_rx,
             };
             let opts = RunOptions {
                 backend,
@@ -555,7 +562,7 @@ fn cmd_integrate(p: &Parsed, db_path: &Path) -> Result<i32> {
 
 // ── validate ─────────────────────────────────────────────────────────────────
 
-fn cmd_validate(p: &Parsed, db_path: &Path) -> Result<i32> {
+fn cmd_validate(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
     let thread_id = p.require("thread")?;
     let snapshot_id = p.require("snapshot")?;
     if p.after_dashdash.is_empty() {
@@ -564,7 +571,13 @@ fn cmd_validate(p: &Parsed, db_path: &Path) -> Result<i32> {
         ));
     }
     let mut store = open_store(db_path)?;
-    let record = session::validate(&mut store, &thread_id, &snapshot_id, &p.after_dashdash)?;
+    let record = session::validate(
+        &mut store,
+        data_dir,
+        &thread_id,
+        &snapshot_id,
+        &p.after_dashdash,
+    )?;
     print_json(&json!({
         "snapshot_id": record.snapshot_id,
         "oid": record.oid,
@@ -573,6 +586,13 @@ fn cmd_validate(p: &Parsed, db_path: &Path) -> Result<i32> {
         "duration_ms": record.duration_ms,
         "output_hash": record.output_hash,
         "output_tail": record.output_tail,
+        "stdout_bytes": record.stdout_bytes,
+        "stderr_bytes": record.stderr_bytes,
+        "stdout_hash": record.stdout_hash,
+        "stderr_hash": record.stderr_hash,
+        "tree_before_ok": record.tree_before_ok,
+        "tree_after_unchanged": record.tree_after_unchanged,
+        "checkout_id": record.checkout_id,
     }))?;
     Ok(if record.exit_code == 0 { 0 } else { 3 })
 }

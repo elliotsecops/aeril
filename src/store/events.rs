@@ -7,7 +7,7 @@
 //! - Payloads versionados (`payload_version`) con forma por `kind`; los
 //!   productores usan los structs tipados de [`payload`].
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::timeutil::now_ms;
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde::Serialize;
@@ -21,6 +21,8 @@ pub const K_AGENT_MESSAGE: &str = "agent.message";
 pub const K_AGENT_TOOL_CALL: &str = "agent.tool_call";
 pub const K_PERMISSION_REQUESTED: &str = "permission.requested";
 pub const K_PERMISSION_RESPONDED: &str = "permission.responded";
+pub const K_PERMISSION_TRANSMITTED: &str = "permission.transmitted";
+pub const K_PERMISSION_AUDIT_FAILED: &str = "permission.audit_failed";
 pub const K_RUN_ENDED: &str = "run.ended";
 pub const K_CHECKPOINT_PREPARED: &str = "checkpoint.prepared";
 pub const K_CHECKPOINT_READY: &str = "checkpoint.ready";
@@ -62,10 +64,19 @@ pub mod payload {
     #[derive(Debug, Serialize, Deserialize, Default)]
     pub struct EngineSession {
         pub engine_session_id: String,
-        /// `true` si el motor aceptó reanudar una sesión existente
-        /// (`session/load`); `false` si se abrió una sesión nueva con contexto
-        /// restaurado por Aeril. No son equivalentes y se registran distinto.
+        /// `true` si la sesión final en uso es la misma que la previa.
         pub resumed: bool,
+        /// Operación intentada primero: `"load"` o `"new"`.
+        #[serde(default)]
+        pub attempted: Option<String>,
+        /// El motor aceptó el intento (protocolo). No implica restauración.
+        #[serde(default)]
+        pub accepted: Option<bool>,
+        /// Restauración del contexto previo VERIFICADA. Con Hermes 0.21.5
+        /// `session/load` de una sesión desconocida responde OK sin historial:
+        /// no es verificable → siempre `false` en v0.
+        #[serde(default)]
+        pub verified: bool,
     }
 
     #[derive(Debug, Serialize, Deserialize, Default)]
@@ -100,6 +111,24 @@ pub mod payload {
         pub request_id: String,
         pub option_id: String,
         pub policy: String,
+    }
+
+    /// La decisión durable (`permission.responded`) NO afirma entrega: este
+    /// evento registra el intento de transmisión al backend y su resultado.
+    #[derive(Debug, Serialize, Deserialize, Default)]
+    pub struct PermissionTransmitted {
+        pub request_id: String,
+        pub option_id: String,
+        pub ok: bool,
+    }
+
+    /// Fallo al persistir estado de autorización: sin auditoría durable no
+    /// hay autorización (fail closed). Best-effort; puede fallar también.
+    #[derive(Debug, Serialize, Deserialize, Default)]
+    pub struct PermissionAuditFailed {
+        pub request_id: String,
+        pub stage: String,
+        pub detail: String,
     }
 
     #[derive(Debug, Serialize, Deserialize, Default)]
@@ -243,8 +272,26 @@ pub mod payload {
         pub command: String,
         pub exit_code: i32,
         pub duration_ms: i64,
+        /// Identidad estable de los bytes de stdout+stderr (FNV no criptográfico
+        /// en v0), calculada incrementalmente sobre TODOS los bytes.
         pub output_hash: String,
         pub output_tail: String,
+        #[serde(default)]
+        pub stdout_bytes: u64,
+        #[serde(default)]
+        pub stderr_bytes: u64,
+        #[serde(default)]
+        pub stdout_hash: String,
+        #[serde(default)]
+        pub stderr_hash: String,
+        /// El checkout aislado reproducía el tree exacto del snapshot antes de correr.
+        #[serde(default)]
+        pub tree_before_ok: bool,
+        /// El contenido trackeado no cambió durante la validación.
+        #[serde(default)]
+        pub tree_after_unchanged: bool,
+        #[serde(default)]
+        pub checkout_id: String,
     }
 }
 
@@ -287,6 +334,16 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
 const SELECT_COLS: &str = "SELECT id, thread_id, seq, run_id, kind, actor, payload_version, payload, created_ms FROM events";
 
 // ── append ───────────────────────────────────────────────────────────────────
+/// Punto de fallo determinista para tests de robustez (mismo espíritu que la
+/// inyección de crashes): `AERIL_FAULT_APPEND=<kind>` (o `all`) hace fallar el
+/// append de ese kind. NUNCA se activa sin la variable de entorno.
+fn fault_injected(kind: &str) -> bool {
+    match std::env::var("AERIL_FAULT_APPEND") {
+        Ok(v) => v == "all" || v == kind,
+        Err(_) => false,
+    }
+}
+
 /// Append dentro de una transacción existente. Asigna `seq` con el contador
 /// del thread; si el INSERT falla, la transacción completa se revierte.
 pub fn append_tx(
@@ -298,6 +355,11 @@ pub fn append_tx(
     payload: &serde_json::Value,
     now: i64,
 ) -> Result<(String, i64)> {
+    if fault_injected(kind) {
+        return Err(Error::Other(format!(
+            "escritura fallida inyectada para `{kind}` (AERIL_FAULT_APPEND)"
+        )));
+    }
     let seq: i64 = tx.query_row(
         "UPDATE threads SET next_seq = next_seq + 1, updated_ms = ?1 WHERE id = ?2 RETURNING next_seq - 1",
         params![now, thread_id],

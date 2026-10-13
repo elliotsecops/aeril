@@ -20,6 +20,20 @@ struct MockScript {
     delay_ms: u64,
     #[serde(default)]
     edits: Vec<MockEdit>,
+    /// Emite `usage_update` + `available_commands_update` (notificaciones de
+    /// setup, NO evidencia de procesamiento del turno) tras session/new|load
+    /// y al inicio de cada turno.
+    #[serde(default)]
+    notify_setup: bool,
+    /// `session/load` responde error (fallback del cliente a sesión nueva).
+    #[serde(default)]
+    fail_load: bool,
+    /// El proceso muere a mitad del turno (conexión perdida) tras N ms.
+    #[serde(default)]
+    exit_after_ms: u64,
+    /// Ignora `session/cancel` (backend que no coopera; B6).
+    #[serde(default)]
+    ignore_cancel: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -109,8 +123,18 @@ pub fn run(script_path: &str) -> Result<()> {
                         "modes": {"currentModeId": "default", "availableModes": []}
                     }
                 }))?;
+                if script.notify_setup {
+                    setup_notifications()?;
+                }
             }
             ("session/load", Some(id)) => {
+                if script.fail_load {
+                    send(&json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32603, "message": "load de sesión no disponible (mock)"}
+                    }))?;
+                    continue;
+                }
                 if let Some(c) = params.get("cwd").and_then(Value::as_str) {
                     cwd = PathBuf::from(c);
                 }
@@ -124,6 +148,9 @@ pub fn run(script_path: &str) -> Result<()> {
                         "modes": {"currentModeId": "default", "availableModes": []}
                     }
                 }))?;
+                if script.notify_setup {
+                    setup_notifications()?;
+                }
             }
             ("session/prompt", Some(id)) => {
                 if params.get("sessionId").and_then(Value::as_str) != Some(session_id.as_str()) {
@@ -158,10 +185,20 @@ fn run_turn(
     rx: &Receiver<String>,
     cancelled: &mut bool,
 ) -> Result<String> {
+    if script.notify_setup {
+        setup_notifications()?;
+    }
+    if script.exit_after_ms > 0 {
+        // Conexión perdida a mitad del turno, sin contenido real antes.
+        if sleep_polling(script.exit_after_ms, rx, cancelled, true) {
+            return Ok("cancelled".to_string());
+        }
+        std::process::exit(9);
+    }
     if let Some(msg) = &script.message {
         chunk_out(msg)?;
     }
-    if sleep_polling(script.delay_ms, rx, cancelled) {
+    if sleep_polling(script.delay_ms, rx, cancelled, script.ignore_cancel) {
         return Ok("cancelled".to_string());
     }
 
@@ -211,7 +248,9 @@ fn run_turn(
                         continue;
                     };
                     if v.get("method").and_then(Value::as_str) == Some("session/cancel") {
-                        *cancelled = true;
+                        if !script.ignore_cancel {
+                            *cancelled = true;
+                        }
                         continue;
                     }
                     if v.get("id").and_then(Value::as_u64) == Some(req_id) {
@@ -304,23 +343,41 @@ fn chunk_out(text: &str) -> Result<()> {
 
 /// Duerme `ms` en tramos cortos, detectando `session/cancel` en el canal.
 /// Devuelve `true` si se canceló.
-fn sleep_polling(ms: u64, rx: &Receiver<String>, cancelled: &mut bool) -> bool {
+/// Notificaciones de setup (usage/commands): NO son evidencia de un turno.
+fn setup_notifications() -> Result<()> {
+    send(&json!({
+        "jsonrpc": "2.0", "method": "session/update",
+        "params": {"update": {"sessionUpdate": "usage_update", "size": 200000, "used": 1234}}
+    }))?;
+    send(&json!({
+        "jsonrpc": "2.0", "method": "session/update",
+        "params": {"update": {"sessionUpdate": "available_commands_update", "availableCommands": []}}
+    }))
+}
+
+fn sleep_polling(
+    ms: u64,
+    rx: &Receiver<String>,
+    cancelled: &mut bool,
+    ignore_cancel: bool,
+) -> bool {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(line) => {
-                if let Ok(v) = serde_json::from_str::<Value>(&line)
+                if !ignore_cancel
+                    && let Ok(v) = serde_json::from_str::<Value>(&line)
                     && v.get("method").and_then(Value::as_str) == Some("session/cancel")
                 {
                     *cancelled = true;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return *cancelled,
+            Err(RecvTimeoutError::Disconnected) => return *cancelled && !ignore_cancel,
         }
-        if *cancelled {
+        if *cancelled && !ignore_cancel {
             return true;
         }
     }
-    *cancelled
+    *cancelled && !ignore_cancel
 }

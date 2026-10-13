@@ -21,6 +21,28 @@ pub struct Captured {
     pub patch: String,
 }
 
+/// ¿La entrada de status es un cambio NO soportado en v0 (submódulo/gitlink
+/// o directorio en disco)? Se rechaza explícitamente: jamás se omite en
+/// silencio del snapshot.
+fn unsupported_entry(entry: &git2::StatusEntry<'_>, abs: &std::path::Path) -> Option<String> {
+    let gitlink = |d: Option<git2::DiffDelta<'_>>| {
+        d.map(|d| {
+            d.old_file().mode() == git2::FileMode::Commit
+                || d.new_file().mode() == git2::FileMode::Commit
+        })
+        .unwrap_or(false)
+    };
+    if gitlink(entry.head_to_index()) || gitlink(entry.index_to_workdir()) {
+        return Some("submódulo (gitlink) modificado".to_string());
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(abs)
+        && meta.is_dir()
+    {
+        return Some("directorio/submódulo no soportado".to_string());
+    }
+    None
+}
+
 /// Captura el estado del WORKING TREE como objetos inmutables.
 ///
 /// Devuelve `Ok(None)` si el contenido es idéntico a la base: no hay nada
@@ -53,25 +75,26 @@ pub fn capture(
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .include_ignored(false)
-        .exclude_submodules(true);
+        .include_ignored(false);
+
     let statuses: Statuses = worktree_repo.statuses(Some(&mut opts))?;
 
     let mut builder = git2::build::TreeUpdateBuilder::new();
     for entry in statuses.iter() {
         let Ok(rel) = entry.path() else { continue };
         let abs = workdir.join(rel);
+        // Gitlink/módulo o directorio: rechazo explícito ANTES de mirar disco.
+        if let Some(why) = unsupported_entry(&entry, &abs) {
+            return Err(Error::unsupported(format!(
+                "cambio no soportado en snapshot v0 ({why}): {rel}"
+            )));
+        }
         let meta = std::fs::symlink_metadata(&abs);
         let Ok(meta) = meta else {
             // No está en disco: borrado respecto del índice.
             builder.remove(rel);
             continue;
         };
-        if meta.is_dir() {
-            return Err(Error::unsupported(format!(
-                "cambio no soportado en snapshot v0 (directorio/submódulo): {rel}"
-            )));
-        }
         let (content, mode) = if meta.file_type().is_symlink() {
             let target = std::fs::read_link(&abs)?;
             (
@@ -142,22 +165,22 @@ pub fn current_tree(worktree_repo: &Repository, base_oid: &str) -> Result<String
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .include_ignored(false)
-        .exclude_submodules(true);
+        .include_ignored(false);
+
     let statuses = worktree_repo.statuses(Some(&mut opts))?;
     let mut builder = git2::build::TreeUpdateBuilder::new();
     for entry in statuses.iter() {
         let Ok(rel) = entry.path() else { continue };
         let abs = workdir.join(rel);
+        if let Some(why) = unsupported_entry(&entry, &abs) {
+            return Err(Error::unsupported(format!(
+                "cambio no soportado ({why}): {rel}"
+            )));
+        }
         let Ok(meta) = std::fs::symlink_metadata(&abs) else {
             builder.remove(rel);
             continue;
         };
-        if meta.is_dir() {
-            return Err(Error::unsupported(format!(
-                "cambio no soportado (directorio/submódulo): {rel}"
-            )));
-        }
         let (content, mode) = if meta.file_type().is_symlink() {
             (
                 std::fs::read_link(&abs)?

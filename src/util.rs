@@ -2,12 +2,40 @@
 //! criptográfico en v0 — la integridad real la dan los OIDs de Git).
 
 pub fn fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    let mut h = Fnv1a::new();
+    h.update(bytes);
+    h.hex()
+}
+
+/// FNV-1a incremental: permite hashear flujos completos sin retenerlos.
+#[derive(Debug)]
+pub struct Fnv1a {
+    hash: u64,
+}
+
+impl Fnv1a {
+    pub fn new() -> Self {
+        Fnv1a {
+            hash: 0xcbf2_9ce4_8422_2325,
+        }
     }
-    format!("{hash:016x}")
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.hash ^= *b as u64;
+            self.hash = self.hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    pub fn hex(&self) -> String {
+        format!("{:016x}", self.hash)
+    }
+}
+
+impl Default for Fnv1a {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Trunca texto a `max` caracteres, marcando el corte si ocurre.

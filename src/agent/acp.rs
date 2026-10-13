@@ -45,10 +45,25 @@ pub enum PermissionDecision {
 
 /// Observador del turno: persistencia y política viven fuera del protocolo.
 pub trait TurnObserver {
+    /// Llamado inmediatamente después de enviar el prompt: delimita qué
+    /// notificaciones cuentan como evidencia DE ESTE turno.
+    fn on_turn_started(&mut self) {}
     /// Notificación `session/update`.
     fn on_update(&mut self, update: &Value) -> Result<()>;
     /// Request `session/request_permission`: decide y registra.
-    fn on_permission(&mut self, req: &PermissionRequest) -> PermissionDecision;
+    /// `Err` ⇒ fail closed: el cliente deniega y el turno termina.
+    fn on_permission(&mut self, req: &PermissionRequest) -> Result<PermissionDecision>;
+    /// Resultado del intento de transmisión de la decisión al backend.
+    /// La decisión durable ya existe; esto NO la reemplaza ni la afirma.
+    fn on_permission_sent(
+        &mut self,
+        _req: &PermissionRequest,
+        _decision: &PermissionDecision,
+        _ok: bool,
+    ) {
+    }
+    /// La persistencia del estado de autorización falló (fail closed).
+    fn on_permission_failed(&mut self, _req: &PermissionRequest, _detail: &str) {}
 }
 
 /// Observador vacío para llamadas de control (initialize/session/new).
@@ -58,10 +73,10 @@ impl TurnObserver for NoopObserver {
     fn on_update(&mut self, _update: &Value) -> Result<()> {
         Ok(())
     }
-    fn on_permission(&mut self, _req: &PermissionRequest) -> PermissionDecision {
-        PermissionDecision::Cancelled {
+    fn on_permission(&mut self, _req: &PermissionRequest) -> Result<PermissionDecision> {
+        Ok(PermissionDecision::Cancelled {
             policy: "control_phase_default_deny".into(),
-        }
+        })
     }
 }
 
@@ -326,16 +341,31 @@ impl AcpClient {
             "session/request_permission" => {
                 let mut req = parse_permission(params);
                 req.request_id = id.clone();
-                let decision = obs.on_permission(&req);
-                let result = match decision {
-                    PermissionDecision::Selected { option_id, .. } => {
-                        json!({"outcome": {"outcome": "selected", "optionId": option_id}})
+                match obs.on_permission(&req) {
+                    Ok(decision) => {
+                        let result = match &decision {
+                            PermissionDecision::Selected { option_id, .. } => {
+                                json!({"outcome": {"outcome": "selected", "optionId": option_id}})
+                            }
+                            PermissionDecision::Cancelled { .. } => {
+                                json!({"outcome": {"outcome": "cancelled"}})
+                            }
+                        };
+                        let send_res = self.respond(id, result).await;
+                        obs.on_permission_sent(&req, &decision, send_res.is_ok());
+                        send_res
                     }
-                    PermissionDecision::Cancelled { .. } => {
-                        json!({"outcome": {"outcome": "cancelled"}})
+                    Err(e) => {
+                        // Fail closed: sin auditoría durable no hay
+                        // autorización. Se intenta denegar (cancelled) y el
+                        // turno termina con error (nunca un allow silencioso).
+                        let _ = self
+                            .respond(id, json!({"outcome": {"outcome": "cancelled"}}))
+                            .await;
+                        obs.on_permission_failed(&req, &e.to_string());
+                        Err(e)
                     }
-                };
-                self.respond(id, result).await
+                }
             }
             other => {
                 // Métodos de cliente que Hermes no usa (fs/*, terminal/*):
@@ -435,6 +465,9 @@ impl AcpClient {
             &json!({"jsonrpc": "2.0", "id": id, "method": "session/prompt", "params": params}),
         )
         .await?;
+        // A partir de aquí, las notificaciones pueden ser evidencia de ESTE
+        // turno (antes, pueden ser restos de sesión/new o de un load).
+        obs.on_turn_started();
 
         let mut cancel_sent = false;
         loop {
@@ -554,6 +587,22 @@ pub fn parse_permission(params: &Value) -> PermissionRequest {
         options,
         diff_path,
     }
+}
+
+/// ¿La notificación es evidencia de procesamiento de UN turno?
+/// Las notificaciones de setup (usage, comandos disponibles, info de sesión)
+/// NO lo son: pueden llegar demoradas y no prueban que el prompt se procesó.
+pub fn is_turn_evidence(update: &Value) -> bool {
+    matches!(
+        update.get("sessionUpdate").and_then(Value::as_str),
+        Some(
+            "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "plan"
+        )
+    )
 }
 
 /// Extrae el texto de una notificación `session/update` de tipo chunk.

@@ -143,12 +143,17 @@ pub fn set_state(conn: &Connection, run_id: &str, state: &str) -> Result<()> {
 }
 
 /// Persiste la sesión externa del motor (identidad durable, no "contexto").
+/// Registra la operación intentada y si el protocolo la aceptó; la
+/// restauración efectiva del contexto previo NO es verificable con Hermes
+/// (load de sesión desconocida responde OK sin historial) → `verified=false`.
 pub fn set_engine_session(
     conn: &mut Connection,
     thread_id: &str,
     run_id: &str,
     engine_session_id: &str,
     resumed: bool,
+    attempted: &str,
+    accepted: bool,
 ) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
@@ -158,6 +163,9 @@ pub fn set_engine_session(
     let payload = payload::EngineSession {
         engine_session_id: engine_session_id.to_string(),
         resumed,
+        attempted: Some(attempted.to_string()),
+        accepted: Some(accepted),
+        verified: false,
     };
     events::append_tx(
         &tx,

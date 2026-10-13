@@ -55,6 +55,19 @@ pub fn fast_forward(
     source_oid: &str,
     expect_oid: &str,
 ) -> std::result::Result<IntegrationOutcome, IntegrationBlocked> {
+    fast_forward_with_hook(repo, target_branch, source_oid, expect_oid, None)
+}
+
+/// Igual que [`fast_forward`] con un `hook` que corre DESPUÉS de la
+/// verificación de ancestría y ANTES del CAS. Solo para tests deterministas
+/// de concurrencia (simula a otro escritor avanzando la rama justo ahí).
+pub fn fast_forward_with_hook(
+    repo: &Repository,
+    target_branch: &str,
+    source_oid: &str,
+    expect_oid: &str,
+    hook: Option<&dyn Fn()>,
+) -> std::result::Result<IntegrationOutcome, IntegrationBlocked> {
     let full_ref = format!("refs/heads/{target_branch}");
 
     if let Some(worktree) = checked_out_worktree(repo, target_branch) {
@@ -99,12 +112,70 @@ pub fn fast_forward(
         });
     }
 
-    // Movimiento de ref sin force: es fast-forward por construcción.
-    let mut r = repo
+    if let Some(h) = hook {
+        h();
+    }
+
+    // CAS real: transacción de refs de libgit2. `lock_ref` fija el valor
+    // observado; `commit` falla con GIT_EMODIFIED si otro escritor movió la
+    // ref entretanto. Un avance concurrente nunca se sobrescribe: el commit
+    // ajeno queda y este intento se reporta como stale.
+    let mut tx = repo.transaction().map_err(|e| {
+        IntegrationBlocked::Git(format!("no se pudo abrir la transacción de refs: {e}"))
+    })?;
+    tx.lock_ref(&full_ref)
+        .map_err(|e| IntegrationBlocked::Git(format!("no se pudo bloquear {full_ref}: {e}")))?;
+    let locked = repo
         .find_reference(&full_ref)
+        .ok()
+        .and_then(|r| r.target())
+        .map(|o| o.to_string());
+    match locked.as_deref() {
+        Some(cur) if cur == source_oid => {
+            // Otro escritor completó la misma integración: idempotente.
+            return Ok(IntegrationOutcome {
+                target_oid_before: target_s,
+                target_oid_after: source_oid.to_string(),
+            });
+        }
+        Some(cur) if cur == expect_oid => {}
+        Some(cur) => {
+            return Err(IntegrationBlocked::Stale {
+                expected: expect_oid.to_string(),
+                actual: cur.to_string(),
+            });
+        }
+        None => {
+            return Err(IntegrationBlocked::Git(format!(
+                "{full_ref} desapareció durante la integración"
+            )));
+        }
+    }
+    let sig = git2::Signature::now("Aeril", "aeril@localhost")
         .map_err(|e| IntegrationBlocked::Git(e.to_string()))?;
-    r.set_target(source, "aeril: integración fast-forward")
-        .map_err(|e| IntegrationBlocked::Git(e.to_string()))?;
+    tx.set_target(
+        &full_ref,
+        source,
+        Some(&sig),
+        "aeril: integración fast-forward",
+    )
+    .map_err(|e| IntegrationBlocked::Git(e.to_string()))?;
+    match tx.commit() {
+        Ok(()) => {}
+        Err(e) if e.code() == git2::ErrorCode::Modified => {
+            let actual = repo
+                .find_reference(&full_ref)
+                .ok()
+                .and_then(|r| r.target())
+                .map(|o| o.to_string())
+                .unwrap_or_default();
+            return Err(IntegrationBlocked::Stale {
+                expected: expect_oid.to_string(),
+                actual,
+            });
+        }
+        Err(e) => return Err(IntegrationBlocked::Git(e.to_string())),
+    }
 
     let after = repo
         .find_reference(&full_ref)

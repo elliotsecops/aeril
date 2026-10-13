@@ -224,59 +224,6 @@ fn integracion_stale_y_divergente_bloquean_sin_tocar_nada() {
 }
 
 #[test]
-fn validacion_rechaza_workspace_que_no_coincide_con_el_snapshot() {
-    let env = TestEnv::new("edge-validate");
-    let thread = env.thread_new("validación");
-    let script = env.script("s", mock_edit("NOTES.md", "# v2 validación\n", "x"));
-    let run = env.run_start(&thread, "x", &script);
-    let sid = run["snapshot"]["snapshot_id"].as_str().unwrap().to_string();
-
-    // El workspace queda con contenido distinto al snapshot (edición posterior).
-    let wt = env.worktree_path(&thread);
-    std::fs::write(wt.join("NOTES.md"), "# contenido posterior\n").unwrap();
-
-    let out = env.aeril(&[
-        "validate",
-        "--thread",
-        &thread,
-        "--snapshot",
-        &sid,
-        "--",
-        "cat",
-        "NOTES.md",
-    ]);
-    assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("no coincide con el snapshot"),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    // Con el workspace intacto, la validación corre y queda ligada al OID.
-    let env2 = TestEnv::new("edge-validate-ok");
-    let thread2 = env2.thread_new("validación ok");
-    let script2 = env2.script("s", mock_edit("NOTES.md", "# v2 ok\n", "x"));
-    let run2 = env2.run_start(&thread2, "x", &script2);
-    let sid2 = run2["snapshot"]["snapshot_id"].as_str().unwrap();
-    let v = env2.aeril_ok(&[
-        "validate",
-        "--thread",
-        &thread2,
-        "--snapshot",
-        sid2,
-        "--",
-        "cat",
-        "NOTES.md",
-    ]);
-    assert_eq!(v["exit_code"], 0);
-    assert_eq!(
-        v["oid"].as_str().unwrap(),
-        run2["snapshot"]["oid"].as_str().unwrap()
-    );
-    assert!(v["output_tail"].as_str().unwrap().contains("# v2 ok"));
-}
-
-#[test]
 fn cancelacion_detiene_el_turno_del_motor() {
     let env = TestEnv::new("edge-cancel");
     let thread = env.thread_new("cancelación");
