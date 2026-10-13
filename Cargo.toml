@@ -1,0 +1,31 @@
+[package]
+name = "aeril"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+git2 = { version = "0.21.0", default-features = false }
+libc = "0.2.190"
+ratatui = "0.30.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["rt", "rt-multi-thread", "process", "io-util", "time", "sync", "macros"] }
+uuid = { version = "1.28.0", features = ["v4", "v5"] }
+
+# Perfiles de build de Fase 0.
+# dev: debug=1 (line tables) para no llenar el disco; deps optimizadas porque
+#      SQLite/libgit2 en -O0 distorsionan las mediciones locales.
+# release: presupuesto de tamaño (≤30 MB) — LTO thin + strip.
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
