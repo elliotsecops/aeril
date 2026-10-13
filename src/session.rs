@@ -204,6 +204,23 @@ impl Runner {
             },
         )?;
 
+        // Intención durable del feedback ANTES de lanzar el backend: si algo
+        // falla después, el fallo es registrable y auditable.
+        if let Some(ids) = &opts.feedback_comment_ids {
+            let sent = payload::FeedbackSent {
+                comment_ids: ids.clone(),
+                run_id: run.id.clone(),
+            };
+            events::append_typed(
+                &mut store.conn,
+                thread_id,
+                Some(&run.id),
+                events::K_FEEDBACK_SENT,
+                "human",
+                &sent,
+            )?;
+        }
+
         let prompt = match (&opts.feedback_comment_ids, feedback) {
             (Some(ids), true) => compose_feedback_prompt(store, thread_id, ids)?,
             _ => opts.goal.clone(),
@@ -220,18 +237,22 @@ impl Runner {
         drop(rt);
 
         // ── cierre del run ───────────────────────────────────────────────────
+        let delivered = turn.feedback_delivered;
         let (mut state, mut detail, stop_reason) = match turn {
             TurnResult {
                 stop_reason: Some(s),
                 detail,
+                ..
             } if s == "end_turn" => ("completed", detail, Some(s)),
             TurnResult {
                 stop_reason: Some(s),
                 detail,
+                ..
             } if s == "cancelled" => ("cancelled", detail, Some(s)),
             TurnResult {
                 stop_reason: Some(s),
                 detail,
+                ..
             } => (
                 "failed",
                 detail.or_else(|| Some(format!("stopReason: {s}"))),
@@ -240,8 +261,31 @@ impl Runner {
             TurnResult {
                 stop_reason: None,
                 detail,
+                ..
             } => ("failed", detail, None),
         };
+
+        // Feedback sin evidencia de procesamiento = fallo explícito (jamás se
+        // declara entregado sin ack del backend).
+        if delivered == Some(false) {
+            if let Some(ids) = &opts.feedback_comment_ids {
+                let reason = detail
+                    .clone()
+                    .unwrap_or_else(|| "el turno no dio evidencia de procesamiento".into());
+                let _ = events::append_typed(
+                    &mut store.conn,
+                    thread_id,
+                    Some(&run.id),
+                    events::K_FEEDBACK_FAILED,
+                    "system",
+                    &payload::FeedbackFailed {
+                        comment_ids: ids.clone(),
+                        run_id: Some(run.id.clone()),
+                        reason,
+                    },
+                );
+            }
+        }
 
         let mut snapshot: Option<checkpoint::CaptureOutcome> = None;
         if state == "completed" {
@@ -308,6 +352,7 @@ impl Runner {
                 return TurnResult {
                     stop_reason: None,
                     detail: Some(format!("no se pudo lanzar el backend: {e}")),
+                    feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
                 };
             }
         };
@@ -316,6 +361,7 @@ impl Runner {
             return TurnResult {
                 stop_reason: None,
                 detail: Some(format!("initialize falló: {e}")),
+                feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
             };
         }
 
@@ -341,6 +387,7 @@ impl Runner {
                                 return TurnResult {
                                     stop_reason: None,
                                     detail: Some(format!("session/new falló: {e}")),
+                                    feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
                                 };
                             }
                         },
@@ -356,6 +403,7 @@ impl Runner {
                         return TurnResult {
                             stop_reason: None,
                             detail: Some(format!("session/new falló: {e}")),
+                            feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
                         };
                     }
                 },
@@ -371,6 +419,7 @@ impl Runner {
                     return TurnResult {
                         stop_reason: None,
                         detail: Some(format!("session/new falló: {e}")),
+                        feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
                     };
                 }
             }
@@ -386,29 +435,18 @@ impl Runner {
             return TurnResult {
                 stop_reason: None,
                 detail: Some(format!("no se pudo persistir la sesión del motor: {e}")),
+                feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
             };
         }
-
-        // Intención durable del feedback ANTES del prompt.
-        if let Some(ids) = &opts.feedback_comment_ids {
-            let sent = payload::FeedbackSent {
-                comment_ids: ids.clone(),
-                run_id: run.id.clone(),
+        // La sesión quedó establecida: el run está corriendo (si el proceso
+        // muere a partir de aquí, la fila queda `running` = interrumpido).
+        if let Err(e) = runs::set_state(&store.conn, &run.id, "running") {
+            let _ = client.kill().await;
+            return TurnResult {
+                stop_reason: None,
+                detail: Some(format!("no se pudo marcar el run como running: {e}")),
+                feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
             };
-            if let Err(e) = events::append_typed(
-                &mut store.conn,
-                &run.thread_id,
-                Some(&run.id),
-                events::K_FEEDBACK_SENT,
-                "human",
-                &sent,
-            ) {
-                let _ = client.kill().await;
-                return TurnResult {
-                    stop_reason: None,
-                    detail: Some(format!("no se pudo registrar feedback.sent: {e}")),
-                };
-            }
         }
 
         let stop = {
@@ -425,55 +463,24 @@ impl Runner {
             let res = client
                 .prompt(prompt, &mut observer, self.cancel.take())
                 .await;
-            let pending = observer
+            // La entrega (o su ausencia) se decide aquí; el evento de fallo lo
+            // escribe el llamador con el resultado final del run.
+            let delivered = observer
                 .feedback_pending
                 .as_ref()
-                .filter(|(_, delivered)| !delivered)
-                .map(|(ids, _)| ids.clone());
+                .map(|(_, delivered)| *delivered);
             drop(observer);
             match res {
-                Ok(stop) => {
-                    if let Some(ids) = pending {
-                        let _ = events::append_typed(
-                            &mut store.conn,
-                            &run.thread_id,
-                            Some(&run.id),
-                            events::K_FEEDBACK_FAILED,
-                            "system",
-                            &payload::FeedbackFailed {
-                                comment_ids: ids,
-                                run_id: Some(run.id.clone()),
-                                reason: format!(
-                                    "el turno terminó ({stop}) sin evidencia de procesamiento"
-                                ),
-                            },
-                        );
-                    }
-                    TurnResult {
-                        stop_reason: Some(stop),
-                        detail: None,
-                    }
-                }
-                Err(e) => {
-                    if let Some(ids) = pending {
-                        let _ = events::append_typed(
-                            &mut store.conn,
-                            &run.thread_id,
-                            Some(&run.id),
-                            events::K_FEEDBACK_FAILED,
-                            "system",
-                            &payload::FeedbackFailed {
-                                comment_ids: ids,
-                                run_id: Some(run.id.clone()),
-                                reason: e.to_string(),
-                            },
-                        );
-                    }
-                    TurnResult {
-                        stop_reason: None,
-                        detail: Some(e.to_string()),
-                    }
-                }
+                Ok(stop) => TurnResult {
+                    stop_reason: Some(stop),
+                    detail: None,
+                    feedback_delivered: delivered,
+                },
+                Err(e) => TurnResult {
+                    stop_reason: None,
+                    detail: Some(e.to_string()),
+                    feedback_delivered: delivered,
+                },
             }
         };
         let _ = client.kill().await;
@@ -484,6 +491,9 @@ impl Runner {
 struct TurnResult {
     stop_reason: Option<String>,
     detail: Option<String>,
+    /// `None` = este run no envía feedback; `Some(true)` = el motor dio
+    /// evidencia de procesarlo; `Some(false)` = quedó sin ack.
+    feedback_delivered: Option<bool>,
 }
 
 fn persist_recreation(

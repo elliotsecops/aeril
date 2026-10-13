@@ -216,11 +216,27 @@ fn cmd_run(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
             let mut store = open_store(db_path)?;
             // Reconciliar checkpoints interrumpidos antes de arrancar un run.
             checkpoint::recover_pending(&mut store, &|path: &str| git::open(Path::new(path)).ok())?;
+            // Cancelación programada (para pruebas E2E y demos): pide
+            // `session/cancel` al motor tras N ms de iniciado el run.
+            let cancel_rx = match p.flag("cancel-after-ms") {
+                Some(ms_str) => {
+                    let ms: u64 = ms_str
+                        .parse()
+                        .map_err(|_| Error::invalid("--cancel-after-ms inválido"))?;
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                        let _ = tx.send(());
+                    });
+                    Some(rx)
+                }
+                None => None,
+            };
             let mut runner = Runner {
                 data_dir: data_dir.to_path_buf(),
                 db_path: db_path.to_path_buf(),
                 ui: None,
-                cancel: None,
+                cancel: cancel_rx,
             };
             let opts = RunOptions {
                 backend,
