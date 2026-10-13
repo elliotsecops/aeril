@@ -12,7 +12,13 @@ fn ref_conflictiva_detiene_y_nunca_sobrescribe() {
     let script = env.script("s", mock_edit("NOTES.md", "# v2 conflicto\n", "x"));
     let out = env.aeril_env(
         &[
-            "run", "start", "--thread", &thread, "--prompt", "x", "--backend",
+            "run",
+            "start",
+            "--thread",
+            &thread,
+            "--prompt",
+            "x",
+            "--backend",
             &format!("mock:{}", script.display()),
         ],
         &[("AERIL_CRASH_AFTER", "prepared")],
@@ -54,7 +60,13 @@ fn objetos_faltantes_se_reportan_sin_fabricar_exito() {
     let script = env.script("s", mock_edit("NOTES.md", "# v2 objetos\n", "x"));
     let out = env.aeril_env(
         &[
-            "run", "start", "--thread", &thread, "--prompt", "x", "--backend",
+            "run",
+            "start",
+            "--thread",
+            &thread,
+            "--prompt",
+            "x",
+            "--backend",
             &format!("mock:{}", script.display()),
         ],
         &[("AERIL_CRASH_AFTER", "prepared")],
@@ -92,8 +104,20 @@ fn objetos_faltantes_se_reportan_sin_fabricar_exito() {
 
     // Comentar ese snapshot falla: nunca hay ready fabricado.
     let c = env.aeril(&[
-        "comment", "add", "--thread", &thread, "--snapshot", &sid, "--path", "NOTES.md", "--start",
-        "3", "--end", "3", "--text", "no",
+        "comment",
+        "add",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &sid,
+        "--path",
+        "NOTES.md",
+        "--start",
+        "3",
+        "--end",
+        "3",
+        "--text",
+        "no",
     ]);
     assert!(!c.status.success());
 }
@@ -111,16 +135,36 @@ fn integracion_stale_y_divergente_bloquean_sin_tocar_nada() {
     // 1) stale: la rama destino se movió respecto de la base del snapshot.
     let b = "destino".to_string();
     env.update_ref(&format!("refs/heads/{b}"), &b0);
-    env.aeril_ok(&["integrate", "--thread", &thread, "--snapshot", &sid, "--to", &b]);
+    env.aeril_ok(&[
+        "integrate",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &sid,
+        "--to",
+        &b,
+    ]);
     // ahora destino == S1; integrar de nuevo el mismo snapshot es stale.
-    let out = env.aeril(&["integrate", "--thread", &thread, "--snapshot", &sid, "--to", &b]);
+    let out = env.aeril(&[
+        "integrate",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &sid,
+        "--to",
+        &b,
+    ]);
     assert!(!out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("se movió"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(env.rev_parse(&b), s1_oid, "la rama no se movió por el bloqueo");
+    assert_eq!(
+        env.rev_parse(&b),
+        s1_oid,
+        "la rama no se movió por el bloqueo"
+    );
 
     // 2) divergente: rama con un commit que no es ancestro del snapshot.
     let tree = env.rev_parse("HEAD^{tree}");
@@ -130,7 +174,14 @@ fn integracion_stale_y_divergente_bloquean_sin_tocar_nada() {
     );
     env.update_ref("refs/heads/diverge", &divergent);
     let out = env.aeril(&[
-        "integrate", "--thread", &thread, "--snapshot", &sid, "--to", "diverge", "--expect",
+        "integrate",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &sid,
+        "--to",
+        "diverge",
+        "--expect",
         &divergent,
     ]);
     assert!(!out.status.success());
@@ -142,7 +193,15 @@ fn integracion_stale_y_divergente_bloquean_sin_tocar_nada() {
     assert_eq!(env.rev_parse("refs/heads/diverge"), divergent);
 
     // 3) destino ocupado por un checkout: main está chequeada → bloqueo.
-    let out = env.aeril(&["integrate", "--thread", &thread, "--snapshot", &sid, "--to", "main"]);
+    let out = env.aeril(&[
+        "integrate",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &sid,
+        "--to",
+        "main",
+    ]);
     assert!(!out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("checkout"),
@@ -158,7 +217,10 @@ fn integracion_stale_y_divergente_bloquean_sin_tocar_nada() {
         3,
         "stale + divergente + checkout ocupado"
     );
-    assert_eq!(text.matches("\"kind\":\"integration.completed\"").count(), 1);
+    assert_eq!(
+        text.matches("\"kind\":\"integration.completed\"").count(),
+        1
+    );
 }
 
 #[test]
@@ -174,7 +236,14 @@ fn validacion_rechaza_workspace_que_no_coincide_con_el_snapshot() {
     std::fs::write(wt.join("NOTES.md"), "# contenido posterior\n").unwrap();
 
     let out = env.aeril(&[
-        "validate", "--thread", &thread, "--snapshot", &sid, "--", "cat", "NOTES.md",
+        "validate",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &sid,
+        "--",
+        "cat",
+        "NOTES.md",
     ]);
     assert!(!out.status.success());
     assert!(
@@ -190,10 +259,20 @@ fn validacion_rechaza_workspace_que_no_coincide_con_el_snapshot() {
     let run2 = env2.run_start(&thread2, "x", &script2);
     let sid2 = run2["snapshot"]["snapshot_id"].as_str().unwrap();
     let v = env2.aeril_ok(&[
-        "validate", "--thread", &thread2, "--snapshot", sid2, "--", "cat", "NOTES.md",
+        "validate",
+        "--thread",
+        &thread2,
+        "--snapshot",
+        sid2,
+        "--",
+        "cat",
+        "NOTES.md",
     ]);
     assert_eq!(v["exit_code"], 0);
-    assert_eq!(v["oid"].as_str().unwrap(), run2["snapshot"]["oid"].as_str().unwrap());
+    assert_eq!(
+        v["oid"].as_str().unwrap(),
+        run2["snapshot"]["oid"].as_str().unwrap()
+    );
     assert!(v["output_tail"].as_str().unwrap().contains("# v2 ok"));
 }
 
@@ -206,8 +285,16 @@ fn cancelacion_detiene_el_turno_del_motor() {
         serde_json::json!({"message": "pensando mucho…", "delay_ms": 30000, "edits": []}),
     );
     let summary = env.aeril_ok(&[
-        "run", "start", "--thread", &thread, "--prompt", "x", "--backend",
-        &format!("mock:{}", script.display()), "--cancel-after-ms", "1500",
+        "run",
+        "start",
+        "--thread",
+        &thread,
+        "--prompt",
+        "x",
+        "--backend",
+        &format!("mock:{}", script.display()),
+        "--cancel-after-ms",
+        "1500",
     ]);
     assert_eq!(summary["state"], "cancelled", "summary: {summary}");
     assert_eq!(summary["stop_reason"], "cancelled");
@@ -215,5 +302,8 @@ fn cancelacion_detiene_el_turno_del_motor() {
     let out = env.aeril(&["export", "--thread", &thread, "--format", "jsonl"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("\"stop_reason\":\"cancelled\""));
-    assert!(!text.contains("checkpoint.ready"), "no hay checkpoint de un turno cancelado");
+    assert!(
+        !text.contains("checkpoint.ready"),
+        "no hay checkpoint de un turno cancelado"
+    );
 }

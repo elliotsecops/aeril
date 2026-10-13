@@ -16,10 +16,7 @@ pub struct TestEnv {
 
 impl TestEnv {
     pub fn new(name: &str) -> TestEnv {
-        let root = std::env::temp_dir().join(format!(
-            "aeril-test-{name}-{}",
-            aeril::ids::new_id()
-        ));
+        let root = std::env::temp_dir().join(format!("aeril-test-{name}-{}", aeril::ids::new_id()));
         let repo = root.join("repo");
         let data = root.join("data");
         std::fs::create_dir_all(&data).expect("mkdir data");

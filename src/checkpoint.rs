@@ -23,16 +23,16 @@ pub struct CaptureOutcome {
     pub oid: String,
     pub files: Vec<payload::FileSummary>,
     pub patch_len: usize,
-    pub had_changes: bool,
 }
 
 /// Captura y publica un checkpoint del estado actual del worktree del run.
+/// Devuelve `Ok(None)` si no hay cambios respecto de la base del run.
 pub fn capture(
     store: &mut Store,
     repo: &Repository,
     run: &RunRow,
     reason: &str,
-) -> Result<CaptureOutcome> {
+) -> Result<Option<CaptureOutcome>> {
     let workspace_id = run
         .workspace_id
         .as_deref()
@@ -48,7 +48,10 @@ pub fn capture(
     let message = format!("checkpoint {snapshot_id} ({reason}; run {})", run.id);
 
     // 1. Construir objetos inmutables (working tree real, sin tocar index/rama).
-    let captured = git::snapshot::capture(&wt_repo, base_oid, &message)?;
+    let Some(captured) = git::snapshot::capture(&wt_repo, base_oid, &message)? else {
+        // Sin cambios: no hay nada que revisar; no se publica nada.
+        return Ok(None);
+    };
     crash::point("objects");
 
     // 2. Persistir la intención ANTES de publicar la ref.
@@ -137,14 +140,13 @@ pub fn capture(
         &ready,
     )?;
 
-    Ok(CaptureOutcome {
+    Ok(Some(CaptureOutcome {
         snapshot_id,
         event_id: ready_event_id,
         oid: captured.commit_oid,
         files: captured.files,
         patch_len: captured.patch.len(),
-        had_changes: captured.had_changes,
-    })
+    }))
 }
 
 // ── recuperación ─────────────────────────────────────────────────────────────

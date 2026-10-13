@@ -244,6 +244,7 @@ fn cmd_run(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                 permissions,
                 feedback_comment_ids: None,
                 resume_session: p.yes("resume"),
+                model: p.flag("model"),
             };
             let summary = runner.start(&mut store, &thread_id, &opts)?;
             print_run_summary(&summary)?;
@@ -261,7 +262,7 @@ fn print_run_summary(summary: &session::RunSummary) -> Result<()> {
             "event_id": s.event_id,
             "files": s.files.len(),
             "patch_len": s.patch_len,
-            "had_changes": s.had_changes,
+            "had_changes": true,
         })
     });
     print_json(&json!({
@@ -471,6 +472,7 @@ fn cmd_feedback(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                 // El feedback busca continuar el trabajo: se intenta reanudar
                 // la sesión del motor (con fallback explícito a sesión nueva).
                 resume_session: true,
+                model: p.flag("model"),
             };
             let summary = runner.start(&mut store, &thread_id, &opts)?;
             print_run_summary(&summary)?;

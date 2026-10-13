@@ -55,6 +55,8 @@ pub struct RunOptions {
     pub feedback_comment_ids: Option<Vec<String>>,
     /// Intentar `session/load` de la sesión previa del motor.
     pub resume_session: bool,
+    /// Modelo a fijar con `session/set_model` tras abrir la sesión.
+    pub model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -290,15 +292,14 @@ impl Runner {
         let mut snapshot: Option<checkpoint::CaptureOutcome> = None;
         if state == "completed" {
             match checkpoint::capture(store, &repo, &run, "run completado") {
-                Ok(c) => {
-                    if c.had_changes {
-                        self.note(UiNote::Event {
-                            thread_id: thread_id.to_string(),
-                            kind: events::K_CHECKPOINT_READY.into(),
-                        });
-                        snapshot = Some(c);
-                    }
+                Ok(Some(c)) => {
+                    self.note(UiNote::Event {
+                        thread_id: thread_id.to_string(),
+                        kind: events::K_CHECKPOINT_READY.into(),
+                    });
+                    snapshot = Some(c);
                 }
+                Ok(None) => {}
                 Err(e) => {
                     state = "failed";
                     detail = Some(format!("captura de checkpoint falló: {e}"));
@@ -387,7 +388,10 @@ impl Runner {
                                 return TurnResult {
                                     stop_reason: None,
                                     detail: Some(format!("session/new falló: {e}")),
-                                    feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                                    feedback_delivered: opts
+                                        .feedback_comment_ids
+                                        .as_ref()
+                                        .map(|_| false),
                                 };
                             }
                         },
@@ -449,6 +453,18 @@ impl Runner {
             };
         }
 
+        // Modelo explícito del run (si el usuario lo pidió).
+        if let Some(model) = &opts.model {
+            if let Err(e) = client.session_set_model(model).await {
+                let _ = client.kill().await;
+                return TurnResult {
+                    stop_reason: None,
+                    detail: Some(format!("no se pudo fijar el modelo `{model}`: {e}")),
+                    feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                };
+            }
+        }
+
         let stop = {
             let mut observer = PersistingObserver {
                 store,
@@ -458,11 +474,14 @@ impl Runner {
                 ui: self.ui.clone(),
                 current_message: None,
                 feedback_pending: opts.feedback_comment_ids.clone().map(|ids| (ids, false)),
-                tool_status: HashMap::new(),
+                tools: HashMap::new(),
             };
             let res = client
                 .prompt(prompt, &mut observer, self.cancel.take())
                 .await;
+            // El último mensaje acumulado del turno se persiste SIEMPRE,
+            // aunque el turno haya fallado (es evidencia de lo que dijo el motor).
+            let flush = observer.flush_message();
             // La entrega (o su ausencia) se decide aquí; el evento de fallo lo
             // escribe el llamador con el resultado final del run.
             let delivered = observer
@@ -470,6 +489,13 @@ impl Runner {
                 .as_ref()
                 .map(|(_, delivered)| *delivered);
             drop(observer);
+            if let Err(e) = flush {
+                return TurnResult {
+                    stop_reason: None,
+                    detail: Some(format!("no se pudo persistir el mensaje final: {e}")),
+                    feedback_delivered: delivered,
+                };
+            }
             match res {
                 Ok(stop) => TurnResult {
                     stop_reason: Some(stop),
@@ -569,7 +595,9 @@ struct PersistingObserver<'a> {
     ui: Option<std_mpsc::Sender<UiNote>>,
     current_message: Option<(Option<String>, String)>,
     feedback_pending: Option<(Vec<String>, bool)>,
-    tool_status: HashMap<String, String>,
+    /// `toolCallId → (título, último estado visto)`: los updates de Hermes no
+    /// repiten el título, así que se arrastra desde el `tool_call` inicial.
+    tools: HashMap<String, (String, String)>,
 }
 
 impl PersistingObserver<'_> {
@@ -661,22 +689,25 @@ impl TurnObserver for PersistingObserver<'_> {
                     if !is_final {
                         return Ok(());
                     }
-                    if self.tool_status.get(&tool_call_id) == status.as_ref() {
-                        return Ok(());
+                    if let Some((_, last)) = self.tools.get(&tool_call_id) {
+                        if Some(last) == status.as_ref() {
+                            return Ok(());
+                        }
                     }
                 }
+                let title = update
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| self.tools.get(&tool_call_id).map(|(t, _)| t.clone()))
+                    .unwrap_or_else(|| tool_call_id.clone());
                 if let Some(s) = &status {
-                    self.tool_status.insert(tool_call_id.clone(), s.clone());
+                    self.tools
+                        .insert(tool_call_id.clone(), (title.clone(), s.clone()));
                 }
                 let tc = payload::AgentToolCall {
                     tool_call_id: tool_call_id.clone(),
-                    title: truncate(
-                        update
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .unwrap_or(&tool_call_id),
-                        300,
-                    ),
+                    title: truncate(&title, 300),
                     kind: update
                         .get("kind")
                         .and_then(Value::as_str)

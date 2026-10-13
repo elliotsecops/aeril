@@ -403,6 +403,19 @@ impl AcpClient {
         }
     }
 
+    /// Fija el modelo de la sesión (`session/set_model`). Algunos backends no
+    /// lo soportan: el error se propaga y el run no continúa a ciegas.
+    pub async fn session_set_model(&mut self, model_id: &str) -> Result<()> {
+        let session_id = self
+            .session_id
+            .clone()
+            .ok_or_else(|| Error::backend("set_model sin sesión abierta"))?;
+        let params = json!({"sessionId": session_id, "modelId": model_id});
+        let mut obs = NoopObserver;
+        self.request("session/set_model", params, &mut obs).await?;
+        Ok(())
+    }
+
     /// Envía un prompt y bombea el turno hasta la respuesta final.
     /// `cancel` permite pedir `session/cancel` desde otro thread.
     pub async fn prompt(

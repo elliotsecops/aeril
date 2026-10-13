@@ -19,15 +19,21 @@ pub struct Captured {
     pub tree_oid: String,
     pub files: Vec<FileSummary>,
     pub patch: String,
-    pub had_changes: bool,
 }
 
 /// Captura el estado del WORKING TREE como objetos inmutables.
 ///
+/// Devuelve `Ok(None)` si el contenido es idéntico a la base: no hay nada
+/// que revisar y no se publica ni un evento `prepared` ni una ref.
+///
 /// `worktree_repo` debe ser el repositorio ligado al worktree de la tarea (su
 /// índice es el que refleja el checkout). El commit resultante tiene como
 /// único padre el commit base de la tarea (sin encadenar checkpoints).
-pub fn capture(worktree_repo: &Repository, base_oid: &str, message: &str) -> Result<Captured> {
+pub fn capture(
+    worktree_repo: &Repository,
+    base_oid: &str,
+    message: &str,
+) -> Result<Option<Captured>> {
     match worktree_repo.state() {
         git2::RepositoryState::Clean => {}
         other => {
@@ -105,14 +111,18 @@ pub fn capture(worktree_repo: &Repository, base_oid: &str, message: &str) -> Res
     let commit_oid = worktree_repo.commit(None, &sig, &sig, message, &tree, &[&base_commit])?;
 
     let files = crate::git::diff::files_between(worktree_repo, base_oid, &commit_oid.to_string())?;
+    if files.is_empty() {
+        // Sin cambios reales: el commit queda huérfano (inofensivo) y NO se
+        // publica ref ni evento. Un "checkpoint vacío" no es una revisión.
+        return Ok(None);
+    }
     let patch = crate::git::diff::patch_between(worktree_repo, base_oid, &commit_oid.to_string())?;
-    Ok(Captured {
+    Ok(Some(Captured {
         commit_oid: commit_oid.to_string(),
         tree_oid: tree.id().to_string(),
-        had_changes: !files.is_empty(),
         files,
         patch,
-    })
+    }))
 }
 
 fn exec_bit(meta: &std::fs::Metadata) -> bool {

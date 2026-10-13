@@ -23,19 +23,44 @@ fn test_a_retencion_de_la_revision_comentada() {
     );
     let run1 = env.run_start(&thread, "Editá NOTES.md", &s1);
     assert_eq!(run1["state"], "completed", "run1: {run1}");
-    let s1_id = run1["snapshot"]["snapshot_id"].as_str().unwrap().to_string();
+    let s1_id = run1["snapshot"]["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let s1_oid = run1["snapshot"]["oid"].as_str().unwrap().to_string();
     assert_eq!(run1["snapshot"]["had_changes"], true);
 
     // 5: comentario anclado a S1.
     let c = env.aeril_ok(&[
-        "comment", "add", "--thread", &thread, "--snapshot", &s1_id, "--path", "NOTES.md",
-        "--start", "3", "--end", "3", "--text", "la línea 3 es vaga",
+        "comment",
+        "add",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &s1_id,
+        "--path",
+        "NOTES.md",
+        "--start",
+        "3",
+        "--end",
+        "3",
+        "--text",
+        "la línea 3 es vaga",
     ]);
     let comment_id = c["comment_id"].as_str().unwrap().to_string();
 
-    let before = env.aeril_ok(&["comment", "show", "--thread", &thread, "--comment", &comment_id]);
-    assert_eq!(before["blob_verified"], true, "el blob del ancla debe verificar");
+    let before = env.aeril_ok(&[
+        "comment",
+        "show",
+        "--thread",
+        &thread,
+        "--comment",
+        &comment_id,
+    ]);
+    assert_eq!(
+        before["blob_verified"], true,
+        "el blob del ancla debe verificar"
+    );
     assert_eq!(before["snapshot_oid"].as_str().unwrap(), s1_oid);
     let s1_patch = before["original_patch"].as_str().unwrap().to_string();
     assert!(s1_patch.contains("+# Notas v2"));
@@ -53,10 +78,14 @@ fn test_a_retencion_de_la_revision_comentada() {
     assert_eq!(run2["state"], "completed", "run2: {run2}");
     let s2_oid = run2["snapshot"]["oid"].as_str().unwrap().to_string();
     assert_ne!(s1_oid, s2_oid, "S1 y S2 deben ser objetos distintos");
-    let s2_patch = env
-        .aeril_ok(&["checkpoint", "show", "--thread", &thread, "--snapshot",
-            run2["snapshot"]["snapshot_id"].as_str().unwrap()])
-        ["patch"]
+    let s2_patch = env.aeril_ok(&[
+        "checkpoint",
+        "show",
+        "--thread",
+        &thread,
+        "--snapshot",
+        run2["snapshot"]["snapshot_id"].as_str().unwrap(),
+    ])["patch"]
         .as_str()
         .unwrap()
         .to_string();
@@ -76,7 +105,14 @@ fn test_a_retencion_de_la_revision_comentada() {
     assert_eq!(rec.as_array().unwrap().len(), 0, "no hay nada pendiente");
 
     // 10: el comentario reabre EXACTAMENTE el patch de S1.
-    let after = env.aeril_ok(&["comment", "show", "--thread", &thread, "--comment", &comment_id]);
+    let after = env.aeril_ok(&[
+        "comment",
+        "show",
+        "--thread",
+        &thread,
+        "--comment",
+        &comment_id,
+    ]);
     assert_eq!(
         after["original_patch"].as_str().unwrap(),
         s1_patch,
@@ -106,24 +142,46 @@ fn test_a_bis_el_comentario_sobrevive_a_mas_ediciones() {
     // Variante: dos ediciones más después del comentario; el ancla no cambia.
     let env = TestEnv::new("retention-more");
     let thread = env.thread_new("Más ediciones");
-    let s1 = env.script("s1", mock_edit("NOTES.md", "# v2\n\nfragmento comentado\n", "uno"));
+    let s1 = env.script(
+        "s1",
+        mock_edit("NOTES.md", "# v2\n\nfragmento comentado\n", "uno"),
+    );
     let r1 = env.run_start(&thread, "uno", &s1);
     let sid = r1["snapshot"]["snapshot_id"].as_str().unwrap().to_string();
     let oid = r1["snapshot"]["oid"].as_str().unwrap().to_string();
     let c = env.aeril_ok(&[
-        "comment", "add", "--thread", &thread, "--snapshot", &sid, "--path", "NOTES.md",
-        "--start", "3", "--end", "3", "--text", "nota",
+        "comment",
+        "add",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &sid,
+        "--path",
+        "NOTES.md",
+        "--start",
+        "3",
+        "--end",
+        "3",
+        "--text",
+        "nota",
     ]);
     let cid = c["comment_id"].as_str().unwrap().to_string();
     for i in 0..2 {
         let s = env.script(
             &format!("more{i}"),
-            mock_edit("NOTES.md", &format!("# v{} \n\ncontenido cambiado {i}\n", 3 + i), "mas"),
+            mock_edit(
+                "NOTES.md",
+                &format!("# v{} \n\ncontenido cambiado {i}\n", 3 + i),
+                "mas",
+            ),
         );
         let r = env.run_start(&thread, "seguir", &s);
         assert_eq!(r["state"], "completed");
     }
     let view = env.aeril_ok(&["comment", "show", "--thread", &thread, "--comment", &cid]);
     assert_eq!(view["snapshot_oid"].as_str().unwrap(), oid);
-    assert_eq!(view["anchored_text"].as_str().unwrap(), "fragmento comentado");
+    assert_eq!(
+        view["anchored_text"].as_str().unwrap(),
+        "fragmento comentado"
+    );
 }

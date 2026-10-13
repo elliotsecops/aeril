@@ -256,6 +256,7 @@ impl App {
                 permissions: PermissionPolicySetting::Auto,
                 feedback_comment_ids: Some(ids.clone()),
                 resume_session: true,
+                model: None,
             },
             &format!("enviando {} comentario(s) al agente…", ids.len()),
         );

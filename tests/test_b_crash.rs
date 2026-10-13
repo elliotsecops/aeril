@@ -13,11 +13,21 @@ fn crash_run(env: &TestEnv, point: &str) -> String {
     let thread = env.thread_new("crash");
     let script = env.script(
         &format!("s-{point}"),
-        mock_edit("NOTES.md", "# Notas v2\n\ncontenido del crash\n", "editando"),
+        mock_edit(
+            "NOTES.md",
+            "# Notas v2\n\ncontenido del crash\n",
+            "editando",
+        ),
     );
     let out = env.aeril_env(
         &[
-            "run", "start", "--thread", &thread, "--prompt", "x", "--backend",
+            "run",
+            "start",
+            "--thread",
+            &thread,
+            "--prompt",
+            "x",
+            "--backend",
             &format!("mock:{}", script.display()),
         ],
         &[("AERIL_CRASH_AFTER", point)],
@@ -60,8 +70,20 @@ fn crash_en_cada_frontera_se_recupera_o_reporta() {
 
                 // Comentario antes de readiness: debe fallar (solo tras ready).
                 let c = env.aeril(&[
-                    "comment", "add", "--thread", &thread, "--snapshot", &sid, "--path", "NOTES.md",
-                    "--start", "3", "--end", "3", "--text", "todavía no",
+                    "comment",
+                    "add",
+                    "--thread",
+                    &thread,
+                    "--snapshot",
+                    &sid,
+                    "--path",
+                    "NOTES.md",
+                    "--start",
+                    "3",
+                    "--end",
+                    "3",
+                    "--text",
+                    "todavía no",
                 ]);
                 assert!(!c.status.success(), "no se comenta antes de ready");
                 assert!(
@@ -93,7 +115,12 @@ fn crash_en_cada_frontera_se_recupera_o_reporta() {
                 assert_eq!(ready["state"], "ready");
                 assert_eq!(ready["recovered"], true);
                 let show = env.aeril_ok(&[
-                    "checkpoint", "show", "--thread", &thread, "--snapshot", &sid,
+                    "checkpoint",
+                    "show",
+                    "--thread",
+                    &thread,
+                    "--snapshot",
+                    &sid,
                 ]);
                 assert_eq!(show["oid"].as_str().unwrap(), expected_oid);
                 let patch = show["patch"].as_str().unwrap();
@@ -110,15 +137,24 @@ fn crash_en_cada_frontera_se_recupera_o_reporta() {
                 let rec2 = env.aeril_ok(&["recover"]);
                 assert_eq!(rec2.as_array().unwrap().len(), 0);
                 let list3 = env.checkpoint_list(&thread);
-                assert_eq!(
-                    list3.iter().filter(|c| c["state"] == "ready").count(),
-                    1
-                );
+                assert_eq!(list3.iter().filter(|c| c["state"] == "ready").count(), 1);
 
                 // Comentar sobre el checkpoint recuperado funciona.
                 let c = env.aeril_ok(&[
-                    "comment", "add", "--thread", &thread, "--snapshot", &sid, "--path", "NOTES.md",
-                    "--start", "3", "--end", "3", "--text", "ok",
+                    "comment",
+                    "add",
+                    "--thread",
+                    &thread,
+                    "--snapshot",
+                    &sid,
+                    "--path",
+                    "NOTES.md",
+                    "--start",
+                    "3",
+                    "--end",
+                    "3",
+                    "--text",
+                    "ok",
                 ]);
                 assert!(c["comment_id"].as_str().is_some());
             }
@@ -139,7 +175,13 @@ fn crash_externo_con_sigkill_desde_afuera() {
     let marker = env.root.join("marker");
     let mut child = Command::new(BIN)
         .args([
-            "run", "start", "--thread", &thread, "--prompt", "x", "--backend",
+            "run",
+            "start",
+            "--thread",
+            &thread,
+            "--prompt",
+            "x",
+            "--backend",
             &format!("mock:{}", script.display()),
         ])
         .env("AERIL_DATA_DIR", &env.data)
