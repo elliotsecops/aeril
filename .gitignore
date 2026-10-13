@@ -1,0 +1,9 @@
+# Rust
+/target
+*.rs.bk
+
+# Estado local de Aeril y datos generados (nunca versionar)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/bench-data/
