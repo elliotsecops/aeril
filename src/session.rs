@@ -9,12 +9,14 @@ use crate::agent::acp::{
 };
 use crate::agent::{BackendSpec, resolve_backend};
 use crate::checkpoint;
+use crate::crash;
 use crate::error::{Error, Result};
 use crate::git;
 use crate::ids::new_id;
 use crate::store::events::{self, payload};
 use crate::store::runs::{self, RunRow, StartRunSpec};
-use crate::store::{Store, threads};
+use crate::store::{Store, leases, threads};
+use crate::timeutil::now_ms;
 use crate::util::{fnv1a_hex, truncate};
 use git2::Repository;
 use serde_json::Value;
@@ -104,22 +106,86 @@ impl Runner {
         let latest = runs::latest(&store.conn, thread_id)?;
         let prev_session = latest.as_ref().and_then(|r| r.engine_session_id.clone());
 
-        // ── base de la tarea y workspace verificado ─────────────────────────
+        // ── base de la tarea y workspace candidato ───────────────────────────
         let feedback = opts.feedback_comment_ids.is_some();
-        let (base_oid, target) = if feedback {
+        let base_oid: String = if feedback {
             let (_, ready) = checkpoint::latest_ready(store, thread_id)?.ok_or_else(|| {
                 Error::invalid("feedback requiere al menos un checkpoint en estado ready")
             })?;
-            match latest.as_ref().and_then(|r| r.workspace_id.clone()) {
+            ready.oid
+        } else {
+            git::head_oid(&repo)?
+        };
+        let candidate_ws: Option<String> = if feedback {
+            latest.as_ref().and_then(|r| r.workspace_id.clone())
+        } else {
+            match latest.as_ref() {
+                Some(r) if r.base_oid.as_deref() == Some(base_oid.as_str()) => {
+                    r.workspace_id.clone()
+                }
+                _ => None,
+            }
+        };
+
+        // ── lease del workspace existente ANTES de verificarlo o tocarlo ────
+        // Dos procesos de Aeril no pueden editar el mismo checkout a la vez;
+        // un lease vencido o de un proceso muerto se toma y se registra.
+        let pre_run_id = new_id();
+        let mut lease_guard: Option<LeaseGuard> = None;
+        if let Some(ws) = &candidate_ws {
+            match leases::try_acquire(
+                &mut store.conn,
+                ws,
+                &pre_run_id,
+                std::process::id() as i64,
+                leases::DEFAULT_TTL_MS,
+            )? {
+                leases::AcquireOutcome::Busy {
+                    run_id: busy_run,
+                    pid,
+                    age_ms,
+                } => {
+                    return Err(Error::conflict(format!(
+                        "workspace {ws} en uso por el run {busy_run} (pid {pid}, renovado hace {age_ms} ms); esperá a que termine o resolvé el lease vencido"
+                    )));
+                }
+                leases::AcquireOutcome::Acquired { took_over } => {
+                    if let Some(t) = took_over {
+                        events::append_typed(
+                            &mut store.conn,
+                            thread_id,
+                            None,
+                            events::K_WORKSPACE_LEASE_TAKEN_OVER,
+                            "system",
+                            &payload::WorkspaceLeaseTakenOver {
+                                workspace_id: ws.clone(),
+                                previous_run_id: t.previous_run_id,
+                                previous_pid: t.previous_pid,
+                                age_ms: t.age_ms,
+                                reason: t.reason.to_string(),
+                            },
+                        )?;
+                    }
+                    lease_guard = Some(LeaseGuard::start(
+                        self.db_path.clone(),
+                        ws.clone(),
+                        pre_run_id.clone(),
+                    ));
+                }
+            }
+        }
+
+        // ── verificación / recreación del workspace ──────────────────────────
+        let target: WorkTarget = if feedback {
+            let (_, ready) = checkpoint::latest_ready(store, thread_id)?
+                .ok_or_else(|| Error::invalid("feedback sin checkpoint listo"))?;
+            match candidate_ws.clone() {
                 Some(ws) => match git::worktree::verify(&repo, &self.data_dir, &ws, &ready.oid) {
-                    git::worktree::VerifyOutcome::Ok => (
-                        ready.oid.clone(),
-                        WorkTarget {
-                            workspace_id: ws.clone(),
-                            path: git::worktree::path_for(&self.data_dir, &ws),
-                            branch: crate::ids::workspace_branch(&ws),
-                        },
-                    ),
+                    git::worktree::VerifyOutcome::Ok => WorkTarget {
+                        workspace_id: ws.clone(),
+                        path: git::worktree::path_for(&self.data_dir, &ws),
+                        branch: crate::ids::workspace_branch(&ws),
+                    },
                     other => {
                         let ws = git::worktree::recreate(&repo, &self.data_dir, &ws, &ready.oid)?;
                         persist_recreation(
@@ -129,67 +195,106 @@ impl Runner {
                             &ready.oid,
                             &format!("{other:?}"),
                         )?;
-                        (
-                            ready.oid.clone(),
-                            WorkTarget {
-                                workspace_id: ws.workspace_id,
-                                path: ws.path,
-                                branch: ws.branch,
-                            },
-                        )
+                        WorkTarget {
+                            workspace_id: ws.workspace_id,
+                            path: ws.path,
+                            branch: ws.branch,
+                        }
                     }
                 },
                 None => {
                     let ws = git::worktree::create(&repo, &self.data_dir, &ready.oid, None)?;
-                    (
-                        ready.oid.clone(),
-                        WorkTarget {
-                            workspace_id: ws.workspace_id,
-                            path: ws.path,
-                            branch: ws.branch,
-                        },
-                    )
+                    WorkTarget {
+                        workspace_id: ws.workspace_id,
+                        path: ws.path,
+                        branch: ws.branch,
+                    }
                 }
             }
         } else {
-            let base = git::head_oid(&repo)?;
-            let reuse = match latest.as_ref().and_then(|r| r.workspace_id.clone()) {
+            match candidate_ws.clone() {
                 Some(ws)
-                    if latest.as_ref().and_then(|r| r.base_oid.clone()) == Some(base.clone())
-                        && matches!(
-                            git::worktree::verify(&repo, &self.data_dir, &ws, &base),
-                            git::worktree::VerifyOutcome::Ok
-                        ) =>
+                    if matches!(
+                        git::worktree::verify(&repo, &self.data_dir, &ws, &base_oid),
+                        git::worktree::VerifyOutcome::Ok
+                    ) =>
                 {
-                    Some(WorkTarget {
+                    WorkTarget {
                         workspace_id: ws.clone(),
                         path: git::worktree::path_for(&self.data_dir, &ws),
                         branch: crate::ids::workspace_branch(&ws),
-                    })
+                    }
                 }
-                _ => None,
-            };
-            match reuse {
-                Some(t) => (base, t),
-                None => {
-                    let ws = git::worktree::create(&repo, &self.data_dir, &base, None)?;
-                    (
-                        base,
-                        WorkTarget {
-                            workspace_id: ws.workspace_id,
-                            path: ws.path,
-                            branch: ws.branch,
-                        },
-                    )
+                _ => {
+                    // Workspace nuevo (id fresco): privado del run, sin lease
+                    // necesario (ningún otro proceso conoce su identidad).
+                    let ws = git::worktree::create(&repo, &self.data_dir, &base_oid, None)?;
+                    WorkTarget {
+                        workspace_id: ws.workspace_id,
+                        path: ws.path,
+                        branch: ws.branch,
+                    }
                 }
             }
         };
+
+        // Todo run adquiere el lease de SU workspace (también los recién
+        // creados: otro proceso podría reutilizar el mismo workspace después).
+        let needs_lease = lease_guard
+            .as_ref()
+            .map(|g| g.workspace_id != target.workspace_id)
+            .unwrap_or(true);
+        if needs_lease {
+            drop(lease_guard.take());
+            match leases::try_acquire(
+                &mut store.conn,
+                &target.workspace_id,
+                &pre_run_id,
+                std::process::id() as i64,
+                leases::DEFAULT_TTL_MS,
+            )? {
+                leases::AcquireOutcome::Busy {
+                    run_id: busy_run,
+                    pid,
+                    age_ms,
+                } => {
+                    return Err(Error::conflict(format!(
+                        "workspace {} en uso por el run {busy_run} (pid {pid}, renovado hace {age_ms} ms)",
+                        target.workspace_id
+                    )));
+                }
+                leases::AcquireOutcome::Acquired { took_over } => {
+                    if let Some(t) = took_over {
+                        events::append_typed(
+                            &mut store.conn,
+                            thread_id,
+                            None,
+                            events::K_WORKSPACE_LEASE_TAKEN_OVER,
+                            "system",
+                            &payload::WorkspaceLeaseTakenOver {
+                                workspace_id: target.workspace_id.clone(),
+                                previous_run_id: t.previous_run_id,
+                                previous_pid: t.previous_pid,
+                                age_ms: t.age_ms,
+                                reason: t.reason.to_string(),
+                            },
+                        )?;
+                    }
+                    lease_guard = Some(LeaseGuard::start(
+                        self.db_path.clone(),
+                        target.workspace_id.clone(),
+                        pre_run_id.clone(),
+                    ));
+                }
+            }
+        }
 
         // ── backend y run ────────────────────────────────────────────────────
         let spec = resolve_backend(&opts.backend)?;
         let run = runs::start(
             &mut store.conn,
             &StartRunSpec {
+                id: Some(&pre_run_id),
                 thread_id,
                 backend: &spec.name,
                 backend_version: &spec.version,
@@ -324,6 +429,8 @@ impl Runner {
             detail.as_deref(),
             stop_reason.as_deref(),
         )?;
+        // Libera el lease explícitamente (además del Drop por early-returns).
+        drop(lease_guard);
         self.note(UiNote::RunDone {
             thread_id: thread_id.to_string(),
             run_id: run.id.clone(),
@@ -502,8 +609,16 @@ impl Runner {
                 };
             }
             match res {
-                Ok(stop) => TurnResult {
-                    stop_reason: Some(stop),
+                Ok(c) if c.cancel_unconfirmed => TurnResult {
+                    stop_reason: Some("cancelled".into()),
+                    detail: Some(
+                        "cancelación no confirmada por el backend; proceso terminado tras el plazo"
+                            .into(),
+                    ),
+                    feedback_delivered: delivered,
+                },
+                Ok(c) => TurnResult {
+                    stop_reason: Some(c.stop_reason),
                     detail: None,
                     feedback_delivered: delivered,
                 },
@@ -525,6 +640,75 @@ struct TurnResult {
     /// `None` = este run no envía feedback; `Some(true)` = el motor dio
     /// evidencia de procesarlo; `Some(false)` = quedó sin ack.
     feedback_delivered: Option<bool>,
+}
+
+/// Guard del lease de workspace: renueva en un thread propio y libera al
+/// soltarse (Drop). El lease coordina SOLO procesos de Aeril; no aísla de
+/// procesos externos con los permisos del usuario.
+struct LeaseGuard {
+    db_path: PathBuf,
+    workspace_id: String,
+    run_id: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    renewer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LeaseGuard {
+    fn start(db_path: PathBuf, workspace_id: String, run_id: String) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let db = db_path.clone();
+        let ws = workspace_id.clone();
+        let rid = run_id.clone();
+        let renewer = std::thread::spawn(move || {
+            let mut ticks: u32 = 0;
+            loop {
+                if stop_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                ticks += 1;
+                if !ticks.is_multiple_of(15) {
+                    continue;
+                }
+                match Store::open(&db) {
+                    Ok(store) => match leases::renew(&store.conn, &ws, &rid) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eprintln!(
+                                "aeril: lease del workspace {ws} perdido; la exclusión entre procesos de Aeril ya no está garantizada"
+                            );
+                            return;
+                        }
+                        Err(e) => eprintln!("aeril: renovación de lease falló: {e}"),
+                    },
+                    Err(e) => {
+                        eprintln!("aeril: no se pudo abrir el store para renovar el lease: {e}")
+                    }
+                }
+            }
+        });
+        LeaseGuard {
+            db_path,
+            workspace_id,
+            run_id,
+            stop,
+            renewer: Some(renewer),
+        }
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(store) = Store::open(&self.db_path) {
+            let _ = leases::release(&store.conn, &self.workspace_id, &self.run_id);
+        }
+        if let Some(t) = self.renewer.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 fn persist_recreation(
@@ -901,14 +1085,35 @@ pub fn integrate(
     target_branch: &str,
     expect_oid: Option<&str>,
 ) -> Result<git::integrate::IntegrationOutcome> {
+    // Antes de una operación nueva, reconciliar intentos interrumpidos de
+    // este u otros threads (nunca se fabrica éxito sin evidencia de la ref).
+    reconcile_integrations(store)?;
     let thread = threads::get(&store.conn, thread_id)?
         .ok_or_else(|| Error::not_found(format!("thread {thread_id}")))?;
     let (_, ready) = checkpoint::ready_for_snapshot(store, thread_id, snapshot_id)?
         .ok_or_else(|| Error::not_ready(format!("no hay checkpoint ready {snapshot_id}")))?;
     let repo = git::open(Path::new(&thread.repo_path))?;
     let expect = expect_oid.unwrap_or(&ready.base_oid).to_string();
+
+    // Intención durable ANTES de tocar la ref: si el proceso muere entre
+    // medio, la reconciliación al reabrir decide con evidencia.
+    events::append_typed(
+        &mut store.conn,
+        thread_id,
+        None,
+        events::K_INTEGRATION_REQUESTED,
+        "system",
+        &payload::IntegrationRequested {
+            target_branch: target_branch.to_string(),
+            source_oid: ready.oid.clone(),
+            target_oid_expected: expect.clone(),
+        },
+    )?;
+    crash::point("integrate_intent");
+
     match git::integrate::fast_forward(&repo, target_branch, &ready.oid, &expect) {
         Ok(outcome) => {
+            crash::point("integrate_committed");
             events::append_typed(
                 &mut store.conn,
                 thread_id,
@@ -920,6 +1125,7 @@ pub fn integrate(
                     source_oid: ready.oid.clone(),
                     target_oid_before: outcome.target_oid_before.clone(),
                     target_oid_after: outcome.target_oid_after.clone(),
+                    recovered: false,
                 },
             )?;
             Ok(outcome)
@@ -945,6 +1151,185 @@ pub fn integrate(
             Err(Error::conflict(blocked.describe()))
         }
     }
+}
+
+/// Resultado de reconciliar un intento de integración interrumpido.
+#[derive(Debug)]
+pub enum IntegrationReconcile {
+    /// La ref quedó en la fuente: la integración SÍ ocurrió (evidencia).
+    CompletedRecovered {
+        target_branch: String,
+        source_oid: String,
+    },
+    /// La ref quedó en la base esperada: el intento no se aplicó (abandonado).
+    Abandoned {
+        target_branch: String,
+        source_oid: String,
+        reason: String,
+    },
+}
+
+/// Reconcilia `integration.requested` sin resolución. Idempotente frente a
+/// reconciliaciones concurrentes (el append re-chequea dentro de la tx).
+/// Nunca mueve refs: solo registra lo que la ref demuestra.
+pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconcile>> {
+    #[derive(Debug)]
+    struct Pending {
+        seq: i64,
+        thread_id: String,
+        repo_path: String,
+        requested: payload::IntegrationRequested,
+    }
+    let pending: Vec<Pending> = {
+        let mut stmt = store.conn.prepare(
+        "SELECT r.seq, r.thread_id, r.payload, t.repo_path
+         FROM events r JOIN threads t ON t.id = r.thread_id
+         WHERE r.kind = ?1
+           AND NOT EXISTS (
+             SELECT 1 FROM events s
+             WHERE s.thread_id = r.thread_id AND s.seq > r.seq
+               AND s.kind IN (?2, ?3)
+               AND json_extract(s.payload, '$.target_branch') = json_extract(r.payload, '$.target_branch')
+               AND json_extract(s.payload, '$.source_oid') = json_extract(r.payload, '$.source_oid')
+           )
+         ORDER BY r.seq ASC",
+    )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                events::K_INTEGRATION_REQUESTED,
+                events::K_INTEGRATION_COMPLETED,
+                events::K_INTEGRATION_BLOCKED
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        let mut pending = Vec::new();
+        for r in rows {
+            let (seq, thread_id, payload_text, repo_path) = r?;
+            let requested: payload::IntegrationRequested = serde_json::from_str(&payload_text)
+                .map_err(|e| Error::integrity(format!("integration.requested ilegible: {e}")))?;
+            pending.push(Pending {
+                seq,
+                thread_id,
+                repo_path,
+                requested,
+            });
+        }
+        pending
+    };
+
+    let mut outcomes = Vec::new();
+    for p in pending {
+        let Some(repo) = git::open(Path::new(&p.repo_path)).ok() else {
+            continue; // repo no disponible: sigue pendiente, sin inventar nada
+        };
+        let full_ref = format!("refs/heads/{}", p.requested.target_branch);
+        let current = repo
+            .find_reference(&full_ref)
+            .ok()
+            .and_then(|r| r.target())
+            .map(|o| o.to_string());
+
+        let (kind, value, outcome) = match current.as_deref() {
+            Some(cur) if cur == p.requested.source_oid => {
+                let ev = payload::IntegrationCompleted {
+                    target_branch: p.requested.target_branch.clone(),
+                    source_oid: p.requested.source_oid.clone(),
+                    target_oid_before: p.requested.target_oid_expected.clone(),
+                    target_oid_after: p.requested.source_oid.clone(),
+                    recovered: true,
+                };
+                let outcome = IntegrationReconcile::CompletedRecovered {
+                    target_branch: p.requested.target_branch.clone(),
+                    source_oid: p.requested.source_oid.clone(),
+                };
+                (
+                    events::K_INTEGRATION_COMPLETED,
+                    serde_json::to_value(ev)?,
+                    outcome,
+                )
+            }
+            Some(cur) if cur == p.requested.target_oid_expected => {
+                let reason =
+                    "intento abandonado: la ref no cambió (crash antes de aplicar)".to_string();
+                let ev = payload::IntegrationBlocked {
+                    target_branch: p.requested.target_branch.clone(),
+                    source_oid: p.requested.source_oid.clone(),
+                    target_oid_current: Some(cur.to_string()),
+                    reason: reason.clone(),
+                };
+                let outcome = IntegrationReconcile::Abandoned {
+                    target_branch: p.requested.target_branch.clone(),
+                    source_oid: p.requested.source_oid.clone(),
+                    reason,
+                };
+                (
+                    events::K_INTEGRATION_BLOCKED,
+                    serde_json::to_value(ev)?,
+                    outcome,
+                )
+            }
+            other => {
+                let reason = format!(
+                    "la ref fue movida por otro escritor tras la interrupción (actual: {})",
+                    other.unwrap_or("ausente")
+                );
+                let ev = payload::IntegrationBlocked {
+                    target_branch: p.requested.target_branch.clone(),
+                    source_oid: p.requested.source_oid.clone(),
+                    target_oid_current: other.map(str::to_string),
+                    reason: reason.clone(),
+                };
+                let outcome = IntegrationReconcile::Abandoned {
+                    target_branch: p.requested.target_branch.clone(),
+                    source_oid: p.requested.source_oid.clone(),
+                    reason,
+                };
+                (
+                    events::K_INTEGRATION_BLOCKED,
+                    serde_json::to_value(ev)?,
+                    outcome,
+                )
+            }
+        };
+
+        // Idempotente: re-chequear dentro de la transacción.
+        let tx = store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let already: i64 = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM events s
+                WHERE s.thread_id = ?1 AND s.seq > ?2
+                  AND s.kind IN (?3, ?4)
+                  AND json_extract(s.payload, '$.target_branch') = ?5
+                  AND json_extract(s.payload, '$.source_oid') = ?6
+            )",
+            rusqlite::params![
+                p.thread_id,
+                p.seq,
+                events::K_INTEGRATION_COMPLETED,
+                events::K_INTEGRATION_BLOCKED,
+                p.requested.target_branch,
+                p.requested.source_oid
+            ],
+            |row| row.get(0),
+        )?;
+        if already == 1 {
+            tx.rollback()?;
+            continue;
+        }
+        events::append_tx(&tx, &p.thread_id, None, kind, "system", &value, now_ms())?;
+        tx.commit()?;
+        outcomes.push(outcome);
+    }
+    Ok(outcomes)
 }
 
 // ── validación sobre un checkout aislado del snapshot ───────────────────────

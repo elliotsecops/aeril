@@ -218,12 +218,24 @@ pub enum PublishOutcome {
 
 /// Publica la ref del checkpoint con semántica de estado esperado:
 /// - no existe → crear;
-/// - existe con el MISMO OID → retry idempotente, ok;
+/// - existe con el MISMO OID → retry idempotente, ok (aunque la haya creado
+///   otro proceso en paralelo: la creación falla y se re-verifica);
 /// - existe con OTRO OID → conflicto de integridad, nunca se sobrescribe.
 pub fn publish_ref_cas(
     repo: &Repository,
     ref_name: &str,
     expected_oid: &str,
+) -> Result<PublishOutcome> {
+    publish_ref_cas_with_hook(repo, ref_name, expected_oid, None)
+}
+
+/// Igual que [`publish_ref_cas`] con un `hook` que corre tras observar que la
+/// ref no existe y antes de crearla. Solo para tests deterministas de carrera.
+pub fn publish_ref_cas_with_hook(
+    repo: &Repository,
+    ref_name: &str,
+    expected_oid: &str,
+    hook: Option<&dyn Fn()>,
 ) -> Result<PublishOutcome> {
     let expected = Oid::from_str(expected_oid)?;
     match repo.find_reference(ref_name) {
@@ -240,7 +252,27 @@ pub fn publish_ref_cas(
             }
         }
         Err(_) => {
-            repo.reference(ref_name, expected, false, "aeril: checkpoint")?;
+            if let Some(h) = hook {
+                h();
+            }
+            if let Err(create_err) = repo.reference(ref_name, expected, false, "aeril: checkpoint")
+            {
+                // Otro proceso pudo crear la ref en paralelo: misma
+                // (name, oid) = éxito idempotente; otro OID = conflicto.
+                return match repo.find_reference(ref_name) {
+                    Ok(existing) => {
+                        let target = existing.target().unwrap_or(Oid::ZERO_SHA1);
+                        if target == expected {
+                            Ok(PublishOutcome::AlreadyExists)
+                        } else {
+                            Err(Error::conflict(format!(
+                                "{ref_name} fue creada en paralelo apuntando a {target} y se esperaba {expected}: conflicto de integridad"
+                            )))
+                        }
+                    }
+                    Err(_) => Err(create_err.into()),
+                };
+            }
             let check = repo.find_reference(ref_name)?;
             if check.target() != Some(expected) {
                 return Err(Error::integrity(format!(

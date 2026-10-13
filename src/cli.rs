@@ -147,7 +147,7 @@ fn dispatch(args: &[String], t0: Instant) -> Result<i32> {
         Some("integrate") => cmd_integrate(&p, &db_path),
         Some("validate") => cmd_validate(&p, &data_dir, &db_path),
         Some("export") => cmd_export(&p, &db_path),
-        Some("bench") => cmd_bench(&p, &data_dir),
+        Some("bench") => cmd_bench(&p, &data_dir, &db_path),
         Some("__mock-agent") => {
             let script = p.require("script")?;
             agent::mock::run(&script)?;
@@ -421,11 +421,34 @@ fn cmd_comment(p: &Parsed, db_path: &Path) -> Result<i32> {
         }
         Some("list") => {
             let thread_id = p.require("thread")?;
+            let limit: i64 = p
+                .flag("limit")
+                .map(|v| v.parse())
+                .transpose()
+                .map_err(|_| Error::invalid("--limit inválido"))?
+                .unwrap_or(100);
+            let offset: i64 = p
+                .flag("offset")
+                .map(|v| v.parse())
+                .transpose()
+                .map_err(|_| Error::invalid("--offset inválido"))?
+                .unwrap_or(0);
             let store = open_store(db_path)?;
-            let repo = threads::get(&store.conn, &thread_id)?
-                .and_then(|t| git::open(Path::new(&t.repo_path)).ok());
-            let views = review::list_comments(&store, &thread_id, repo.as_ref())?;
-            let arr: Vec<Value> = views.iter().map(comment_view_json).collect();
+            let summaries = review::list_comment_summaries(&store, &thread_id, limit, offset)?;
+            let arr: Vec<Value> = summaries
+                .iter()
+                .map(|c| {
+                    json!({
+                        "comment_id": c.comment_id,
+                        "seq": c.seq,
+                        "text": c.text,
+                        "state": c.state.as_str(),
+                        "snapshot_id": c.anchor.snapshot_id,
+                        "snapshot_oid": c.snapshot_oid,
+                        "anchor": c.anchor,
+                    })
+                })
+                .collect();
             print_json(&Value::Array(arr))?;
             Ok(0)
         }
@@ -495,6 +518,9 @@ fn cmd_recover(_p: &Parsed, db_path: &Path) -> Result<i32> {
     let mut store = open_store(db_path)?;
     let outcomes =
         checkpoint::recover_pending(&mut store, &|path: &str| git::open(Path::new(path)).ok())?;
+    // Reconciliación de integraciones interrumpidas (B4): nunca mueve refs,
+    // solo registra lo que la ref demuestra.
+    let integrations = session::reconcile_integrations(&mut store)?;
     let arr: Vec<Value> = outcomes
         .iter()
         .map(|o| match o {
@@ -502,6 +528,9 @@ fn cmd_recover(_p: &Parsed, db_path: &Path) -> Result<i32> {
                 snapshot_id,
                 ref_recreated,
             } => json!({"action": "completed_ready", "snapshot_id": snapshot_id, "ref_recreated": ref_recreated}),
+            checkpoint::RecoveryOutcome::AlreadyResolved { snapshot_id } => {
+                json!({"action": "already_resolved", "snapshot_id": snapshot_id})
+            }
             checkpoint::RecoveryOutcome::RefConflict { snapshot_id, detail } => {
                 json!({"action": "ref_conflict", "snapshot_id": snapshot_id, "detail": detail})
             }
@@ -516,6 +545,20 @@ fn cmd_recover(_p: &Parsed, db_path: &Path) -> Result<i32> {
             }
         })
         .collect();
+    let mut arr = arr;
+    for i in integrations {
+        arr.push(match i {
+            session::IntegrationReconcile::CompletedRecovered {
+                target_branch,
+                source_oid,
+            } => json!({"action": "integration_completed_recovered", "target_branch": target_branch, "source_oid": source_oid}),
+            session::IntegrationReconcile::Abandoned {
+                target_branch,
+                source_oid,
+                reason,
+            } => json!({"action": "integration_abandoned", "target_branch": target_branch, "source_oid": source_oid, "reason": reason}),
+        });
+    }
     print_json(&Value::Array(arr))?;
     Ok(0)
 }
@@ -534,6 +577,14 @@ fn cmd_worktree(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
             let ws = run
                 .workspace_id
                 .ok_or_else(|| Error::invalid("el run no tiene workspace"))?;
+            if let Some(info) = crate::store::leases::active(&store.conn, &ws)? {
+                return Err(Error::conflict(format!(
+                    "el workspace {ws} tiene un run activo (run {}, pid {}, renovado hace {} ms): no se borra el worktree en uso",
+                    info.run_id,
+                    info.pid,
+                    crate::timeutil::now_ms() - info.renewed_ms
+                )));
+            }
             let repo = git::open(Path::new(&row.repo_path))?;
             git::worktree::remove(&repo, data_dir, &ws)?;
             print_json(&json!({"removed": true, "workspace_id": ws}))?;
@@ -623,7 +674,7 @@ fn cmd_export(p: &Parsed, db_path: &Path) -> Result<i32> {
 
 // ── bench ────────────────────────────────────────────────────────────────────
 
-fn cmd_bench(p: &Parsed, data_dir: &Path) -> Result<i32> {
+fn cmd_bench(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
     match p.pos.get(1).map(String::as_str) {
         Some("seed") => {
             let dir = p
@@ -657,6 +708,38 @@ fn cmd_bench(p: &Parsed, data_dir: &Path) -> Result<i32> {
                 "db_bytes": report.db_bytes,
             }))?;
             Ok(0)
+        }
+        Some("scale") => {
+            let runs: u64 = p
+                .flag("runs")
+                .map(|v| v.parse())
+                .transpose()
+                .map_err(|_| Error::invalid("--runs inválido"))?
+                .unwrap_or(5);
+            let delay_ms: u64 = p
+                .flag("delay-ms")
+                .map(|v| v.parse())
+                .transpose()
+                .map_err(|_| Error::invalid("--delay-ms inválido"))?
+                .unwrap_or(6000);
+            let dir = data_dir.join("scale");
+            let _ = db_path;
+            let report = bench::scale(&dir, runs, delay_ms)?;
+            print_json(&json!({
+                "runs": report.runs,
+                "failures": report.failures,
+                "app_rss_mb": report.app_rss_kb as f64 / 1024.0,
+                "agents_rss_mb": report.agents_rss_kb as f64 / 1024.0,
+                "total_rss_mb": report.total_rss_kb as f64 / 1024.0,
+                "gate_app_mb": report.gate_app_mb,
+                "app_ok": report.app_ok,
+                "note": report.note,
+            }))?;
+            Ok(if report.app_ok && report.failures == 0 {
+                0
+            } else {
+                4
+            })
         }
         other => Err(Error::invalid(format!("bench {other:?} no soportado"))),
     }

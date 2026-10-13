@@ -30,7 +30,7 @@ pub struct ThreadDetail {
     pub repo_path: String,
     pub events: Vec<EventRecord>,
     pub sel: usize,
-    pub comments: Vec<review::CommentView>,
+    pub comments: Vec<review::CommentSummary>,
     pub patch: Vec<String>,
     pub patch_scroll: u16,
 }
@@ -70,6 +70,7 @@ pub struct App {
     pub t0: Instant,
     pub first_draw_done: bool,
     pub input_processed: bool,
+    pub thread_opened_beacon: bool,
 }
 
 impl App {
@@ -106,8 +107,9 @@ impl App {
             return Ok(());
         };
         detail.events = events::fetch_tail(&self.store.conn, &detail.thread_id, 100)?;
-        let repo = git::open(Path::new(&detail.repo_path)).ok();
-        detail.comments = review::list_comments(&self.store, &detail.thread_id, repo.as_ref())?;
+        // Resúmenes livianos (sin patches): la memoria de revisión queda
+        // acotada; el patch se carga SOLO para el evento seleccionado.
+        detail.comments = review::list_comment_summaries(&self.store, &detail.thread_id, 200, 0)?;
         if detail.sel >= detail.events.len() {
             detail.sel = detail.events.len().saturating_sub(1);
         }
@@ -120,9 +122,15 @@ impl App {
                     detail.patch = p.patch.lines().map(str::to_string).collect();
                 }
             } else if ev.kind == events::K_COMMENT_ADDED
-                && let Some(c) = detail.comments.iter().find(|c| c.comment_id == ev.id)
+                && detail.comments.iter().any(|c| c.comment_id == ev.id)
             {
-                detail.patch = c.original_patch.lines().map(str::to_string).collect();
+                // El patch del comentario se carga SOLO para el seleccionado.
+                let repo = git::open(Path::new(&detail.repo_path)).ok();
+                if let Ok(view) =
+                    review::view_comment(&self.store, &detail.thread_id, &ev.id, repo.as_ref())
+                {
+                    detail.patch = view.original_patch.lines().map(str::to_string).collect();
+                }
             }
         }
         Ok(())
@@ -475,6 +483,8 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
     let outcomes =
         checkpoint::recover_pending(&mut store, &|path: &str| git::open(Path::new(path)).ok())?;
     let recovery_note = summarize_recovery(&outcomes);
+    // Reconciliación de integraciones interrumpidas (B4).
+    let _ = session::reconcile_integrations(&mut store)?;
 
     let threads = threads::list_projection(&store.conn, 200)?;
     let (ui_tx, ui_rx) = mpsc::channel();
@@ -496,6 +506,7 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
         t0,
         first_draw_done: false,
         input_processed: false,
+        thread_opened_beacon: false,
     };
 
     let mut terminal = ratatui::init();
@@ -537,6 +548,7 @@ fn summarize_recovery(outcomes: &[checkpoint::RecoveryOutcome]) -> Option<String
     for o in outcomes {
         match o {
             checkpoint::RecoveryOutcome::Completed { .. } => completed += 1,
+            checkpoint::RecoveryOutcome::AlreadyResolved { .. } => {}
             checkpoint::RecoveryOutcome::RefConflict { snapshot_id, .. } => problems.push(format!(
                 "conflicto de ref en snapshot {}",
                 &snapshot_id[..8.min(snapshot_id.len())]

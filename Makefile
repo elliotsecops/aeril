@@ -59,10 +59,10 @@ budget-start: $(BIN) bench-seed
 	@$(PYTHON) scripts/bench/startup.py --bin $(BIN) --data-dir $(BENCH_DIR) \
 		--runs 30 | tee $(DATA_DIR)/start.txt
 
-# 5 agentes ≤ 500 MB: no verificable en Fase 0 (un solo backend/agente).
+# 5 agentes: gate de la APP ≤ 500 MB con runs mock concurrentes; agentes y
+# total medidos aparte. NO prueba Hermes real (perfil compartido, no medible).
 budget-scale: $(BIN)
-	@echo "budget-scale: UNVERIFIED — Fase 0 solo mide un agente; ejecutar en Fase 1."
-	@exit 1
+	@$(BIN) bench scale --runs 5 --delay-ms 6000 --data-dir $(DATA_DIR)/scale-data | tee $(DATA_DIR)/scale.json
 
 budget: budget-size budget-deps budget-mem budget-start
 

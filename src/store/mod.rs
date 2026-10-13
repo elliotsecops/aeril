@@ -4,6 +4,7 @@
 //! modo WAL permite lectores concurrentes mientras el agente escribe.
 
 pub mod events;
+pub mod leases;
 pub mod runs;
 pub mod schema;
 pub mod threads;

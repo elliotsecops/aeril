@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -41,6 +41,15 @@ pub struct PermissionRequest {
 pub enum PermissionDecision {
     Selected { option_id: String, policy: String },
     Cancelled { policy: String },
+}
+
+/// Resultado de un turno de `session/prompt`.
+#[derive(Debug, Clone)]
+pub struct TurnCompletion {
+    pub stop_reason: String,
+    /// Cancelación pedida y NO confirmada: se agotó el plazo fijo tras el
+    /// `session/cancel` y el backend fue terminado.
+    pub cancel_unconfirmed: bool,
 }
 
 /// Observador del turno: persistencia y política viven fuera del protocolo.
@@ -94,6 +103,119 @@ enum ServerMsg {
     Closed(String),
 }
 
+/// Mensaje entrante + tamaño en bytes (para el presupuesto por turno).
+struct Frame {
+    msg: ServerMsg,
+    size: usize,
+}
+
+/// Límite por línea/mensaje ACP: rechazo explícito ANTES de asignar sin cota.
+fn max_line_bytes() -> usize {
+    crate::util::env_usize("AERIL_ACP_MAX_LINE_BYTES", 16 * 1024 * 1024)
+}
+
+/// Límite acumulado de bytes recibidos en un turno (o fase de control).
+fn max_turn_bytes() -> usize {
+    crate::util::env_usize("AERIL_ACP_MAX_TURN_BYTES", 64 * 1024 * 1024)
+}
+
+/// Lee una línea con cota estricta de memoria: nunca se acumulan más de
+/// `limit` bytes (más el chunk de `fill_buf`, que está acotado por el buffer).
+async fn read_bounded_line<R>(reader: &mut R, limit: usize) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if out.is_empty() { None } else { Some(out) });
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                if out.len() + pos > limit {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("mensaje ACP de más de {limit} bytes: rechazado"),
+                    ));
+                }
+                out.extend_from_slice(&available[..pos]);
+                reader.consume(pos + 1);
+                return Ok(Some(out));
+            }
+            None => {
+                if out.len() + available.len() > limit {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("mensaje ACP de más de {limit} bytes: rechazado"),
+                    ));
+                }
+                out.extend_from_slice(available);
+                let n = available.len();
+                reader.consume(n);
+            }
+        }
+    }
+}
+
+/// Como [`read_bounded_line`] pero para stderr: conserva hasta `keep` bytes
+/// por línea y descarta el resto (el log es diagnóstico, no protocolo).
+async fn read_line_lossy_bounded<R>(reader: &mut R, keep: usize) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut out: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if out.is_empty() && !truncated {
+                return Ok(None);
+            }
+            return Ok(Some(finalize_lossy(out, truncated)));
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                if out.len() < keep {
+                    let take = (keep - out.len()).min(pos);
+                    out.extend_from_slice(&available[..take]);
+                    if take < pos {
+                        truncated = true;
+                    }
+                } else if pos > 0 {
+                    truncated = true;
+                }
+                reader.consume(pos + 1);
+                return Ok(Some(finalize_lossy(out, truncated)));
+            }
+            None => {
+                if out.len() < keep {
+                    let take = (keep - out.len()).min(available.len());
+                    out.extend_from_slice(&available[..take]);
+                    if take < available.len() {
+                        truncated = true;
+                    }
+                } else if !available.is_empty() {
+                    truncated = true;
+                }
+                let n = available.len();
+                reader.consume(n);
+            }
+        }
+    }
+}
+
+fn finalize_lossy(mut out: Vec<u8>, truncated: bool) -> String {
+    let mut s = String::from_utf8_lossy(&out).into_owned();
+    if truncated {
+        s.push_str("…[truncado]");
+    }
+    out.clear();
+    s
+}
+
 #[derive(Debug, Clone)]
 pub struct RpcError {
     pub code: i64,
@@ -141,7 +263,7 @@ fn classify(line: &str) -> Result<ServerMsg> {
 pub struct AcpClient {
     stdin: ChildStdin,
     child: Child,
-    rx: mpsc::Receiver<ServerMsg>,
+    rx: mpsc::Receiver<Frame>,
     next_id: u64,
     stderr_tail: Arc<Mutex<Vec<String>>>,
     pub session_id: Option<String>,
@@ -177,8 +299,9 @@ impl AcpClient {
         {
             let tail = stderr_tail.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(l)) = lines.next_line().await {
+                let mut reader = BufReader::new(stderr);
+                // Buffer acotado: 200 líneas × ≤4 KiB por línea = ≤800 KiB.
+                while let Ok(Some(l)) = read_line_lossy_bounded(&mut reader, 4096).await {
                     let mut v = tail.lock().unwrap();
                     if v.len() >= 200 {
                         v.remove(0);
@@ -190,31 +313,46 @@ impl AcpClient {
 
         let (tx, rx) = mpsc::channel(1024);
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
+            let mut reader = BufReader::new(stdout);
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
+                match read_bounded_line(&mut reader, max_line_bytes()).await {
+                    Ok(Some(bytes)) => {
+                        let size = bytes.len();
+                        let line = String::from_utf8_lossy(&bytes).into_owned();
                         if line.trim().is_empty() {
                             continue;
                         }
                         let msg = match classify(&line) {
                             Ok(m) => m,
                             Err(e) => {
-                                let _ = tx.send(ServerMsg::Closed(e.to_string())).await;
+                                let _ = tx
+                                    .send(Frame {
+                                        msg: ServerMsg::Closed(e.to_string()),
+                                        size,
+                                    })
+                                    .await;
                                 break;
                             }
                         };
-                        if tx.send(msg).await.is_err() {
+                        if tx.send(Frame { msg, size }).await.is_err() {
                             break;
                         }
                     }
                     Ok(None) => {
-                        let _ = tx.send(ServerMsg::Closed("EOF del backend".into())).await;
+                        let _ = tx
+                            .send(Frame {
+                                msg: ServerMsg::Closed("EOF del backend".into()),
+                                size: 0,
+                            })
+                            .await;
                         break;
                     }
                     Err(e) => {
                         let _ = tx
-                            .send(ServerMsg::Closed(format!("error leyendo del backend: {e}")))
+                            .send(Frame {
+                                msg: ServerMsg::Closed(format!("entrada rechazada: {e}")),
+                                size: 0,
+                            })
                             .await;
                         break;
                     }
@@ -293,8 +431,9 @@ impl AcpClient {
         let id = self.next_request_id();
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await?;
+        let mut control_bytes: usize = 0;
         loop {
-            let msg = match timeout(self.control_timeout, self.rx.recv()).await {
+            let frame = match timeout(self.control_timeout, self.rx.recv()).await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Err(self.closed_err("el canal del backend se cerró")),
                 Err(_) => {
@@ -304,7 +443,15 @@ impl AcpClient {
                     )));
                 }
             };
-            match msg {
+            control_bytes += frame.size;
+            if control_bytes > max_turn_bytes() {
+                let _ = self.kill().await;
+                return Err(Error::backend(format!(
+                    "la fase de control excedió el máximo de entrada ({} bytes)",
+                    max_turn_bytes()
+                )));
+            }
+            match frame.msg {
                 ServerMsg::Response { id: rid, result } if rid == id => {
                     return result.map_err(|e| Error::backend(format!("`{method}` falló: {e}")));
                 }
@@ -444,14 +591,15 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Envía un prompt y bombea el turno hasta la respuesta final.
-    /// `cancel` permite pedir `session/cancel` desde otro thread.
+    /// Resultado de un turno. `cancel_unconfirmed` marca que la cancelación
+    /// fue pedida pero el backend no la confirmó: se agotó el plazo fijo y el
+    /// proceso fue terminado (nunca se espera indefinidamente).
     pub async fn prompt(
         &mut self,
         text: &str,
         obs: &mut dyn TurnObserver,
         mut cancel: Option<oneshot::Receiver<()>>,
-    ) -> Result<String> {
+    ) -> Result<TurnCompletion> {
         let session_id = self
             .session_id
             .clone()
@@ -469,9 +617,21 @@ impl AcpClient {
         // turno (antes, pueden ser restos de sesión/new o de un load).
         obs.on_turn_started();
 
+        let cancel_grace = env_secs("AERIL_CANCEL_GRACE_SECS", 10);
+        let mut turn_bytes: usize = 0;
         let mut cancel_sent = false;
+        let mut cancel_sent_at: Option<std::time::Instant> = None;
         loop {
             let recv = self.rx.recv();
+            // Tras pedir la cancelación, el plazo es fijo e independiente del
+            // streaming: un backend que sigue hablando sin confirmar no
+            // extiende la espera.
+            let wait = match cancel_sent_at {
+                None => self.turn_timeout,
+                Some(t0) => cancel_grace
+                    .saturating_sub(t0.elapsed())
+                    .max(std::time::Duration::from_millis(1)),
+            };
             tokio::select! {
                 biased;
                 _ = async {
@@ -482,29 +642,49 @@ impl AcpClient {
                     }
                 }, if !cancel_sent => {
                     cancel_sent = true;
+                    cancel_sent_at = Some(std::time::Instant::now());
                     let _ = self.send(&json!({
                         "jsonrpc": "2.0",
                         "method": "session/cancel",
                         "params": {"sessionId": session_id}
                     })).await;
                 }
-                msg = timeout(self.turn_timeout, recv) => {
-                    let msg = match msg {
+                msg = timeout(wait, recv) => {
+                    let frame = match msg {
                         Ok(Some(m)) => m,
                         Ok(None) => return Err(self.closed_err("el canal del backend se cerró durante el turno")),
                         Err(_) => {
                             let _ = self.kill().await;
+                            if cancel_sent_at.is_some() {
+                                return Ok(TurnCompletion {
+                                    stop_reason: "cancelled".into(),
+                                    cancel_unconfirmed: true,
+                                });
+                            }
                             return Err(Error::backend(format!(
                                 "turno sin actividad durante {:?}; backend terminado",
                                 self.turn_timeout
                             )));
                         }
                     };
-                    match msg {
+                    // Presupuesto acumulado del turno: el tamaño por línea ya
+                    // está acotado; acá se acota el total.
+                    turn_bytes += frame.size;
+                    if turn_bytes > max_turn_bytes() {
+                        let _ = self.kill().await;
+                        return Err(Error::backend(format!(
+                            "el turno excedió el máximo de entrada acumulada ({} bytes); backend terminado",
+                            max_turn_bytes()
+                        )));
+                    }
+                    match frame.msg {
                         ServerMsg::Response { id: rid, result } if rid == id => {
                             let v = result.map_err(|e| Error::backend(format!("prompt falló: {e}")))?;
                             let stop = v.get("stopReason").and_then(Value::as_str).unwrap_or("end_turn");
-                            return Ok(stop.to_string());
+                            return Ok(TurnCompletion {
+                                stop_reason: stop.to_string(),
+                                cancel_unconfirmed: false,
+                            });
                         }
                         ServerMsg::Response { id: rid, .. } => {
                             return Err(Error::backend(format!("respuesta inesperada durante el turno (id {rid})")));

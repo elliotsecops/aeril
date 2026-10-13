@@ -7,6 +7,15 @@ pub fn fnv1a_hex(bytes: &[u8]) -> String {
     h.hex()
 }
 
+/// Lee un límite de bytes/cantidad desde el entorno (tests de presupuesto).
+pub fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 /// FNV-1a incremental: permite hashear flujos completos sin retenerlos.
 #[derive(Debug)]
 pub struct Fnv1a {

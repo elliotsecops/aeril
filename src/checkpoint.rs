@@ -52,6 +52,22 @@ pub fn capture(
         // Sin cambios: no hay nada que revisar; no se publica nada.
         return Ok(None);
     };
+    // Límites agregados de la memoria de revisión (B2): rechazo explícito,
+    // nunca truncado silencioso ni publicación de un patch incompleto.
+    let max_patch = crate::util::env_usize("AERIL_MAX_PATCH_BYTES", 4 * 1024 * 1024);
+    let max_files = crate::util::env_usize("AERIL_MAX_FILES", 500);
+    if captured.patch.len() > max_patch {
+        return Err(Error::unsupported(format!(
+            "checkpoint rechazado: el patch revisado mide {} bytes (límite {max_patch})",
+            captured.patch.len()
+        )));
+    }
+    if captured.files.len() > max_files {
+        return Err(Error::unsupported(format!(
+            "checkpoint rechazado: {} archivos revisados (límite {max_files})",
+            captured.files.len()
+        )));
+    }
     crash::point("objects");
 
     // 2. Persistir la intención ANTES de publicar la ref.
@@ -214,6 +230,9 @@ pub enum RecoveryOutcome {
         snapshot_id: String,
         ref_recreated: bool,
     },
+    /// Otro proceso de Aeril resolvió el mismo snapshot mientras tanto:
+    /// no se duplica la resolución.
+    AlreadyResolved { snapshot_id: String },
     /// La ref apunta a otro OID: conflicto de integridad, no se toca.
     RefConflict { snapshot_id: String, detail: String },
     /// Faltan objetos o la ref no puede verificarse: terminal, se reporta.
@@ -225,6 +244,51 @@ pub enum RecoveryOutcome {
     },
     /// Otro fallo de integridad reportado como terminal.
     Failed { snapshot_id: String, detail: String },
+}
+
+/// ¿Existe ya una resolución (`ready`/`failed`) para este snapshot?
+fn resolution_exists(
+    conn: &rusqlite::Connection,
+    thread_id: &str,
+    snapshot_id: &str,
+) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE thread_id = ?1 AND kind IN (?2, ?3)
+              AND json_extract(payload, '$.snapshot_id') = ?4
+        )",
+        rusqlite::params![
+            thread_id,
+            events::K_CHECKPOINT_READY,
+            events::K_CHECKPOINT_FAILED,
+            snapshot_id
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
+/// Append idempotente de una resolución: si otro proceso ya resolvió el
+/// snapshot, no se duplica (dos `recover` concurrentes → un solo ready).
+fn append_resolution(
+    store: &mut Store,
+    thread_id: &str,
+    run_id: Option<&str>,
+    snapshot_id: &str,
+    kind: &str,
+    payload: &serde_json::Value,
+) -> Result<bool> {
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if resolution_exists(&tx, thread_id, snapshot_id)? {
+        tx.rollback()?;
+        return Ok(false);
+    }
+    events::append_tx(&tx, thread_id, run_id, kind, "system", payload, now_ms())?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// Reconcilia checkpoints interrumpidos. Idempotente: los que ya tienen
@@ -336,23 +400,26 @@ pub fn recover_pending(
                         files,
                         recovered: true,
                     };
-                    let tx = store
-                        .conn
-                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                    events::append_tx(
-                        &tx,
+                    // Idempotente ante recuperación concurrente: si otro
+                    // proceso ya resolvió, no se duplica el evento.
+                    let appended = append_resolution(
+                        store,
                         &p.thread_id,
                         prepared.run_id.as_deref(),
+                        &prepared.snapshot_id,
                         events::K_CHECKPOINT_READY,
-                        "system",
                         &serde_json::to_value(ready)?,
-                        now_ms(),
                     )?;
-                    tx.commit()?;
-                    outcomes.push(RecoveryOutcome::Completed {
-                        snapshot_id: prepared.snapshot_id.clone(),
-                        ref_recreated,
-                    });
+                    if appended {
+                        outcomes.push(RecoveryOutcome::Completed {
+                            snapshot_id: prepared.snapshot_id.clone(),
+                            ref_recreated,
+                        });
+                    } else {
+                        outcomes.push(RecoveryOutcome::AlreadyResolved {
+                            snapshot_id: prepared.snapshot_id.clone(),
+                        });
+                    }
                 }
                 (Err(e), _) | (_, Err(e)) => {
                     let detail = format!("no se pudo recomponer el patch desde Git: {e}");
@@ -406,13 +473,13 @@ fn append_failed(
         reason: format!("{reason}: {detail}"),
         terminal,
     };
-    events::append_typed(
-        &mut store.conn,
+    append_resolution(
+        store,
         thread_id,
         prepared.run_id.as_deref(),
+        &prepared.snapshot_id,
         events::K_CHECKPOINT_FAILED,
-        "system",
-        &failed,
+        &serde_json::to_value(failed)?,
     )?;
     Ok(())
 }

@@ -75,14 +75,15 @@ pub fn seed(
                         kind: &str,
                         actor: &str,
                         payload: serde_json::Value|
-         -> Result<()> {
+         -> Result<String> {
+            let id = new_id();
             tx.execute(
                 "INSERT INTO events (id, thread_id, seq, run_id, kind, actor, payload_version, payload, created_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)",
-                params![new_id(), thread_id, seq, run_id, kind, actor, payload.to_string(), now_base + seq * 1000],
+                params![id, thread_id, seq, run_id, kind, actor, payload.to_string(), now_base + seq * 1000],
             )?;
             seq += 1;
-            Ok(())
+            Ok(id)
         };
 
         push(
@@ -101,6 +102,7 @@ pub fn seed(
         )?;
 
         // diffs: checkpoint.ready con patch y archivos
+        let mut ready_events: Vec<(String, String, String)> = Vec::new(); // (event_id, snapshot_id, oid)
         for d in 0..diffs_per_thread {
             let patch = fake_patch(t, d);
             let file = events::payload::FileSummary {
@@ -111,19 +113,49 @@ pub fn seed(
                 before_blob_oid: Some(format!("{:040x}", (t * 17 + d) % 0xffff_ffff)),
                 after_blob_oid: Some(format!("{:040x}", (t * 29 + d + 7) % 0xffff_ffff)),
             };
-            push(
+            let snap_id = new_id();
+            let oid = format!("{:040x}", (t * 31 + d) % 0xffff_ffff);
+            let ev_id = push(
                 &tx,
                 Some(&run1),
                 events::K_CHECKPOINT_READY,
                 "system",
                 json!({
-                    "snapshot_id": new_id(),
+                    "snapshot_id": snap_id,
                     "git_ref": format!("refs/aeril/checkpoints/{}", new_id()),
-                    "oid": format!("{:040x}", (t * 31 + d) % 0xffff_ffff),
+                    "oid": oid,
                     "base_oid": "0".repeat(40),
                     "patch": patch,
                     "files": [serde_json::to_value(&file).unwrap_or(serde_json::Value::Null)],
                     "recovered": false
+                }),
+            )?;
+            ready_events.push((ev_id, snap_id, oid));
+        }
+
+        // comentarios enlazados a los checkpoints (la vista de revisión los carga)
+        let comments_n: u64 = 10.min(ready_events.len() as u64);
+        for c in 0..comments_n {
+            let (ev_id, snap_id, oid) = &ready_events[(c as usize) % ready_events.len()];
+            push(
+                &tx,
+                None,
+                events::K_COMMENT_ADDED,
+                "human",
+                json!({
+                    "checkpoint_event_id": ev_id,
+                    "oid": oid,
+                    "anchor": {
+                        "snapshot_id": snap_id,
+                        "path": format!("src/module_{}.rs", c % 12),
+                        "side": "new",
+                        "start_line": 10 + c,
+                        "end_line": 12 + c,
+                        "before_blob_oid": format!("{:040x}", (t * 17 + c) % 0xffff_ffff),
+                        "after_blob_oid": format!("{:040x}", (t * 29 + c + 7) % 0xffff_ffff),
+                        "context_hash": format!("{:016x}", (t + c) * 7919)
+                    },
+                    "text": format!("Comentario sintético {c}: revisar el manejo de errores y agregar validación de entrada en esta sección.")
                 }),
             )?;
         }
@@ -132,6 +164,7 @@ pub fn seed(
         let mut remaining = events_per_thread
             .saturating_sub(2)
             .saturating_sub(diffs_per_thread)
+            .saturating_sub(comments_n)
             .saturating_sub(2);
         let mut i = 0u64;
         while remaining > 0 {
@@ -258,4 +291,172 @@ pub fn beacon(stage: &str, t0: Instant) {
         use std::io::Write;
         let _ = writeln!(f, "{line}");
     }
+}
+
+// ── medición de escala (runs concurrentes con agentes mock) ──────────────────
+
+pub struct ScaleReport {
+    pub runs: u64,
+    pub failures: u64,
+    pub app_rss_kb: u64,
+    pub agents_rss_kb: u64,
+    pub total_rss_kb: u64,
+    pub gate_app_mb: u64,
+    pub app_ok: bool,
+    pub note: String,
+}
+
+fn read_rss_kb(pid: i64) -> u64 {
+    let path = if pid <= 0 {
+        "/proc/self/status".to_string()
+    } else {
+        format!("/proc/{pid}/status")
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Suma RSS de los hijos directos del proceso (los agentes mock).
+fn children_rss_kb() -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return 0;
+    };
+    for task in tasks.flatten() {
+        let path = task.path().join("children");
+        let Ok(children) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for pid_str in children.split_whitespace() {
+            if let Ok(pid) = pid_str.parse::<i64>()
+                && seen.insert(pid)
+            {
+                total += read_rss_kb(pid);
+            }
+        }
+    }
+    total
+}
+
+fn ensure_scale_repo(path: &Path) -> Result<()> {
+    if path.join(".git").exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path)?;
+    let repo = git2::Repository::init(path)?;
+    std::fs::write(path.join("NOTES.md"), "# Notas de escala\n\nbase\n")?;
+    let mut index = repo.index()?;
+    index.add_path(Path::new("NOTES.md"))?;
+    index.write()?;
+    let tree_oid = index.write_tree()?;
+    let tree = repo.find_tree(tree_oid)?;
+    let sig = git2::Signature::now("Aeril", "aeril@localhost")?;
+    repo.commit(Some("HEAD"), &sig, &sig, "base de escala", &tree, &[])?;
+    Ok(())
+}
+
+/// Corre `runs` runs concurrentes con el backend MOCK dentro de UN proceso de
+/// Aeril y mide: RSS de la aplicación (gate ≤ 500 MB) y RSS de los agentes
+/// (informativo, medido APARTE). No prueba el consumo de Hermes real: los
+/// procesos de Hermes comparten perfil (`~/.hermes`) y no es medible en v0.
+pub fn scale(data_dir: &Path, runs: u64, delay_ms: u64) -> Result<ScaleReport> {
+    use crate::session::{PermissionPolicySetting, RunOptions, Runner};
+
+    std::fs::create_dir_all(data_dir)?;
+    let db_path = data_dir.join("aeril.db");
+    let repo_path = data_dir.join("scale-repo");
+    ensure_scale_repo(&repo_path)?;
+
+    let mut store = Store::open(&db_path)?;
+    let repo = crate::git::open(&repo_path)?;
+    let info = crate::git::info(&repo)?;
+
+    let mut jobs = Vec::new();
+    for i in 0..runs {
+        let thread = crate::store::threads::create(
+            &mut store.conn,
+            &format!("Escala {i}"),
+            &repo_path.to_string_lossy(),
+            &info.repo_id,
+        )?;
+        let script_path = data_dir.join(format!("scale-script-{i}.json"));
+        std::fs::write(
+            &script_path,
+            json!({
+                "message": format!("run de escala {i}"),
+                "final_message": "ok",
+                "delay_ms": delay_ms,
+                "edits": [{"op": "write", "path": "NOTES.md", "content": format!("run {i}\n")}],
+            })
+            .to_string(),
+        )?;
+        jobs.push((thread.id, script_path));
+    }
+
+    let mut handles = Vec::new();
+    for (tid, script_path) in jobs {
+        let db = db_path.clone();
+        let dd = data_dir.to_path_buf();
+        handles.push(std::thread::spawn(move || {
+            let mut store = match Store::open(&db) {
+                Ok(s) => s,
+                Err(e) => return Err(e),
+            };
+            let mut runner = Runner {
+                data_dir: dd,
+                db_path: db,
+                ui: None,
+                cancel: None,
+            };
+            let opts = RunOptions {
+                backend: format!("mock:{}", script_path.display()),
+                goal: "carga de escala".into(),
+                permissions: PermissionPolicySetting::Auto,
+                feedback_comment_ids: None,
+                resume_session: false,
+                model: None,
+            };
+            runner.start(&mut store, &tid, &opts).map(|_| ())
+        }));
+        // Escalonado: crea workspaces sin pelear por locks internos de git.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+
+    // Muestra durante la fase de agentes (todos en su delay).
+    std::thread::sleep(std::time::Duration::from_millis(delay_ms / 2));
+    let app_rss_kb = read_rss_kb(-1);
+    let agents_rss_kb = children_rss_kb();
+
+    let mut failures = 0u64;
+    for h in handles {
+        match h.join() {
+            Ok(Ok(())) => {}
+            _ => failures += 1,
+        }
+    }
+
+    let gate_app_mb = 500u64;
+    let app_ok = app_rss_kb / 1024 <= gate_app_mb;
+    Ok(ScaleReport {
+        runs,
+        failures,
+        app_rss_kb,
+        agents_rss_kb,
+        total_rss_kb: app_rss_kb + agents_rss_kb,
+        gate_app_mb,
+        app_ok,
+        note: "Agentes MOCK: caracteriza el overhead de la aplicación; NO prueba el consumo de Hermes real (perfil compartido, no medible en v0)".into(),
+    })
 }

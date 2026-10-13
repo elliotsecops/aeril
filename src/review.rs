@@ -183,6 +183,55 @@ fn states_for(store: &Store, thread_id: &str) -> Result<Vec<(String, CommentStat
     Ok(out)
 }
 
+/// Resumen liviano de un comentario: SIN patch ni contenido anclado.
+/// Es lo que carga la lista/timeline; el patch se lee solo para el seleccionado
+/// vía [`view_comment`] (memoria de revisión acotada, B2).
+#[derive(Debug)]
+pub struct CommentSummary {
+    pub comment_id: String,
+    pub seq: i64,
+    pub created_ms: i64,
+    pub text: String,
+    pub anchor: payload::Anchor,
+    pub snapshot_oid: String,
+    pub state: CommentState,
+}
+
+/// Página de resúmenes (orden ascendente por seq).
+pub fn list_comment_summaries(
+    store: &Store,
+    thread_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<CommentSummary>> {
+    let states = states_for(store, thread_id)?;
+    let mut out = Vec::new();
+    for ev in events::fetch_by_kind(&store.conn, thread_id, events::K_COMMENT_ADDED)? {
+        let added: payload::CommentAdded = ev.parse()?;
+        let state = states
+            .iter()
+            .find(|(cid, _)| *cid == ev.id)
+            .map(|(_, s)| *s)
+            .unwrap_or(CommentState::Open);
+        out.push(CommentSummary {
+            comment_id: ev.id.clone(),
+            seq: ev.seq,
+            created_ms: ev.created_ms,
+            text: added.text.clone(),
+            anchor: added.anchor.clone(),
+            snapshot_oid: added.oid.clone(),
+            state,
+        });
+    }
+    let start = offset.max(0) as usize;
+    let end = (start + limit.max(0) as usize).min(out.len());
+    Ok(if start >= out.len() {
+        Vec::new()
+    } else {
+        out.drain(..).skip(start).take(end - start).collect()
+    })
+}
+
 pub fn view_comment(
     store: &Store,
     thread_id: &str,
@@ -232,18 +281,6 @@ pub fn view_comment(
         anchored_text,
         blob_verified,
     })
-}
-
-pub fn list_comments(
-    store: &Store,
-    thread_id: &str,
-    repo: Option<&Repository>,
-) -> Result<Vec<CommentView>> {
-    let mut out = Vec::new();
-    for ev in events::fetch_by_kind(&store.conn, thread_id, events::K_COMMENT_ADDED)? {
-        out.push(view_comment(store, thread_id, &ev.id, repo)?);
-    }
-    Ok(out)
 }
 
 /// IDs de comentarios sin resolver (para el envío de feedback).

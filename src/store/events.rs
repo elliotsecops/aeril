@@ -33,6 +33,8 @@ pub const K_FEEDBACK_SENT: &str = "feedback.sent";
 pub const K_FEEDBACK_DELIVERED: &str = "feedback.delivered";
 pub const K_FEEDBACK_FAILED: &str = "feedback.failed";
 pub const K_WORKSPACE_RECREATED: &str = "workspace.recreated";
+pub const K_WORKSPACE_LEASE_TAKEN_OVER: &str = "workspace.lease_taken_over";
+pub const K_INTEGRATION_REQUESTED: &str = "integration.requested";
 pub const K_INTEGRATION_COMPLETED: &str = "integration.completed";
 pub const K_INTEGRATION_BLOCKED: &str = "integration.blocked";
 pub const K_VALIDATION_RECORDED: &str = "validation.recorded";
@@ -248,12 +250,34 @@ pub mod payload {
         pub reason: String,
     }
 
+    /// Toma de control de un lease vencido o de un proceso muerto (advisory:
+    /// solo coordina procesos de Aeril, no aísla de procesos externos).
+    #[derive(Debug, Serialize, Deserialize, Default)]
+    pub struct WorkspaceLeaseTakenOver {
+        pub workspace_id: String,
+        pub previous_run_id: String,
+        pub previous_pid: i64,
+        pub age_ms: i64,
+        pub reason: String,
+    }
+
+    /// Intención durable de integración, escrita ANTES de tocar la ref.
+    #[derive(Debug, Serialize, Deserialize, Default)]
+    pub struct IntegrationRequested {
+        pub target_branch: String,
+        pub source_oid: String,
+        pub target_oid_expected: String,
+    }
+
     #[derive(Debug, Serialize, Deserialize, Default)]
     pub struct IntegrationCompleted {
         pub target_branch: String,
         pub source_oid: String,
         pub target_oid_before: String,
         pub target_oid_after: String,
+        /// `true` si lo resolvió la reconciliación al reabrir, no la operación.
+        #[serde(default)]
+        pub recovered: bool,
     }
 
     #[derive(Debug, Serialize, Deserialize, Default)]

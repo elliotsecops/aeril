@@ -1,38 +1,38 @@
 #!/usr/bin/env python3
-"""Medición externa de arranque (y RAM idle) de la TUI de Aeril.
+"""Medición externa del arranque, RSS idle y caché residente por thread.
 
-Método (v0.4 §6 de HANDOFF):
-- Corre la TUI REAL en un pty, con `AERIL_BENCH_BEACON` apuntando a un archivo.
-- T0 se toma en este proceso EXTERNO justo antes del fork.
-- La app escribe `first_draw` cuando terminó el primer frame y
-  `input_processed` cuando procesó la primera tecla (flecha abajo), que es la
-  definición acordada de "UI utilizable" (entrada procesada, no frame vacío).
-- p95 sobre las muestras externas; se reporta también el tiempo interno.
-
-Condición de caché: se etiqueta explícitamente. Por defecto los samples son
-con page cache WARM del host (no se vacía la caché del SO: sería una operación
-disruptiva que requiere autorización). Con `--cold` se etiqueta "cold-requested"
-pero NO se ejecuta ningún drop de cachés: el reporte queda como no verificado.
+Método (RC1 §4):
+- Corre la TUI REAL en un pty con `AERIL_BENCH_BEACON`.
+- T0 se toma en este proceso externo justo antes del fork.
+- Endpoint de "UI utilizable": la primera entrada (Enter) ABRE un thread real
+  y se renderiza su timeline + resúmenes de comentarios (`thread_opened`).
+- `--mem`: mide RSS tras 5 s idle (sin abrir thread), luego abre el thread y
+  vuelve a medir tras 3 s: la DIFERENCIA es la caché residente por thread
+  (presupuesto: ≤ 10 MiB), medida como proxy de proceso completo.
+- Cualquier muestra fallida ⇒ el gate FALLA (n_fail == 0 obligatorio).
+- Condiciones declaradas: caché de páginas WARM del host (no se vacía la
+  caché del SO) y fstype real del data dir (no se disfraza tmpfs de NVMe).
 
 Uso:
   startup.py --bin target/release/aeril --data-dir bench-data/bench \
-             [--runs 30] [--mem] [--json] [--max-ms 300] [--max-rss-mb 50]
+             [--runs 30] [--mem] [--json] [--max-ms 300] [--max-rss-mb 50] \
+             [--max-delta-mib 10]
 """
 
 import argparse
 import json
 import os
 import pty
-import select
 import signal
 import statistics
+import subprocess
 import sys
 import time
 
 SAN_MB = 1024 * 1024
 
 
-def host_info():
+def host_info(data_dir):
     info = {"os": "linux", "arch": "x86_64"}
     try:
         with open("/proc/cpuinfo") as f:
@@ -45,14 +45,15 @@ def host_info():
                 if line.startswith("MemTotal"):
                     info["ram_gb"] = round(int(line.split()[1]) / 1024 / 1024, 1)
                     break
-        import subprocess
-
-        dev = subprocess.run(
-            ["df", "--output=source", os.path.abspath(".")],
+        out = subprocess.run(
+            ["df", "--output=source,fstype", os.path.abspath(data_dir)],
             capture_output=True,
             text=True,
-        ).stdout.splitlines()[-1]
-        info["storage"] = dev
+        ).stdout.splitlines()
+        if len(out) >= 2:
+            parts = out[-1].split()
+            info["storage"] = parts[0]
+            info["storage_fstype"] = parts[1]
     except Exception as e:  # noqa: BLE001
         info["host_info_error"] = str(e)
     return info
@@ -71,9 +72,8 @@ def wait_stage(path, stage, timeout, fd):
         for line in read_beacon(path):
             if line.get("stage") == stage:
                 return line
-        # Drenar salida del pty para que la app no se bloquee escribiendo.
         if fd is not None:
-            r, _, _ = select.select([fd], [], [], 0.02)
+            r, _, _ = pty.select([fd], [], [], 0.02)
             if r:
                 try:
                     os.read(fd, 65536)
@@ -91,10 +91,8 @@ def read_rss_kb(pid):
     return None
 
 
-def sample(bin_path, data_dir, timeout_s, idle_probe):
+def sample(bin_path, data_dir, timeout_s, mem_probe):
     beacon = os.path.join(data_dir, f".beacon-{os.getpid()}-{time.monotonic_ns()}")
-    if os.path.exists(beacon):
-        os.unlink(beacon)
     env = dict(os.environ)
     env["AERIL_DATA_DIR"] = data_dir
     env["AERIL_BENCH_BEACON"] = beacon
@@ -110,21 +108,22 @@ def sample(bin_path, data_dir, timeout_s, idle_probe):
 
     result = {"ok": False}
     try:
-        first = wait_stage(beacon, "first_draw", timeout_s, fd)
-        if first is None:
+        if wait_stage(beacon, "first_draw", timeout_s, fd) is None:
             result["error"] = "no llegó first_draw"
             return result, pid
-        os.write(fd, b"\x1b[B")  # flecha abajo: entrada
-        done = wait_stage(beacon, "input_processed", timeout_s, fd)
+        if mem_probe:
+            time.sleep(5.0)
+            result["rss_idle_kb"] = read_rss_kb(pid)
+        os.write(fd, b"\r")  # Enter: abre un thread real
+        done = wait_stage(beacon, "thread_opened", timeout_s, fd)
         if done is None:
-            result["error"] = "no procesó la entrada"
+            result["error"] = "la entrada no abrió un thread (thread_opened ausente)"
             return result, pid
         result["external_ms"] = (time.perf_counter() - t0) * 1000.0
         result["internal_us"] = done.get("internal_us")
-        if idle_probe:
-            time.sleep(5.0)
-            rss = read_rss_kb(pid)
-            result["rss_kb"] = rss
+        if mem_probe:
+            time.sleep(3.0)
+            result["rss_thread_kb"] = read_rss_kb(pid)
         result["ok"] = True
         return result, pid
     finally:
@@ -136,7 +135,7 @@ def sample(bin_path, data_dir, timeout_s, idle_probe):
         reaped = False
         while time.monotonic() < deadline:
             try:
-                wpid, status = os.waitpid(pid, os.WNOHANG)
+                wpid, _status = os.waitpid(pid, os.WNOHANG)
                 if wpid == pid:
                     reaped = True
                     break
@@ -168,74 +167,95 @@ def main():
     ap.add_argument("--bin", required=True)
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--runs", type=int, default=30)
-    ap.add_argument("--mem", action="store_true", help="mide RSS tras 5 s idle")
+    ap.add_argument("--mem", action="store_true", help="mide RSS idle y con thread abierto")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--max-ms", type=float, default=300.0)
     ap.add_argument("--max-rss-mb", type=float, default=50.0)
-    ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--max-delta-mib", type=float, default=10.0)
+    ap.add_argument("--timeout", type=float, default=60.0)
     args = ap.parse_args()
 
     samples = []
-    rss_kb = None
+    rss_idle_kb = None
+    rss_thread_kb = None
     failures = []
-    for i in range(args.runs):
+    runs = 1 if args.mem else args.runs
+    for i in range(runs):
         res, _pid = sample(args.bin, args.data_dir, args.timeout, args.mem and i == 0)
         if res.get("ok"):
             samples.append(res["external_ms"])
-            if "rss_kb" in res:
-                rss_kb = res["rss_kb"]
+            if "rss_idle_kb" in res:
+                rss_idle_kb = res["rss_idle_kb"]
+            if "rss_thread_kb" in res:
+                rss_thread_kb = res["rss_thread_kb"]
         else:
             failures.append(res.get("error", "?"))
-        if args.mem and rss_kb is not None and i == 0:
-            break  # con --mem alcanza una muestra
 
     samples_sorted = sorted(samples)
+    delta_kb = (
+        rss_thread_kb - rss_idle_kb
+        if rss_idle_kb is not None and rss_thread_kb is not None
+        else None
+    )
     report = {
-        "measurement": "startup-to-useful-ui (external, pty, tecla procesada)",
+        "measurement": "arranque → entrada procesada que ABRE un thread (timeline + comentarios), externo, pty",
         "build_profile": "release (lto=thin, strip=symbols, codegen-units=1)",
-        "dataset": "fixtures sintéticas del perfil v0.4 (ver dataset.json)",
-        "cache_condition": "warm page cache del host (no se vació caché del SO)",
-        "method": "spawn externo + beacon interno; p95 sobre muestras externas",
-        "host": host_info(),
+        "dataset": "fixtures sintéticas del perfil v0.4 (100×1000×10, con comentarios)",
+        "cache_condition": "warm page cache del host (no se vació la caché del SO)",
+        "method": "spawn externo + beacons internos; p95 sobre muestras externas; n_fail debe ser 0",
+        "host": host_info(args.data_dir),
         "n_ok": len(samples),
         "n_fail": len(failures),
-        "failures": failures[:3],
+        "failures": failures[:5],
+        "samples_ms": [round(s, 2) for s in samples_sorted],
         "p50_ms": round(statistics.median(samples_sorted), 2) if samples else None,
         "p95_ms": round(percentile(samples_sorted, 95), 2) if samples else None,
         "max_ms": round(max(samples_sorted), 2) if samples else None,
         "min_ms": round(min(samples_sorted), 2) if samples else None,
-        "rss_kb": rss_kb,
-        "rss_mb": round(rss_kb / 1024, 1) if rss_kb else None,
+        "rss_idle_kb": rss_idle_kb,
+        "rss_idle_mb": round(rss_idle_kb / 1024, 1) if rss_idle_kb else None,
+        "rss_thread_open_kb": rss_thread_kb,
+        "rss_thread_open_mb": round(rss_thread_kb / 1024, 1) if rss_thread_kb else None,
+        "per_thread_delta_mib": round(delta_kb / 1024, 2) if delta_kb is not None else None,
         "budget_startup_ms": args.max_ms,
         "budget_rss_mb": args.max_rss_mb,
+        "budget_delta_mib": args.max_delta_mib,
     }
+
     ok = True
-    if samples:
-        if report["p95_ms"] > args.max_ms:
-            ok = False
-            report["startup_verdict"] = "FAIL"
-        else:
-            report["startup_verdict"] = "PASS"
+    if samples and report["p95_ms"] <= args.max_ms and len(failures) == 0:
+        report["startup_verdict"] = "PASS"
     else:
         ok = False
-        report["startup_verdict"] = "FAIL (sin muestras)"
-    if rss_kb is not None:
-        report["rss_verdict"] = "PASS" if report["rss_mb"] <= args.max_rss_mb else "FAIL"
+        report["startup_verdict"] = "FAIL"
+    if rss_idle_kb is not None:
+        report["rss_verdict"] = "PASS" if report["rss_idle_mb"] <= args.max_rss_mb else "FAIL"
         if report["rss_verdict"] == "FAIL":
+            ok = False
+    if delta_kb is not None:
+        report["delta_verdict"] = (
+            "PASS" if report["per_thread_delta_mib"] <= args.max_delta_mib else "FAIL"
+        )
+        if report["delta_verdict"] == "FAIL":
             ok = False
 
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         print(
-            f"arranque: p50={report['p50_ms']}ms p95={report['p95_ms']}ms "
-            f"max={report['max_ms']}ms ({report['n_ok']}/{args.runs} ok) "
-            f"→ {report['startup_verdict']} (≤{args.max_ms}ms)"
+            f"arranque (abre thread): p50={report['p50_ms']}ms p95={report['p95_ms']}ms "
+            f"max={report['max_ms']}ms ({report['n_ok']} ok / {report['n_fail']} fallos) "
+            f"→ {report['startup_verdict']} (≤{args.max_ms}ms, 0 fallos)"
         )
-        if rss_kb is not None:
+        if rss_idle_kb is not None:
             print(
-                f"RSS idle (5 s): {report['rss_mb']} MB → {report['rss_verdict']} "
+                f"RSS idle: {report['rss_idle_mb']} MB → {report['rss_verdict']} "
                 f"(≤{args.max_rss_mb} MB)"
+            )
+        if delta_kb is not None:
+            print(
+                f"caché residente por thread: {report['per_thread_delta_mib']} MiB "
+                f"→ {report['delta_verdict']} (≤{args.max_delta_mib} MiB)"
             )
     sys.exit(0 if ok else 1)
 

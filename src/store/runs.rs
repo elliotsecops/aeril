@@ -46,6 +46,9 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
 }
 
 pub struct StartRunSpec<'a> {
+    /// ID explícito del run (el lease de workspace se toma antes de crear la
+    /// fila y debe referirse al mismo run).
+    pub id: Option<&'a str>,
     pub thread_id: &'a str,
     pub backend: &'a str,
     pub backend_version: &'a str,
@@ -60,7 +63,7 @@ pub struct StartRunSpec<'a> {
 
 /// Crea el run y su evento `run.started` atómicamente.
 pub fn start(conn: &mut Connection, spec: &StartRunSpec<'_>) -> Result<RunRow> {
-    let id = new_id();
+    let id = spec.id.map(str::to_string).unwrap_or_else(new_id);
     let now = now_ms();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
