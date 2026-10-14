@@ -40,7 +40,7 @@ restringe procesos externos. Se documentará en la UI/CLI y en `docs/phase1-*`.
 
 | # | Paso | Entregable | Estado |
 |---|---|---|---|
-| **S0** | **Reconciliación durable de runs interrumpidos** | `run.ended failed/interrupted` idempotente al reabrir; evidencia de supervisor y backend; gate de reuso conservador | **en ejecución** |
+| **S0** | **Reconciliación durable de runs interrumpidos** | `run.ended failed/interrupted` idempotente al reabrir; evidencia de supervisor y backend; gate de reuso conservador | ✅ `130c94f` (7 tests S0; suite 69/69) |
 | S1 | Spike de aislamiento de perfiles de Hermes (time-box 0.5 día) | Informe con evidencia (`HERMES_HOME`/`HOME` por proceso, sesiones/state.db, credenciales sin copiar secretos) + decisión registrada | pendiente |
 | S2 | Estado de runs activos (`run list --active` = runs⋈leases) | CLI + proyección; sin migraciones | pendiente |
 | S3 | TUI concurrente (2 runs, cancelar por run) | uso manual + pty | pendiente |
