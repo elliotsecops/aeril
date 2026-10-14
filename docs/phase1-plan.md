@@ -89,6 +89,16 @@ restringe procesos externos. Se documentará en la UI/CLI y en `docs/phase1-*`.
   por PID+starttime y termina lo que haya quedado vivo antes de permitir reuso (S0).
 - **Evidence gaps**: runs legados sin evidencia de backend ⇒ reuso bloqueado
   (conservador) hasta remover el worktree; documentado.
+- **Frontera de procesos (S0-R1, `fix/phase1-s0-process-safety`)**: Aeril inspecciona
+  y supervisa el **grupo de procesos del backend que él mismo crea** (líder +
+  descendientes), pero **no es un sandbox del SO**. Procesos que escapan por su
+  cuenta del grupo/sesión registrados (p. ej. `setsid`) quedan **fuera de la
+  garantía de atribución**: no se reclaman ni se señalan, y su existencia no se
+  detecta. Identidad no verificable (`pid_start=0`, `/proc` ilegible) o PID
+  reutilizado ⇒ `workspace.recovery_unsafe` persistente + reuso bloqueado, **sin
+  señales destructivas**; un líder muerto con miembros vivos de su grupo homónimo
+  tampoco se reclama (posible reutilización de PGID) y bloquea el reuso (D1/D2/D4
+  de la auditoría S0, corregidos en esta rama).
 
 ## 5. Fuera de alcance (explícito)
 
