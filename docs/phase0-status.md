@@ -5,6 +5,30 @@
 >
 > **RC1 (reliability hardening):** ver `docs/phase0-remediation-matrix.md`
 > (rama `fix/phase0-reliability-rc1`, commits `4e81f7d` y `dfd9416`).
+> **RC2 (blockers de aceptación):** ver `docs/phase0-rc2-acceptance.md`
+> (rama `fix/phase0-reliability-rc2`).
+
+## Garantías exactas RC2 (política documentada)
+
+- **Pipeline ACP byte-bounded**: la cola interna transporta líneas CRUDAS (sin
+  decodificar); el productor reserva bytes antes de encolar (backpressure) y el
+  consumidor libera por Drop en éxito/error/cancelación/cierre. Límites:
+  línea ≤ 4 MiB (`AERIL_ACP_MAX_LINE_BYTES`), en vuelo ≤ 8 MiB
+  (`AERIL_ACP_INFLIGHT_BYTES`), turno acumulado ≤ 64 MiB
+  (`AERIL_ACP_MAX_TURN_BYTES`). Un frame mayor al presupuesto transita solo.
+  `kill()`/`Drop` terminan el **grupo de procesos** del backend.
+- **Lease de workspace**: un TTL vencido **nunca** transfiere ownership con el
+  proceso dueño VIVO (incluye SIGSTOP); recuperación explícita con
+  `aeril lease status|release`. La transferencia automática exige muerte
+  probada (PID ausente o reutilizado según `starttime`). Si un run pierde
+  ownership (o falla la renovación), ABORTA: cancela el backend, registra
+  `workspace.lease_lost`, `run.ended failed`, sin checkpoint ni completitud.
+  `worktree rm` requiere dueño muerto. Ámbito: coordinación advisory entre
+  procesos de Aeril; no es un sandbox (MANIFIESTO §8).
+- **Submódulos/gitlinks**: enumerados por ÍNDICE, no por status. Inicializado
+  con puntero modificado ⇒ rechazo; **no inicializado con contenido bajo su
+  path ⇒ rechazo explícito** (jamás se tra-versa como archivos comunes ni se
+  reporta "sin cambios"); no inicializado y vacío ⇒ captura normal del resto.
 
 Leyenda:
 **V** = implementado y verificado con test automatizado ·

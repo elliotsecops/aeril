@@ -112,7 +112,22 @@ make budget-scale   # reporta UNVERIFIED (sin claim de 5 agentes en Fase 0)
   limitación técnica).
 - `budget-scale` (5 agentes) sin verificación en Fase 0: no hay claim.
 
-## Mediciones RC1 (make budget, 2026-10-13, tras la auditoría)
+## Mediciones RC2 (make budget + budget-scale, 2026-10-13)
+
+| Presupuesto | Límite | Medido | Veredicto |
+|---|---|---|---|
+| Arranque a UI usable que ABRE un thread (p95, n=30, externo) | 300 ms | **25.6 ms** (0 fallos) | ✅ PASS |
+| RSS idle / con thread abierto | 50 MB | **6.7 / 7.5 MB** | ✅ PASS |
+| Caché residente por thread (delta idle→abierto) | 10 MiB | **0.82 MiB** | ✅ PASS |
+| Binario release stripped | 30 MB | **5.5 MB** | ✅ PASS |
+| 5 runs mock: app | ≤ 500 MB | **8.7 MB** (agentes 16.2 / total 24.9 aparte) | ✅ PASS |
+| Cola ACP en vuelo (presupuesto 256 KiB en test) | ≤ presupuesto | **peak 241 KB**, deltas RSS planos frente al volumen | ✅ PASS |
+
+Detalle pre/post de B1 en `docs/phase0-rc2-acceptance.md` §1. **Hermes real ×5
+sigue sin medirse** (perfil compartido): el bench de escala usa mocks y lo
+declara.
+
+## Mediciones RC1 (histórico, make budget 2026-10-13)
 
 **Declaración del benchmark (RC1 §4):**
 - OS/arch: Linux x86_64 · CPU: Intel i7-8550U · RAM: 15.4 GiB · Disco: NVMe `/dev/nvme0n1p5` (fstype **ext4**, reportado por el harness).
@@ -146,6 +161,9 @@ Salidas crudas: `bench-data/{seed,start,mem,scale}.json` (regenerables con
 Los 13 hallazgos del brief de auditoría (A1–A6, B1–B7) están mapeados a
 correcciones, tests y commits en **`docs/phase0-remediation-matrix.md`**
 (Wave A `4e81f7d`, Wave B `dfd9416`). Los gates A/B originales no regresaron.
+La segunda auditoría (3 blockers: amplificación ACP, lease con dueño vivo,
+gitlinks no inicializados) se remedió en **`docs/phase0-rc2-acceptance.md`**
+(rama `fix/phase0-reliability-rc2`, implementación `11fd0d7`).
 
 ## Próxima prioridad de ingeniería
 
