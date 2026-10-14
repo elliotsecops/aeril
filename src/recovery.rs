@@ -551,6 +551,99 @@ pub fn note_reuse_blocked(store: &mut Store, workspace_id: &str, reason: &str) -
     Ok(())
 }
 
+// ── S2: vista de estado de runs (SOLO LECTURA) ──────────────────────────────
+//
+// Reutiliza los clasificadores de liveness de S0/RC2 (supervisor_state_conn y
+// leases::owner_alive): no hay un segundo clasificador de PIDs. Una consulta
+// jamás reconcilia ni muta: solo lee.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LivenessView {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct SupervisorView {
+    pub liveness: LivenessView,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum LeaseView {
+    Owned {
+        pid: i64,
+        owner_alive: bool,
+    },
+    Missing,
+    HeldByOther {
+        holder_run_id: String,
+        pid: i64,
+        owner_alive: bool,
+    },
+}
+
+/// Liveness del supervisor del run según la evidencia durable (run.started) y,
+/// como fallback, el lease del propio run. Sin evidencia ⇒ Unknown (nunca se
+/// declara muerto ni vivo sin prueba).
+pub fn supervisor_view(conn: &Connection, run: &RunRow) -> Result<SupervisorView> {
+    let (liveness, detail) = match supervisor_state_conn(conn, run)? {
+        Supervisor::Alive(d) => (LivenessView::Alive, d),
+        Supervisor::Dead(d) => (LivenessView::Dead, d),
+        Supervisor::Unknown => (
+            LivenessView::Unknown,
+            "sin evidencia de supervisor (ni run.started ni lease propio)".into(),
+        ),
+    };
+    Ok(SupervisorView { liveness, detail })
+}
+
+/// Ownership del lease del workspace del run, con liveness del dueño cuando
+/// el lease pertenece a OTRO run (requisito S2: no presentarlo como válido).
+pub fn lease_view(conn: &Connection, run: &RunRow) -> Result<LeaseView> {
+    let Some(ws) = &run.workspace_id else {
+        return Ok(LeaseView::Missing);
+    };
+    match crate::store::leases::get(conn, ws)? {
+        None => Ok(LeaseView::Missing),
+        Some(info) if info.run_id == run.id => Ok(LeaseView::Owned {
+            pid: info.pid,
+            owner_alive: crate::store::leases::owner_alive(&info),
+        }),
+        Some(info) => {
+            let owner_alive = crate::store::leases::owner_alive(&info);
+            Ok(LeaseView::HeldByOther {
+                holder_run_id: info.run_id,
+                pid: info.pid,
+                owner_alive,
+            })
+        }
+    }
+}
+
+/// Estado operativo efectivo: no se reporta `running` solo porque SQLite diga
+/// `running` — se exige supervisor VIVO. Muerto ⇒ interrupted_candidate;
+/// desconocido ⇒ unknown. Los estados terminales se conservan tal cual.
+pub fn effective_status(run: &RunRow, supervisor: &SupervisorView) -> &'static str {
+    match run.state.as_str() {
+        "completed" => "completed",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        "starting" => match supervisor.liveness {
+            LivenessView::Alive => "starting",
+            LivenessView::Dead => "interrupted_candidate",
+            LivenessView::Unknown => "unknown",
+        },
+        "running" => match supervisor.liveness {
+            LivenessView::Alive => "running",
+            LivenessView::Dead => "interrupted_candidate",
+            LivenessView::Unknown => "unknown",
+        },
+        _ => "unknown",
+    }
+}
+
 /// Gate de reuso (Runner): ¿es seguro reutilizar este workspace?
 ///
 /// - estado `workspace.recovery_unsafe` previo → Blocked SIEMPRE: la

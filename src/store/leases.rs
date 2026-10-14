@@ -119,6 +119,11 @@ fn read_lease(conn: &Connection, workspace_id: &str) -> Result<Option<LeaseInfo>
     }
 }
 
+/// Lectura de un lease sin clasificar liveness (S2: vista de estado).
+pub fn get(conn: &Connection, workspace_id: &str) -> Result<Option<LeaseInfo>> {
+    read_lease(conn, workspace_id)
+}
+
 /// ¿Hay un dueño VIVO del workspace? (para bloquear `worktree rm`).
 /// Un lease de un proceso muerto no bloquea: recuperación conservadora pero
 /// la muerte debe estar probada (PID muerto o reutilizado).

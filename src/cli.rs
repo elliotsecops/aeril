@@ -219,8 +219,66 @@ fn cmd_thread(p: &Parsed, db_path: &Path) -> Result<i32> {
 
 // ── run ──────────────────────────────────────────────────────────────────────
 
+fn run_view(store: &Store, run: &runs::RunRow) -> Result<Value> {
+    use crate::recovery::{LeaseView, LivenessView};
+    let supervisor = crate::recovery::supervisor_view(&store.conn, run)?;
+    let lease = crate::recovery::lease_view(&store.conn, run)?;
+    let status = crate::recovery::effective_status(run, &supervisor);
+    let sup_status = match supervisor.liveness {
+        LivenessView::Alive => "alive",
+        LivenessView::Dead => "dead",
+        LivenessView::Unknown => "unknown",
+    };
+    let lease_json = match lease {
+        LeaseView::Owned { pid, owner_alive } => {
+            json!({"status": "owned", "pid": pid, "owner_alive": owner_alive})
+        }
+        LeaseView::Missing => json!({"status": "missing"}),
+        LeaseView::HeldByOther {
+            holder_run_id,
+            pid,
+            owner_alive,
+        } => json!({
+            "status": "held_by_other",
+            "holder_run_id": holder_run_id,
+            "pid": pid,
+            "owner_alive": owner_alive,
+        }),
+    };
+    Ok(json!({
+        "run_id": run.id,
+        "thread_id": run.thread_id,
+        "workspace_id": run.workspace_id,
+        "backend": run.backend,
+        "state": run.state,
+        "supervisor": {"status": sup_status, "detail": supervisor.detail},
+        "lease": lease_json,
+        "started_ms": run.started_ms,
+        "ended_ms": run.ended_ms,
+        "status": status,
+    }))
+}
+
 fn cmd_run(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
     match p.pos.get(1).map(String::as_str) {
+        Some("list") => {
+            let active_only = p.yes("active");
+            let limit: i64 = p
+                .flag("limit")
+                .map(|v| v.parse())
+                .transpose()
+                .map_err(|_| Error::invalid("--limit inválido"))?
+                .unwrap_or(50);
+            let store = open_store(db_path)?;
+            // SOLO LECTURA: no se reconcilia ni se muta nada en una consulta.
+            let listed = runs::list_recent(&store.conn, active_only, limit)?;
+            let arr: Vec<Value> = listed
+                .iter()
+                .map(|run| run_view(&store, run))
+                .collect::<Result<_>>()?;
+            print_json(&Value::Array(arr))?;
+            Ok(0)
+        }
         Some("start") => {
             let thread_id = p.require("thread")?;
             let prompt = p.require("prompt")?;
@@ -263,7 +321,9 @@ fn cmd_run(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
             print_run_summary(&summary)?;
             Ok(0)
         }
-        other => Err(Error::invalid(format!("run {other:?} no soportado"))),
+        other => Err(Error::invalid(format!(
+            "run {other:?} no soportado (start|list [--active] [--limit N])"
+        ))),
     }
 }
 

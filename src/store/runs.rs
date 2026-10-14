@@ -132,6 +132,22 @@ pub fn latest(conn: &Connection, thread_id: &str) -> Result<Option<RunRow>> {
     }
 }
 
+/// Listado acotado de runs para `run list` (S2). `active_only` filtra
+/// únicamente el estado persistido (starting/running); la liveness se calcula
+/// aparte, nunca se muta nada en una consulta.
+pub fn list_recent(conn: &Connection, active_only: bool, limit: i64) -> Result<Vec<RunRow>> {
+    let sql = if active_only {
+        format!(
+            "SELECT {COLS} FROM runs WHERE state IN ('starting','running') ORDER BY started_ms DESC, id DESC LIMIT ?1"
+        )
+    } else {
+        format!("SELECT {COLS} FROM runs ORDER BY started_ms DESC, id DESC LIMIT ?1")
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![limit.max(1)], row_to_run)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn list(conn: &Connection, thread_id: &str) -> Result<Vec<RunRow>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM runs WHERE thread_id = ?1 ORDER BY started_ms ASC, id ASC"
