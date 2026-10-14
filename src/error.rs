@@ -42,6 +42,11 @@ pub enum Error {
     #[error("checkpoint no listo: {0}")]
     NotReady(String),
 
+    /// El run perdió el ownership del workspace: no puede publicar resultados
+    /// ni reportar completitud (fence transaccional de lease, RC2.1).
+    #[error("lease perdido: {0}")]
+    LeaseLost(String),
+
     /// Fallo del backend de agentes (proceso, protocolo, cancelación).
     #[error("backend: {0}")]
     Backend(String),

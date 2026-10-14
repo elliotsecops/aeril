@@ -144,7 +144,7 @@ impl Runner {
             )? {
                 leases::AcquireOutcome::Busy { info, age_ms } => {
                     return Err(Error::conflict(format!(
-                        "workspace {ws} en uso: el proceso dueño sigue vivo (run {}, pid {}, heartbeat hace {age_ms} ms); un TTL vencido no transfiere ownership; recuperación explícita: `aeril lease release {ws} [--force]`",
+                        "workspace {ws} en uso: el proceso dueño sigue vivo (run {}, pid {}, heartbeat hace {age_ms} ms); un TTL vencido no transfiere ownership; terminá el proceso dueño y verificá su muerte, o esperá la toma automática por PID muerto/reutilizado (`--force` NO pisa a un dueño vivo)",
                         info.run_id, info.pid
                     )));
                 }
@@ -259,8 +259,8 @@ impl Runner {
             )? {
                 leases::AcquireOutcome::Busy { info, age_ms } => {
                     return Err(Error::conflict(format!(
-                        "workspace {} en uso: el proceso dueño sigue vivo (run {}, pid {}, heartbeat hace {age_ms} ms); un TTL vencido no transfiere ownership; recuperación explícita: `aeril lease release {} [--force]`",
-                        target.workspace_id, info.run_id, info.pid, target.workspace_id
+                        "workspace {} en uso: el proceso dueño sigue vivo (run {}, pid {}, heartbeat hace {age_ms} ms); un TTL vencido no transfiere ownership; terminá el proceso dueño y verificá su muerte, o esperá la toma automática por PID muerto/reutilizado (`--force` NO pisa a un dueño vivo)",
+                        target.workspace_id, info.run_id, info.pid
                     )));
                 }
                 leases::AcquireOutcome::Acquired { took_over } => {
@@ -445,16 +445,35 @@ impl Runner {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    if matches!(e, Error::LeaseLost(_)) {
+                        // Pérdida de ownership detectada por el fence: evento
+                        // durable (best-effort; el fence ya rechazó el hecho).
+                        let _ = events::append_typed(
+                            &mut store.conn,
+                            thread_id,
+                            Some(&run.id),
+                            events::K_WORKSPACE_LEASE_LOST,
+                            "system",
+                            &payload::WorkspaceLeaseLost {
+                                workspace_id: target.workspace_id.clone(),
+                                run_id: run.id.clone(),
+                                reason: e.to_string(),
+                            },
+                        );
+                    }
                     state = "failed";
                     detail = Some(format!("captura de checkpoint falló: {e}"));
                 }
             }
         }
 
-        runs::end(
+        // Fence de cierre (RC2.1): el estado final puede degradarse a failed
+        // si el ownership del workspace se perdió (incluye runs sin cambios).
+        let final_state = runs::end(
             &mut store.conn,
             thread_id,
             &run.id,
+            Some(&target.workspace_id),
             state,
             detail.as_deref(),
             stop_reason.as_deref(),
@@ -464,7 +483,7 @@ impl Runner {
         self.note(UiNote::RunDone {
             thread_id: thread_id.to_string(),
             run_id: run.id.clone(),
-            state: state.to_string(),
+            state: final_state.clone(),
         });
 
         let engine_session_id =
@@ -472,7 +491,7 @@ impl Runner {
         Ok(RunSummary {
             thread_id: thread_id.to_string(),
             run_id: run.id,
-            state: state.to_string(),
+            state: final_state,
             stop_reason,
             engine_session_id,
             snapshot,

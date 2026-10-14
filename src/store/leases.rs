@@ -6,7 +6,8 @@
 //! el dueño está probadamente muerto: PID inexistente, o PID reutilizado por
 //! otro proceso (comparando el `starttime` del kernel, `/proc/<pid>/stat`).
 //! Un dueño vivo con heartbeat vencido (p. ej. detenido con SIGSTOP) queda
-//! `Busy` y requiere recuperación explícita (`aeril lease release --force`).
+//! `Busy` y requiere recuperación explícita (terminar el dueño y verificar su
+//! muerte; `lease release` NO puede pisar a un dueño vivo, ni con `--force`).
 //!
 //! Ámbito declarado: es coordinación advisory de Aeril. No aísla de procesos
 //! externos que editen los mismos archivos con los permisos del usuario
@@ -223,22 +224,27 @@ pub fn list(conn: &Connection) -> Result<Vec<(String, LeaseInfo)>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Recuperación EXPLÍCITA de un lease (dueno vivo bloqueando indefinidamente,
-/// p. ej. SIGSTOP). Sin `force`, solo libera si el dueño está muerto.
-/// Devuelve la descripción del lease liberado.
+/// Recuperación EXPLÍCITA de un lease.
+///
+/// RC2.1: un dueño **VIVO no se libera nunca — ni con `--force`**. La única
+/// vía es terminar el proceso dueño, verificar su muerte y volver a ejecutar
+/// (o dejar que la toma de control por PID muerto/reutilizado ocurra sola).
+/// `force` se acepta por compatibilidad de CLI, pero no puede pisar liveness.
 pub fn release_external(
     conn: &mut Connection,
     workspace_id: &str,
-    force: bool,
+    _force: bool,
 ) -> Result<LeaseInfo> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let info = read_lease(&tx, workspace_id)?
         .ok_or_else(|| Error::not_found(format!("no hay lease para {workspace_id}")))?;
-    if !force && owner_alive(&info) {
+    if owner_alive(&info) {
         tx.rollback()?;
         return Err(Error::conflict(format!(
-            "el lease de {workspace_id} pertenece a un proceso VIVO (run {}, pid {}); usá --force solo si confirmaste que debe detenerse",
-            info.run_id, info.pid
+            "el lease de {workspace_id} pertenece a un proceso VIVO (run {}, pid {}); NO se libera, ni con --force. \
+             Terminá el proceso dueño (cierre normal, SIGTERM o SIGKILL), verificá su muerte (p. ej. `ps -p {}`) \
+             y volvé a ejecutar `aeril lease release --workspace {workspace_id}`; la liveness se verifica por PID+starttime",
+            info.run_id, info.pid, info.pid
         )));
     }
     tx.execute(

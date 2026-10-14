@@ -550,12 +550,13 @@ fn cmd_lease(p: &Parsed, db_path: &Path) -> Result<i32> {
                 "workspace_id": ws,
                 "previous_run_id": info.run_id,
                 "previous_pid": info.pid,
-                "forced": force,
+                "force_flag_received": force,
+                "note": "--force no puede pisar a un dueño vivo; solo se liberan dueños con muerte verificada",
             }))?;
             Ok(0)
         }
         other => Err(Error::invalid(format!(
-            "lease {other:?} no soportado (status|release --workspace W [--force])"
+            "lease {other:?} no soportado (status | release --workspace W [--force: protocolar, NO pisa a un dueño vivo])"
         ))),
     }
 }

@@ -118,7 +118,11 @@ struct InflightBudget {
 
 impl InflightBudget {
     fn new(budget: usize) -> Self {
-        let budget = budget.max(1);
+        // Clamp defensivo: `Semaphore::new` paniquea por encima de MAX_PERMITS
+        // y `acquire_many` toma u32 — una config extrema por env no debe
+        // tumbar el proceso.
+        let max = tokio::sync::Semaphore::MAX_PERMITS.min(u32::MAX as usize);
+        let budget = budget.clamp(1, max);
         InflightBudget {
             sem: std::sync::Arc::new(tokio::sync::Semaphore::new(budget)),
             current: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -136,7 +140,8 @@ impl InflightBudget {
             self.budget
         } else {
             size.max(1)
-        } as u32;
+        };
+        let want = want.min(u32::MAX as usize) as u32;
         let permits = tokio::sync::Semaphore::acquire_many_owned(self.sem.clone(), want)
             .await
             .ok()?;

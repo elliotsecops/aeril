@@ -166,6 +166,26 @@ fn b1_cota_de_bytes_en_vuelo_con_consumidor_lento() {
 }
 
 #[test]
+fn b1_configuracion_extrema_no_paniquea() {
+    // Presupuestos absurdos por env no deben tumbar el proceso (clamp).
+    let env = TestEnv::new("rc2-b1-extreme");
+    let spec = flood_spec(&env, 3, 1_000);
+    let (peak, budget, updates, stop) = run_flood(
+        &env,
+        spec,
+        AcpLimits {
+            max_line_bytes: usize::MAX,
+            max_turn_bytes: usize::MAX,
+            inflight_bytes: usize::MAX,
+        },
+        0,
+    );
+    assert_eq!(stop, "end_turn");
+    assert_eq!(updates as u64, 4);
+    assert!(peak <= budget, "peak {peak} budget {budget}");
+}
+
+#[test]
 fn b1_frame_individual_mayor_que_el_budget_transita_solo() {
     let env = TestEnv::new("rc2-b1-single");
     let frames: u64 = 3;

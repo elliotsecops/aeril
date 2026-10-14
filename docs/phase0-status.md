@@ -18,13 +18,19 @@
   (`AERIL_ACP_MAX_TURN_BYTES`). Un frame mayor al presupuesto transita solo.
   `kill()`/`Drop` terminan el **grupo de procesos** del backend.
 - **Lease de workspace**: un TTL vencido **nunca** transfiere ownership con el
-  proceso dueño VIVO (incluye SIGSTOP); recuperación explícita con
-  `aeril lease status|release`. La transferencia automática exige muerte
+  proceso dueño VIVO (incluye SIGSTOP y `lease release --force`, que RC2.1 ya
+  no permite como bypass); recuperación = muerte verificada del proceso dueño
+  (o toma automática por PID muerto/reutilizado). La transferencia automática exige muerte
   probada (PID ausente o reutilizado según `starttime`). Si un run pierde
   ownership (o falla la renovación), ABORTA: cancela el backend, registra
   `workspace.lease_lost`, `run.ended failed`, sin checkpoint ni completitud.
-  `worktree rm` requiere dueño muerto. Ámbito: coordinación advisory entre
-  procesos de Aeril; no es un sandbox (MANIFIESTO §8).
+  `worktree rm` requiere dueño muerto. **Fence RC2.1**: `checkpoint.prepared`,
+  `checkpoint.ready` y `run.ended completed` verifican el ownership del lease
+  DENTRO de la misma transacción IMMEDIATE del append; un dueño obsoleto no
+  publica ready ni reporta completitud (falla explícita + `workspace.lease_lost`;
+  marcador terminal para que la recuperación no complete un checkpoint
+  rechazado; la recuperación de crashes legítimos no cambia). Ámbito:
+  coordinación advisory entre procesos de Aeril; no es un sandbox (MANIFIESTO §8).
 - **Submódulos/gitlinks**: enumerados por ÍNDICE, no por status. Inicializado
   con puntero modificado ⇒ rechazo; **no inicializado con contenido bajo su
   path ⇒ rechazo explícito** (jamás se tra-versa como archivos comunes ni se

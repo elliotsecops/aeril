@@ -15,6 +15,7 @@ use crate::store::events::{self, EventRecord, payload};
 use crate::store::{Store, runs::RunRow};
 use crate::timeutil::now_ms;
 use git2::Repository;
+use rusqlite::OptionalExtension;
 
 #[derive(Debug)]
 pub struct CaptureOutcome {
@@ -80,13 +81,15 @@ pub fn capture(
         parent_oid: base_oid.to_string(),
         files: captured.files.clone(),
     };
-    let (prepared_event_id, _) = events::append_typed(
-        &mut store.conn,
+    let prepared_value = serde_json::to_value(&prepared)?;
+    append_fenced(
+        store,
+        workspace_id,
+        &run.id,
         &run.thread_id,
         Some(&run.id),
         events::K_CHECKPOINT_PREPARED,
-        "system",
-        &prepared,
+        &prepared_value,
     )?;
     crash::point("prepared");
 
@@ -110,7 +113,6 @@ pub fn capture(
         )?;
         return Err(e);
     }
-    let _ = prepared_event_id;
     crash::point("ref");
 
     // 4. Verificar ref + objetos contra lo declarado.
@@ -140,24 +142,53 @@ pub fn capture(
     // 5. Confirmar. Desde aquí se puede revisar/comentar.
     let ready = payload::CheckpointReady {
         snapshot_id: snapshot_id.clone(),
-        git_ref: ref_name,
+        git_ref: ref_name.clone(),
         oid: captured.commit_oid.clone(),
         base_oid: base_oid.to_string(),
         patch: captured.patch.clone(),
         files: captured.files.clone(),
         recovered: false,
     };
-    let (ready_event_id, _) = events::append_typed(
-        &mut store.conn,
+    let ready_value = serde_json::to_value(&ready)?;
+    let ready_event_id = match append_fenced(
+        store,
+        workspace_id,
+        &run.id,
         &run.thread_id,
         Some(&run.id),
         events::K_CHECKPOINT_READY,
-        "system",
-        &ready,
-    )?;
+        &ready_value,
+    ) {
+        Ok(id) => id,
+        Err(e) if matches!(e, Error::LeaseLost(_)) => {
+            // La ref ya está publicada (objetos inmutables, jamás se borra),
+            // pero este checkpoint NO puede volverse ready. Marcador terminal
+            // para que la recuperación no lo complete: la distinción es
+            // crash legítimo (sin marcador → recovery completa) vs pérdida
+            // de lease (marcador → terminado).
+            let failed = payload::CheckpointFailed {
+                snapshot_id: snapshot_id.clone(),
+                git_ref: Some(ref_name.clone()),
+                expected_oid: Some(captured.commit_oid.clone()),
+                phase: "lease_fence".into(),
+                reason: e.to_string(),
+                terminal: true,
+            };
+            append_resolution(
+                store,
+                &run.thread_id,
+                Some(&run.id),
+                &snapshot_id,
+                events::K_CHECKPOINT_FAILED,
+                &serde_json::to_value(failed)?,
+            )?;
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
 
     Ok(Some(CaptureOutcome {
-        snapshot_id,
+        snapshot_id: snapshot_id.clone(),
         event_id: ready_event_id,
         oid: captured.commit_oid,
         files: captured.files,
@@ -244,6 +275,41 @@ pub enum RecoveryOutcome {
     },
     /// Otro fallo de integridad reportado como terminal.
     Failed { snapshot_id: String, detail: String },
+}
+
+/// Fence de lease (RC2.1): verifica el ownership del workspace y persiste el
+/// evento DENTRO DE LA MISMA transacción IMMEDIATE — no hay ventana entre la
+/// verificación y la escritura. Un run sin el lease no puede publicar hechos
+/// de checkpoint (ni `prepared` ni `ready`).
+fn append_fenced(
+    store: &mut Store,
+    workspace_id: &str,
+    owner_run_id: &str,
+    thread_id: &str,
+    run_id: Option<&str>,
+    kind: &str,
+    payload: &serde_json::Value,
+) -> Result<String> {
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let holder: Option<String> = tx
+        .query_row(
+            "SELECT run_id FROM leases WHERE workspace_id = ?1",
+            rusqlite::params![workspace_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if holder.as_deref() != Some(owner_run_id) {
+        tx.rollback()?;
+        return Err(Error::LeaseLost(format!(
+            "el workspace {workspace_id} ya no pertenece al run {owner_run_id} (holder: {}); \"{kind}\" no se persiste",
+            holder.unwrap_or_else(|| "ninguno".into())
+        )));
+    }
+    let (id, _seq) = events::append_tx(&tx, thread_id, run_id, kind, "system", payload, now_ms())?;
+    tx.commit()?;
+    Ok(id)
 }
 
 /// ¿Existe ya una resolución (`ready`/`failed`) para este snapshot?

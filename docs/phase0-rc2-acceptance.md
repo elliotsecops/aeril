@@ -67,7 +67,10 @@ sobre el mismo workspace):**
   transferencia automática queda solo para dueños probadamente muertos
   (PID ausente o **PID reutilizado** detectado por `starttime`, esquema v3).
 - Recuperación explícita: `aeril lease status` / `aeril lease release
-  --workspace W [--force]` (sin `--force` exige dueño muerto).
+  --workspace W`. **RC2.1: `--force` ya no puede pisar a un dueño vivo** — la
+  única vía es terminar el proceso y verificar su muerte (o esperar la toma
+  automática por PID muerto/reutilizado). Ver
+  `docs/phase0-rc2-acceptance.md` §RC2.1.
 - Dueño: si la renovación falla (0 filas o error del store) el run **aborta**:
   cancela el backend vía la señal combinada del turno, registra
   `workspace.lease_lost`, marca `run.ended failed` y **no captura checkpoint
@@ -167,6 +170,53 @@ de 300 KB) está acotado por tamaño de frame × constante; la cota de **cola**
    submódulos no se soporta en v0.
 5. El documento original de la segunda auditoría no vino adjunto; la
    trazabilidad se apoya en el brief y en la reproducción pre-fix registrada.
+
+## RC2.1 — Fence de lease (parche final, rama `fix/phase0-lease-fence`)
+
+**Defecto confirmado:** `lease release --force` borraba el lease de un dueño
+VIVO; B adquiría W y ambos runs completaban sobre el mismo workspace
+(reproducido con dos procesos Aeril reales: el test A falla en el commit
+`62d64e4` con el release aceptado sobre un PID vivo).
+
+**Correcciones:**
+
+1. **`--force` no pisa liveness (jamás).** `release_external` rechaza la
+   liberación si el dueño está confirmado vivo, incluso con `--force`; el
+   error explica la única vía: terminar el proceso dueño, verificar su muerte
+   (`ps -p <pid>`) y reintentar — o esperar la toma automática por PID
+   muerto/reutilizado. `pid_start` (starttime) sigue siendo la verificación.
+   `worktree rm` continúa bloqueado mientras el dueño viva.
+2. **Fence transaccional de checkpoints.** `checkpoint.prepared` y
+   `checkpoint.ready` verifican el ownership DENTRO de la misma transacción
+   `BEGIN IMMEDIATE` del append (sin ventana verificación↔persistencia). Un
+   dueño obsoleto no puede publicar `ready`; si la pérdida ocurre tras
+   publicar la ref (objetos inmutables, jamás se borra la ref), se escribe un
+   `checkpoint.failed` terminal para que la recuperación NO lo complete —
+   la distinción es: crash legítimo sin marcador ⇒ recovery completa (Gate B
+   intacto); pérdida de lease con marcador ⇒ terminado.
+3. **`run.ended` exitoso fenceado.** El estado `completed` (incluido el caso
+   sin cambios, que no captura checkpoint) sólo se registra si el run sigue
+   siendo el dueño; si no, se degrada a `failed` con razón explícita y evento
+   `workspace.lease_lost` en la MISMA transacción.
+4. Extra pequeño: la configuración extrema de límites ACP por env ya no puede
+   paniquear (`Semaphore::MAX_PERMITS`/u32 con clamp).
+
+**Tests de regresión (tests/rc2_1_lease_fence.rs):**
+
+| Test | Escenario | Resultado |
+|---|---|---|
+| A | release --force con dueño VIVO y heartbeat vigente ⇒ conflicto; B bloqueado; A conserva exclusividad y contenido; libera al terminar | ✅ |
+| B | heartbeat vencido + dueño VIVO (intervalo/TTL default) ⇒ release rechazado; ningún segundo run adquiere | ✅ |
+| C | dueño muerto verificado ⇒ `lease release` (sin force) funciona; B adquiere y completa solo | ✅ |
+| D | ownership robado por fixture de DB con renovación default ⇒ fence rechaza `prepared`: sin `checkpoint.ready` nuevo, `run.ended failed`, evento `workspace.lease_lost`, nada pendiente | ✅ |
+| E | Gate B original (`test_b_crash`) sin regresión: los `prepared` legítimos tras SIGKILL se recuperan | ✅ |
+
+Más `b1_configuracion_extrema_no_paniquea` y la migración v2→v3
+(`store::tests::migracion_v2_a_v3_conserva_datos`).
+
+**Verificación:** 61 tests (0 fallos), `fmt` y `clippy -D warnings` limpios,
+suite con `--locked --offline`. **Performance: evidencia RC2 heredada** (los
+cambios no tocan el arranque ni el RSS; no se repitió la campaña).
 
 ## 8. Autoevaluación de merge readiness
 

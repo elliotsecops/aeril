@@ -46,6 +46,56 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    /// Migración v2→v3: un store de la era RC2 (sin `pid_start`) se actualiza
+    /// sin perder datos y la columna queda disponible.
+    #[test]
+    fn migracion_v2_a_v3_conserva_datos() {
+        let dir = std::env::temp_dir().join(format!("aeril-mig-{}", crate::ids::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aeril.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(super::schema::SCHEMA_V1).unwrap();
+            conn.execute_batch(super::schema::SCHEMA_V2).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            conn.execute(
+                "INSERT INTO threads (id, title, repo_id, repo_path, state, next_seq, created_ms, updated_ms)
+                 VALUES ('t1', 'pre-v3', 'r1', '/tmp', 'open', 0, 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO leases (workspace_id, run_id, pid, acquired_ms, renewed_ms, ttl_ms)
+                 VALUES ('ws1', 'run1', 123, 1, 1, 60000)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let v: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3);
+        let title: String = store
+            .conn
+            .query_row("SELECT title FROM threads WHERE id = 't1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "pre-v3");
+        let pid_start: i64 = store
+            .conn
+            .query_row(
+                "SELECT pid_start FROM leases WHERE workspace_id = 'ws1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pid_start, 0, "fila legacy queda en 0 (liveness por PID)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

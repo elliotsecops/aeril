@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::ids::new_id;
 use crate::store::events::{self, payload};
 use crate::timeutil::now_ms;
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 #[derive(Debug, Clone)]
 pub struct RunRow {
@@ -184,26 +184,68 @@ pub fn set_engine_session(
 }
 
 /// Cierra el run y registra `run.ended` en la misma transacción.
+///
+/// RC2.1 — fence de lease: un run que reporta `completed` debe seguir siendo
+/// el dueño VIGENTE del workspace (verificación y append en la MISMA
+/// transacción IMMEDIATE). Ownership perdido ⇒ el run se cierra como `failed`
+/// con razón explícita + evento `workspace.lease_lost`, jamás como éxito.
+/// Devuelve el estado FINAL registrado.
 pub fn end(
     conn: &mut Connection,
     thread_id: &str,
     run_id: &str,
+    workspace_id: Option<&str>,
     state: &str,
     reason: Option<&str>,
     stop_reason: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     let now = now_ms();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut final_state = state.to_string();
+    let mut final_reason = reason.map(str::to_string);
+    if state == "completed"
+        && let Some(ws) = workspace_id
+    {
+        let holder: Option<String> = tx
+            .query_row(
+                "SELECT run_id FROM leases WHERE workspace_id = ?1",
+                params![ws],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if holder.as_deref() != Some(run_id) {
+            let holder_desc = holder.clone().unwrap_or_else(|| "ninguno".into());
+            final_state = "failed".into();
+            let detail = format!(
+                "lease perdido: no se reporta completitud sin ownership del workspace {ws} (holder: {holder_desc})"
+            );
+            final_reason = Some(detail.clone());
+            let lost = payload::WorkspaceLeaseLost {
+                workspace_id: ws.to_string(),
+                run_id: run_id.to_string(),
+                reason: detail,
+            };
+            events::append_tx(
+                &tx,
+                thread_id,
+                Some(run_id),
+                events::K_WORKSPACE_LEASE_LOST,
+                "system",
+                &serde_json::to_value(lost)?,
+                now,
+            )?;
+        }
+    }
     let changed = tx.execute(
         "UPDATE runs SET state = ?2, ended_ms = ?3 WHERE id = ?1",
-        params![run_id, state, now],
+        params![run_id, final_state, now],
     )?;
     if changed == 0 {
         return Err(Error::not_found(format!("run {run_id}")));
     }
     let payload = payload::RunEnded {
-        state: state.to_string(),
-        reason: reason.map(str::to_string),
+        state: final_state.clone(),
+        reason: final_reason,
         stop_reason: stop_reason.map(str::to_string),
     };
     events::append_tx(
@@ -216,5 +258,5 @@ pub fn end(
         now,
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(final_state)
 }
