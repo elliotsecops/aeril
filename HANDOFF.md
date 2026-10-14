@@ -1,8 +1,37 @@
-# Aeril — Handoff (estado al 2026-10-13 — v0.4)
+# Aeril — Handoff (estado al 2026-10-14 — v0.5: Fase 0 integrada)
 
-> **Para la próxima sesión.** Leé esto primero, después `MANIFIESTO.md` (v0.4), después la nota de Obsidian (v0.4). No necesitás el historial de esta conversación para continuar.
+> **Para la próxima sesión.** Leé esto primero, después `MANIFIESTO.md` (v0.4). No necesitás el historial de esta conversación para continuar.
 >
-> **v0.4** integra la **segunda pasada** del revisor: (1) esquema mínimo de 3 tablas pero con snapshot real desde el primer comentario; (2) protocolo prepared→ready y política de limpieza de refs por evidencia, nunca por edad; (3) corrección competitiva —Orca SÍ tiene el cierre review→feedback→integración, la diferenciación es la promesa verificable dentro del presupuesto—; (4) 5-10 días son una demostración estrecha, no el release robusto; (5) v0 integra solo por fast-forward a rama destino explícita.
+> **v0.5 (2026-10-14):** la **Fase 0 está completada, auditada e integrada en `main`** (commit certificado `41ab86cc28acad3476da3662723fd2411d6db16b`, fast-forward). Esta versión agrega el estado actual y marca como obsoletas las instrucciones de arranque; **conserva el historial de decisiones v0.4 sin reescribirlo** (secciones §1–§9).
+>
+> **v0.4** integró la segunda pasada del revisor: (1) esquema mínimo de 3 tablas pero con snapshot real desde el primer comentario; (2) protocolo prepared→ready y política de limpieza de refs por evidencia, nunca por edad; (3) corrección competitiva —Orca SÍ tiene el cierre review→feedback→integración, la diferenciación es la promesa verificable dentro del presupuesto—; (4) 5-10 días son una demostración estrecha, no el release robusto; (5) v0 integra solo por fast-forward a rama destino explícita.
+
+---
+
+## 0. Estado actual (2026-10-14) — Fase 0 ENTREGADA, AUDITADA E INTEGRADA
+
+**Commit certificado:** `41ab86cc28acad3476da3662723fd2411d6db16b` — `main` del remoto, verificado por fast-forward (sin force, sin reescritura). La cadena de auditoría completa (`feat/phase0-vertical-slice` → `fix/phase0-reliability-rc1` → `rc2` → `rc2.1`) queda intacta como ramas históricas.
+
+**Entregado y verificado** (detalle en `docs/phase0-status.md`):
+
+- Corte vertical completo: editar → snapshot inmutable → revisar → comentar → feedback → reanudar tras crash → validar → integrar (FF), con **Gate A** (retención de la revisión por OID tras nuevas ediciones y borrado del worktree) y **Gate B** (recuperación tras SIGKILL entre `prepared` y `ready`) automatizados.
+- Store SQLite (3 tablas + tabla pequeña de leases, migración v3), workspaces verificados, snapshots con `refs/aeril/checkpoints/<id>` y CAS, comentarios anclados a contenido inmutable, validación en checkout aislado con hash completo, integración FF con intención durable y reconciliación.
+- Adaptador ACP (`hermes` + backend mock determinista): permisos fail-closed con auditoría durable, resume real con `attempted/accepted/verified`, entrada byte-bounded con backpressure, cancelación con plazo fijo, terminación por grupo de procesos.
+- Leases de workspace con fence transaccional (RC2.1): un dueño vivo no pierde el workspace por ningún camino de la CLI; un dueño obsoleto no publica `ready` ni reporta completitud.
+- TUI mínima usable + CLI completa + export (JSONL/Markdown) + presupuestos (`make budget`, `make budget-scale`).
+
+**Auditoría final independiente:** 62/62 tests, `cargo fmt --check` y Clippy (`-D warnings`) limpios; presupuestos medidos en la laptop objetivo (p95 ≈ 26 ms al abrir un thread, RSS idle ≈ 6.7 MB, caché por thread ≈ 0.8 MiB, binario ≈ 5.5 MB); evidencia RC2 heredada donde no hubo re-medición.
+
+**Límites preservados (no sobreprometer):**
+
+- **Hermes real ×5 no fue benchmarkeado**: los procesos comparten perfil (`~/.hermes`); el bench de escala usa agentes mock y lo declara explícitamente.
+- Leases = coordinación advisory entre procesos de Aeril, no un sandbox (MANIFIESTO §8).
+- Submódulos y patches > 4 MiB: rechazo explícito en v0. Restauración de sesión del motor no verificable con Hermes 0.21.5 (`verified=false`).
+- PTY/paneles divididos: fuera del alcance de Fase 0 (multiplexor = Fase 1+).
+
+**Documentos de la fase:** `docs/phase0-status.md` (implementado/verificado vs diferido), `docs/phase0-engineering-handoff.md` (comandos de reproducción y mediciones), `docs/phase0-rc2-acceptance.md` (segunda auditoría: blockers B1/B5/A5 y fence RC2.1), `docs/phase0-remediation-matrix.md` (primera auditoría A1–A6/B1–B7), `docs/acp-hermes-spec.md` (protocolo verificado contra el código instalado).
+
+**Próximo milestone: Fase 1** — el corte vertical útil: dos agentes concurrentes en workspaces verificados independientes, con estado durable y recuperación segura. El plan de Fase 1 está **en revisión** (no implementado aún); no declarar ejecución paralela de Hermes como segura hasta verificar su aislamiento de perfiles.
 
 ---
 
@@ -22,7 +51,8 @@ Un **terminal/entorno donde el agente de IA es un participante nativo**. No es u
 |---|---|---|
 | Constitución | `/home/elliot/aeril/MANIFIESTO.md` | **v0.4** |
 | Plan + arquitectura | `~/Documentos/Obsidian Vault/Aeril - Plan de Producto y Arquitectura.md` | **v0.4** |
-| Handoff | `/home/elliot/aeril/HANDOFF.md` | **v0.4** |
+| Handoff | `/home/elliot/aeril/HANDOFF.md` | **v0.5** (histórico v0.4 conservado) |
+| Estado/aceptación de Fase 0 | `docs/phase0-status.md`, `docs/phase0-engineering-handoff.md`, `docs/phase0-rc2-acceptance.md`, `docs/phase0-remediation-matrix.md` | entregados 2026-10-14 |
 
 v0.3 integró la primera revisión; v0.4 la segunda pasada. El revisor (Codex, 2026-10-13) dejó además:
 - `/home/elliot/Documentos/ChatGPT/Aeril/docs/architecture-review-2026-10-13.md` (auditoría completa, 1ra pasada)
@@ -75,11 +105,11 @@ v0.3 integró la primera revisión; v0.4 la segunda pasada. El revisor (Codex, 2
 
 ## 6. Roadmap vigente (corte vertical primero)
 
-| Fase | Entregable | Estimado |
+| Fase | Entregable | Estado |
 |---|---|---|
-| **0 — Ensayo de viabilidad** | Un thread completo y recuperable (editar→snapshot→revisar→comentar→feedback→reanudar tras crash), 1 backend, 1 repo, Linux x86_64, medido en la laptop objetivo | **5-10 días** |
-| 1 — Corte vertical útil | Review durable + 2 agentes con workspaces verificados | 4-6 sem |
-| 2 — Alpha multiagente | 3-5 runs, integración asistida, búsqueda, notificaciones | 4-6 sem |
+| **0 — Ensayo de viabilidad** | Un thread completo y recuperable (editar→snapshot→revisar→comentar→feedback→reanudar tras crash), 1 backend, 1 repo, Linux x86_64, medido en la laptop objetivo | ✅ **Completada, auditada e integrada** (2026-10-14 · `41ab86c`) |
+| 1 — Corte vertical útil | Review durable + 2 agentes con workspaces verificados | **Próximo** (plan en revisión) |
+| 2 — Alpha multiagente | 3-5 runs, integración asistida, búsqueda, notificaciones | Estimado 4-6 sem |
 | 3 — Ampliación | Otros backends/targets; GUI web al final | tras alpha |
 
 **La unidad de valor es el cierre del trabajo:** snapshot → revisión → feedback → reanudación → tests ligados al snapshot → integración segura. Los splits y la GUI web van después.
@@ -97,7 +127,7 @@ v0.3 integró la primera revisión; v0.4 la segunda pasada. El revisor (Codex, 2
 **Siguen abiertas:**
 
 4. **Modelo de confianza:** ✅ **Resuelto.** Redactar en el manifiesto: *"Aeril separa los archivos de trabajo de cada tarea; no restringe los permisos del agente sobre la computadora."* El agente conserva los permisos del usuario: puede acceder a otras carpetas, usar credenciales accesibles, conectarse a Internet, arrancar programas, y tomar el mismo puerto/servicio que otro agente. Borrar el worktree NO detiene los procesos que el agente lanzó ni deshace acciones externas.
-5. **Cuándo extraer `workspaces`/`artifacts` a tablas propias:** cuando los pins/checkpoints en JSON vuelvan difícil la limpieza (el revisor sugiere que una 4ª tabla puede simplificar antes que las 5 completas).
+5. **Cuándo extraer `workspaces`/`artifacts` a tablas propias:** cuando los pins/checkpoints en JSON vuelvan difícil la limpieza (el revisor sugiere que una 4ª tabla puede simplificar antes que las 5 completas). **Estado tras Fase 0:** sigue abierto; el plan de Fase 1 evalúa si la segunda identidad de workspace por thread lo fuerza antes (ver §0).
 6. **Criterio de éxito del ensayo:** ✅ **Resuelto — dos pruebas, ambas obligatorias** (ver §9). Gate = (A) retención de revisión: comentar un cambio, el archivo vuelve a cambiar, borrar el worktree → Aeril muestra **el cambio original comentado**. (B) recuperación de crash: cerrar Aeril de golpe mientras guarda el snapshot → al reabrir, termina de recuperarlo o explica qué falta, sin reemplazarlo por el contenido actual.
 
 ---
@@ -133,8 +163,8 @@ v0.3 integró la primera revisión; v0.4 la segunda pasada. El revisor (Codex, 2
 
 ---
 
-## 10. Próximo paso concreto
+## 10. Próximo paso concreto (histórico v0.4 — **obsoleto**)
 
-Arrancar la **Fase 0** con el gate de §9 ya definido (no hay que rediseñarlo). Las piezas investigables en paralelo: `tui-term`/`vt100`, el adaptador ACP de Hermes, la capa de worktrees con `git2`, y el benchmark de arranque.
+> ~~Arrancar la **Fase 0** con el gate de §9 ya definido…~~ **Obsoleto:** la Fase 0 se arrancó, cerró, auditó e integró (ver §0; commit `41ab86c`). El próximo paso vigente es la **Fase 1** (plan en revisión): dos agentes concurrentes en workspaces verificados independientes, con estado durable y recuperación segura.
 
-*Constitución, plan y este handoff están en v0.4. Este handoff es la puerta de entrada; `MANIFIESTO.md` es la fuente de verdad de las invariantes.*
+*Este handoff es la puerta de entrada; `MANIFIESTO.md` es la fuente de verdad de las invariantes. Las secciones §1–§9 conservan el historial de decisiones v0.4 sin reescribirlo.*
