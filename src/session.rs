@@ -26,18 +26,32 @@ use std::sync::mpsc as std_mpsc;
 use tokio::sync::oneshot;
 
 /// Notas para la UI (la TUI relee del store; esto es para reaccionar).
+///
+/// S3: cada nota de ciclo de vida lleva la `invocation` que la originó. La TUI
+/// supervisa hasta 2 runs concurrentes; sin este identificador, una nota
+/// tardía de un run viejo podría limpiar el estado de una ejecución nueva.
 #[derive(Debug, Clone)]
 pub enum UiNote {
     Event {
         thread_id: String,
         kind: String,
     },
+    /// El run quedó registrado en el store para ESTA invocación (run_id
+    /// visible). NO es terminal: no libera slots.
+    RunStarted {
+        invocation: String,
+        thread_id: String,
+        run_id: String,
+    },
+    /// Nota TERMINAL de la invocación: ack que libera el slot de la TUI.
     RunDone {
+        invocation: String,
         thread_id: String,
         run_id: String,
         state: String,
     },
     Error {
+        invocation: String,
         thread_id: String,
         message: String,
     },
@@ -78,6 +92,8 @@ pub struct Runner {
     pub db_path: PathBuf,
     pub ui: Option<std_mpsc::Sender<UiNote>>,
     pub cancel: Option<oneshot::Receiver<()>>,
+    /// Identificador de invocación de la UI (S3). La CLI usa `""`.
+    pub invocation: String,
 }
 
 struct WorkTarget {
@@ -327,6 +343,15 @@ impl Runner {
             },
         )?;
 
+        // S3: el run durable existe para esta invocación. Es informativo (la
+        // TUI muestra el run_id); el ciclo de vida terminal sigue siendo la
+        // nota RunDone de más abajo.
+        self.note(UiNote::RunStarted {
+            invocation: self.invocation.clone(),
+            thread_id: thread_id.to_string(),
+            run_id: run.id.clone(),
+        });
+
         // Intención durable del feedback ANTES de lanzar el backend: si algo
         // falla después, el fallo es registrable y auditable.
         if let Some(ids) = &opts.feedback_comment_ids {
@@ -493,6 +518,7 @@ impl Runner {
         // Libera el lease explícitamente (además del Drop por early-returns).
         drop(lease_guard);
         self.note(UiNote::RunDone {
+            invocation: self.invocation.clone(),
             thread_id: thread_id.to_string(),
             run_id: run.id.clone(),
             state: final_state.clone(),

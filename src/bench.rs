@@ -424,6 +424,7 @@ pub fn scale(data_dir: &Path, runs: u64, delay_ms: u64) -> Result<ScaleReport> {
                 db_path: db,
                 ui: None,
                 cancel: None,
+                invocation: String::new(),
             };
             let opts = RunOptions {
                 backend: format!("mock:{}", script_path.display()),

@@ -308,6 +308,7 @@ fn cmd_run(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                 db_path: db_path.to_path_buf(),
                 ui: None,
                 cancel: cancel_rx,
+                invocation: String::new(),
             };
             let opts = RunOptions {
                 backend,
@@ -561,6 +562,7 @@ fn cmd_feedback(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                 db_path: db_path.to_path_buf(),
                 ui: None,
                 cancel: cancel_rx,
+                invocation: String::new(),
             };
             let opts = RunOptions {
                 backend,

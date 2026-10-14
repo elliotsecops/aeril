@@ -7,6 +7,8 @@
 //! helpers, por eso se permite dead_code localmente.
 #![allow(dead_code)]
 
+pub mod pty;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 

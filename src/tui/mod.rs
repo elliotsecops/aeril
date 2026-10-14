@@ -49,7 +49,32 @@ pub enum Mode {
         buf: String,
         snapshot_id: String,
     },
+    /// S3: captura del objetivo de un run nuevo en el thread abierto.
+    RunInput {
+        buf: String,
+    },
     Help,
+}
+
+/// S3: un run supervisado por esta TUI. El slot nace al lanzar y muere SOLO
+/// con la nota terminal de esa invocación (`RunDone`/`Error`): pedir
+/// cancelación no libera capacidad (el run puede seguir vivo hasta el ack).
+pub struct RunSlot {
+    pub invocation: String,
+    pub thread_id: String,
+    pub run_id: Option<String>,
+    pub cancel_requested: bool,
+    /// El envío consume el canal (oneshot): se guarda como `Option` para
+    /// poder dispararlo una sola vez.
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+/// Máximo de runs supervisados por instancia de TUI (límite de producto N=2
+/// de Fase 1; NO es un límite global del sistema operativo).
+pub const MAX_SUPERVISED_RUNS: usize = 2;
+
+fn is_hermes_backend(backend: &str) -> bool {
+    backend == "hermes" || backend.starts_with("hermes:")
 }
 
 pub struct App {
@@ -64,7 +89,7 @@ pub struct App {
     pub recovery_note: Option<String>,
     pub ui_rx: mpsc::Receiver<UiNote>,
     pub ui_tx: mpsc::Sender<UiNote>,
-    pub running: Option<(String, oneshot::Sender<()>)>,
+    pub runs: Vec<RunSlot>,
     pub backend: String,
     pub should_quit: bool,
     pub t0: Instant,
@@ -75,9 +100,67 @@ pub struct App {
 
 impl App {
     fn reload_threads(&mut self) -> Result<()> {
+        // S3: preservar la selección por IDENTIDAD. Con runs concurrentes el
+        // orden de la lista cambia (updated_ms) y un índice fijo apuntaría a
+        // otro thread al recargar.
+        let prev_sel_id = self
+            .detail
+            .as_ref()
+            .map(|d| d.thread_id.clone())
+            .or_else(|| self.threads.get(self.thread_sel).map(|t| t.id.clone()));
         self.threads = threads::list_projection(&self.store.conn, 200)?;
+        if let Some(id) = prev_sel_id
+            && let Some(idx) = self.threads.iter().position(|t| t.id == id)
+        {
+            self.thread_sel = idx;
+        }
         if self.thread_sel >= self.threads.len() {
             self.thread_sel = self.threads.len().saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    fn slot_index_by_invocation(&self, invocation: &str) -> Option<usize> {
+        self.runs.iter().position(|s| s.invocation == invocation)
+    }
+
+    fn slot_index_for_thread(&self, thread_id: &str) -> Option<usize> {
+        self.runs.iter().position(|s| s.thread_id == thread_id)
+    }
+
+    /// Thread "seleccionado": el abierto en detalle o el resaltado en la lista.
+    fn selected_thread_id(&self) -> Option<String> {
+        self.detail
+            .as_ref()
+            .map(|d| d.thread_id.clone())
+            .or_else(|| self.threads.get(self.thread_sel).map(|t| t.id.clone()))
+    }
+
+    /// Gate S3 de capacidad/ownership. Err trae el motivo visible al usuario.
+    /// - máximo 2 runs supervisados (activos o cancelando);
+    /// - máximo 1 por thread hasta el ack terminal;
+    /// - Hermes real: 1 por vez (sesiones ACP concurrentes aún no certificadas).
+    fn can_start(&self, thread_id: &str, backend: &str) -> std::result::Result<(), String> {
+        if let Some(slot) = self.runs.iter().find(|s| s.thread_id == thread_id) {
+            return Err(format!(
+                "el thread ya tiene un run {} (se libera con el ack terminal)",
+                if slot.cancel_requested {
+                    "cancelando"
+                } else {
+                    "activo"
+                }
+            ));
+        }
+        if self.runs.len() >= MAX_SUPERVISED_RUNS {
+            return Err(format!(
+                "capacidad máxima: {MAX_SUPERVISED_RUNS} runs supervisados a la vez"
+            ));
+        }
+        if is_hermes_backend(backend) && !self.runs.is_empty() {
+            return Err(
+                "Hermes real: un run por vez (sesiones ACP concurrentes sin certificar); usá mock para concurrencia"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -247,8 +330,8 @@ impl App {
             return Ok(());
         };
         let thread_id = detail.thread_id.clone();
-        if self.running.is_some() {
-            self.status = "ya hay un run en curso (x para cancelar)".into();
+        if let Err(reason) = self.can_start(&thread_id, &self.backend) {
+            self.status = format!("feedback no lanzado: {reason}");
             return Ok(());
         }
         let ids = review::open_comment_ids(&self.store, &thread_id)?;
@@ -322,18 +405,76 @@ impl App {
         Ok(())
     }
 
-    fn spawn_run(&mut self, thread_id: &str, opts: RunOptions, status: &str) {
+    fn start_run_prompt(&mut self) -> Result<()> {
+        if self.detail.is_none() {
+            self.status = "abrí un thread (Enter) para lanzar un run".into();
+            return Ok(());
+        }
+        self.mode = Mode::RunInput { buf: String::new() };
+        self.status = "nuevo run: escribí el objetivo · Enter lanza · Esc cancela".into();
+        Ok(())
+    }
+
+    fn submit_run(&mut self) -> Result<()> {
+        let Mode::RunInput { buf } = std::mem::replace(&mut self.mode, Mode::Normal) else {
+            return Ok(());
+        };
+        let goal = buf.trim().to_string();
+        if goal.is_empty() {
+            self.status = "objetivo vacío: run no lanzado".into();
+            return Ok(());
+        }
+        let Some(detail) = self.detail.as_ref() else {
+            self.status = "abrí un thread (Enter) para lanzar un run".into();
+            return Ok(());
+        };
+        let thread_id = detail.thread_id.clone();
+        // Gate revalidado al enviar (y otra vez al lanzar): el estado pudo
+        // cambiar mientras se escribía el objetivo.
+        if let Err(reason) = self.can_start(&thread_id, &self.backend) {
+            self.status = format!("no se lanzó: {reason}");
+            return Ok(());
+        }
+        self.spawn_run(
+            &thread_id,
+            RunOptions {
+                backend: self.backend.clone(),
+                goal: goal.clone(),
+                permissions: PermissionPolicySetting::Auto,
+                feedback_comment_ids: None,
+                resume_session: true,
+                model: None,
+            },
+            &format!(
+                "▶ run lanzado · {} · thread {}",
+                truncate_chars(&goal, 40),
+                &thread_id[..6.min(thread_id.len())]
+            ),
+        );
+        Ok(())
+    }
+
+    /// Lanza un run supervisado. El gate se valida ANTES de crear estado; el
+    /// slot queda ocupado hasta la nota terminal de ESTA invocación (S3).
+    fn spawn_run(&mut self, thread_id: &str, opts: RunOptions, status: &str) -> bool {
+        if let Err(reason) = self.can_start(thread_id, &opts.backend) {
+            self.status = format!("no se lanzó: {reason}");
+            return false;
+        }
+        let invocation = crate::ids::new_id();
         let db_path = self.db_path.clone();
         let data_dir = self.data_dir.clone();
         let tx = self.ui_tx.clone();
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let tid = thread_id.to_string();
         let tid2 = tid.clone();
+        let inv2 = invocation.clone();
         std::thread::spawn(move || {
             let mut store = match Store::open(&db_path) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = tx.send(UiNote::Error {
+                        invocation: inv2,
                         thread_id: tid2,
                         message: e.to_string(),
                     });
@@ -345,46 +486,96 @@ impl App {
                 db_path: db_path.clone(),
                 ui: Some(tx.clone()),
                 cancel: Some(cancel_rx),
+                invocation: inv2.clone(),
             };
-            if let Err(e) = runner.start(&mut store, &tid2, &opts) {
+            // Un panic del runner NO puede dejar el slot ocupado para siempre
+            // (bloquearía hasta la salida): se convierte en nota terminal y el
+            // run a medio camino queda para la reconciliación S0.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runner.start(&mut store, &tid2, &opts)
+            }));
+            let terminal_error = match outcome {
+                Ok(Ok(_)) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(_) => Some("el runner terminó con un panic (el run queda para S0)".to_string()),
+            };
+            if let Some(message) = terminal_error {
                 let _ = tx.send(UiNote::Error {
+                    invocation: inv2,
                     thread_id: tid2,
-                    message: e.to_string(),
-                });
-            } else {
-                let _ = tx.send(UiNote::RunDone {
-                    thread_id: tid2,
-                    run_id: String::new(),
-                    state: "done".into(),
+                    message,
                 });
             }
+            // La nota RunDone terminal la emite el propio Runner: no duplicar.
         });
-        self.running = Some((tid, cancel_tx));
+        self.runs.push(RunSlot {
+            invocation,
+            thread_id: tid,
+            run_id: None,
+            cancel_requested: false,
+            cancel: Some(cancel_tx),
+        });
         self.status = status.to_string();
+        true
     }
 
     fn on_note(&mut self, note: UiNote) {
-        match &note {
-            UiNote::RunDone { thread_id, .. } => {
-                if self.running.as_ref().map(|(t, _)| t) == Some(thread_id) {
-                    self.running = None;
+        match note {
+            UiNote::RunStarted {
+                invocation, run_id, ..
+            } => {
+                if let Some(slot) = self.runs.iter_mut().find(|s| s.invocation == invocation) {
+                    slot.run_id = Some(run_id);
+                }
+                let _ = self.reload_threads();
+                let _ = self.refresh_detail();
+            }
+            UiNote::RunDone {
+                invocation, state, ..
+            } => {
+                // Ack terminal: libera ÚNICAMENTE el slot de esta invocación.
+                // Una nota tardía de un run viejo no toca una ejecución nueva.
+                if let Some(idx) = self.slot_index_by_invocation(&invocation) {
+                    let slot = self.runs.remove(idx);
+                    self.status = if slot.cancel_requested {
+                        // Cancelación confirmada ≠ finalización normal.
+                        format!("cancelación confirmada: run {state}")
+                    } else {
+                        match state.as_str() {
+                            "completed" => "run completado".into(),
+                            "cancelled" => "run cancelado".into(),
+                            _ => format!("run terminó: {state}"),
+                        }
+                    };
                 }
                 let _ = self.reload_threads();
                 let _ = self.refresh_detail();
             }
             UiNote::Event { thread_id, .. } => {
+                // Solo refresca si el evento es del thread abierto: la
+                // navegación no redirige eventos de otros threads.
                 if self
                     .detail
                     .as_ref()
                     .map(|d| &d.thread_id)
-                    .is_some_and(|t| t == thread_id)
+                    .is_some_and(|t| t == &thread_id)
                 {
                     let _ = self.refresh_detail();
                 }
             }
-            UiNote::Error { message, .. } => {
-                self.running = None;
+            UiNote::Error {
+                invocation,
+                message,
+                ..
+            } => {
+                // Error terminal de la invocación (falló antes de existir un
+                // run, o panic del runner): libera ESE slot y se atribuye al
+                // thread de esa invocación.
+                if let Some(idx) = self.slot_index_by_invocation(&invocation) {
+                    self.runs.remove(idx);
+                }
                 self.status = format!("error: {message}");
+                let _ = self.reload_threads();
             }
         }
     }
@@ -415,11 +606,36 @@ impl App {
                 KeyCode::Char(c) => buf.push(c),
                 _ => {}
             },
+            Mode::RunInput { buf } => match key.code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                    self.status = "nuevo run cancelado".into();
+                }
+                KeyCode::Enter => self.submit_run()?,
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c) => buf.push(c),
+                _ => {}
+            },
             Mode::Help => {
                 self.mode = Mode::Normal;
             }
             Mode::Normal => match key.code {
-                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('q') => {
+                    if self.runs.is_empty() {
+                        self.should_quit = true;
+                    } else {
+                        // Salida segura (S3): no se abandona con runs vivos.
+                        let activos = self.runs.iter().filter(|s| !s.cancel_requested).count();
+                        self.status = format!(
+                            "salida bloqueada: {} run(s) supervisado(s) ({} activos, {} cancelando) — cancelá con x y esperá el ack terminal",
+                            self.runs.len(),
+                            activos,
+                            self.runs.len() - activos
+                        );
+                    }
+                }
                 KeyCode::Char('?') => self.mode = Mode::Help,
                 KeyCode::Char('r') => {
                     self.reload_threads()?;
@@ -461,12 +677,32 @@ impl App {
                     self.detail = None;
                 }
                 KeyCode::Char('c') => self.start_comment()?,
+                KeyCode::Char('n') => self.start_run_prompt()?,
                 KeyCode::Char('f') => self.send_feedback()?,
                 KeyCode::Char('i') => self.start_integrate()?,
                 KeyCode::Char('x') => {
-                    if let Some((_, cancel)) = self.running.take() {
-                        let _ = cancel.send(());
-                        self.status = "cancelación pedida al motor…".into();
+                    match self
+                        .selected_thread_id()
+                        .and_then(|tid| self.slot_index_for_thread(&tid))
+                    {
+                        Some(idx) => {
+                            let slot = &mut self.runs[idx];
+                            if slot.cancel_requested {
+                                self.status =
+                                    "el run ya está cancelando (slot ocupado hasta el ack)".into();
+                            } else if let Some(cancel) = slot.cancel.take() {
+                                // El envío consume el canal; si falla, el run
+                                // ya terminó (llegará/ llegó su nota terminal).
+                                let _ = cancel.send(());
+                                slot.cancel_requested = true;
+                                self.status =
+                                    "cancelación pedida: el slot sigue ocupado hasta el ack terminal"
+                                        .into();
+                            }
+                        }
+                        None => {
+                            self.status = "no hay run activo en el thread seleccionado".into();
+                        }
                     }
                 }
                 _ => {}
@@ -502,7 +738,7 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
         recovery_note,
         ui_rx,
         ui_tx,
-        running: None,
+        runs: Vec::new(),
         backend,
         should_quit: false,
         t0,
@@ -633,8 +869,10 @@ fn render(f: &mut Frame, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            " · Fase 0 · backend: {} · {}",
+            " · Fase 1 · backend: {} · runs {}/{} · {}",
             app.backend,
+            app.runs.len(),
+            MAX_SUPERVISED_RUNS,
             format_relative(crate::timeutil::now_ms())
         )),
     ])];
@@ -664,14 +902,19 @@ fn render(f: &mut Frame, app: &mut App) {
         Mode::BranchInput { .. } => footer_lines.push(Line::from(
             "INTEGRAR fast-forward: escribí la rama destino · Enter ejecuta · Esc cancela",
         )),
+        Mode::RunInput { .. } => footer_lines.push(Line::from(
+            "NUEVO RUN: escribí el objetivo en el thread abierto · Enter lanza · Esc cancela",
+        )),
         Mode::Help => footer_lines.push(Line::from(
-            "↑↓ navegar · Enter abrir thread · c comentar checkpoint · f enviar feedback · i integrar · x cancelar run · PgUp/PgDn scroll del patch · r refrescar · q salir",
+            "↑↓ navegar · Enter abrir thread · n nuevo run · c comentar checkpoint · f enviar feedback · i integrar · x cancelar run (solo el thread seleccionado) · PgUp/PgDn scroll del patch · r refrescar · q salir (bloqueado con runs vivos)",
         )),
         Mode::Normal => {
             let mut spans = vec![Span::styled("↑↓ ", Style::default().fg(Color::Green))];
             spans.push(Span::raw("navegar · "));
             spans.push(Span::styled("Enter ", Style::default().fg(Color::Green)));
             spans.push(Span::raw("abrir · "));
+            spans.push(Span::styled("n ", Style::default().fg(Color::Green)));
+            spans.push(Span::raw("nuevo run · "));
             spans.push(Span::styled("c ", Style::default().fg(Color::Green)));
             spans.push(Span::raw("comentar · "));
             spans.push(Span::styled("f ", Style::default().fg(Color::Green)));
@@ -703,11 +946,28 @@ fn render(f: &mut Frame, app: &mut App) {
                 Span::styled("▏", Style::default().fg(Color::Gray)),
             ]));
         }
+        Mode::RunInput { buf } => {
+            footer_lines.push(Line::from(vec![
+                Span::raw("objetivo> "),
+                Span::styled(buf.clone(), Style::default().fg(Color::White)),
+                Span::styled("▏", Style::default().fg(Color::Gray)),
+            ]));
+        }
         _ => {
-            let status = if app.running.is_some() {
-                format!("▶ run en curso… {} · (x cancela)", app.status)
-            } else {
+            let status = if app.runs.is_empty() {
                 app.status.clone()
+            } else {
+                let marca: String = app
+                    .runs
+                    .iter()
+                    .map(|s| if s.cancel_requested { '⏹' } else { '▶' })
+                    .collect();
+                format!(
+                    "{marca} runs {}/{} (x cancela el thread seleccionado) · {}",
+                    app.runs.len(),
+                    MAX_SUPERVISED_RUNS,
+                    app.status
+                )
             };
             footer_lines.push(Line::from(Span::styled(
                 status,
@@ -753,7 +1013,7 @@ fn render_main(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             Line::from("  Abrí un thread con Enter para ver su timeline y checkpoints."),
             Line::from(""),
             Line::from(
-                "  Flujo Fase 0:  editar → 📌 checkpoint → 🚩 comentar → f feedback → i integrar"
+                "  Flujo:  n run nuevo → editar → 📌 checkpoint → 🚩 comentar → f feedback → i integrar"
                     .to_string(),
             ),
         ];
