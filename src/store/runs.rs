@@ -83,6 +83,7 @@ pub fn start(conn: &mut Connection, spec: &StartRunSpec<'_>) -> Result<RunRow> {
             now
         ],
     )?;
+    let supervisor_pid = std::process::id() as i64;
     let payload = payload::RunStarted {
         backend: spec.backend.to_string(),
         goal: spec.goal.to_string(),
@@ -92,6 +93,8 @@ pub fn start(conn: &mut Connection, spec: &StartRunSpec<'_>) -> Result<RunRow> {
         branch: spec.branch.to_string(),
         base_oid: spec.base_oid.to_string(),
         resumed_session: spec.resumed_session.map(str::to_string),
+        supervisor_pid: Some(supervisor_pid),
+        supervisor_pid_start: crate::store::leases::process_start_time(supervisor_pid),
     };
     events::append_tx(
         &tx,

@@ -840,6 +840,11 @@ impl AcpClient {
         }
     }
 
+    /// PID del proceso del backend (evidencia para la reconciliación S0).
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Bytes actualmente en vuelo (reservados en la cola cruda).
     pub fn inflight_bytes(&self) -> usize {
         self.budget

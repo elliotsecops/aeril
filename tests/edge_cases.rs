@@ -33,7 +33,17 @@ fn ref_conflictiva_detiene_y_nunca_sobrescribe() {
     env.update_ref(&format!("refs/aeril/checkpoints/{sid}"), &other);
 
     let rec = env.aeril_ok(&["recover"]);
-    assert_eq!(rec.as_array().unwrap()[0]["action"], "ref_conflict");
+    // S0: la salida también incluye la reconciliación del run (supervisor
+    // muerto por el crash inyectado); se busca el hecho del checkpoint.
+    assert_eq!(
+        rec.as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"] == "ref_conflict")
+            .count(),
+        1,
+        "{rec}"
+    );
 
     // La ref NO se sobrescribió y el checkpoint queda failed terminal.
     assert_eq!(
@@ -87,9 +97,14 @@ fn objetos_faltantes_se_reportan_sin_fabricar_exito() {
     std::fs::remove_file(&obj).unwrap();
 
     let rec = env.aeril_ok(&["recover"]);
-    assert_eq!(rec.as_array().unwrap()[0]["action"], "objects_missing");
+    let missing = rec
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "objects_missing")
+        .expect("reporte de objetos faltantes");
     assert!(
-        rec[0]["detail"]
+        missing["detail"]
             .as_str()
             .unwrap()
             .contains("no se reconstruye desde el working tree"),

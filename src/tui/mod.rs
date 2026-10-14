@@ -480,9 +480,11 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
     let mut store = Store::open(&db_path)?;
 
     // Recuperación al abrir: reconciliar checkpoints interrumpidos.
+    // S0: runs interrumpidos (supervisores muertos) antes que los checkpoints.
+    let run_outcomes = crate::recovery::reconcile_interrupted_runs(&mut store)?;
     let outcomes =
         checkpoint::recover_pending(&mut store, &|path: &str| git::open(Path::new(path)).ok())?;
-    let recovery_note = summarize_recovery(&outcomes);
+    let recovery_note = summarize_recovery(&run_outcomes, &outcomes);
     // Reconciliación de integraciones interrumpidas (B4).
     let _ = session::reconcile_integrations(&mut store)?;
 
@@ -545,9 +547,22 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
     Ok(())
 }
 
-fn summarize_recovery(outcomes: &[checkpoint::RecoveryOutcome]) -> Option<String> {
-    if outcomes.is_empty() {
+fn summarize_recovery(
+    run_outcomes: &[crate::recovery::RunRecovery],
+    outcomes: &[checkpoint::RecoveryOutcome],
+) -> Option<String> {
+    if run_outcomes.is_empty() && outcomes.is_empty() {
         return None;
+    }
+    let mut interrupted = 0usize;
+    let mut unsafe_runs = 0usize;
+    for r in run_outcomes {
+        if let crate::recovery::RunOutcome::Interrupted { unsafe_state, .. } = &r.outcome {
+            interrupted += 1;
+            if *unsafe_state {
+                unsafe_runs += 1;
+            }
+        }
     }
     let mut completed = 0;
     let mut problems = Vec::new();
@@ -572,10 +587,23 @@ fn summarize_recovery(outcomes: &[checkpoint::RecoveryOutcome]) -> Option<String
         }
     }
     let mut s = String::new();
-    if completed > 0 {
+    if interrupted > 0 {
         s.push_str(&format!(
-            "recuperación: {completed} checkpoint(s) completados"
+            "recuperación: {interrupted} run(s) interrumpidos reconciliados{}",
+            if unsafe_runs > 0 {
+                format!(
+                    " ({unsafe_runs} con backend no verificado: workspace bloqueado para reuso)"
+                )
+            } else {
+                String::new()
+            }
         ));
+    }
+    if completed > 0 {
+        if !s.is_empty() {
+            s.push_str(" · ");
+        }
+        s.push_str(&format!("{completed} checkpoint(s) completados"));
     }
     if !problems.is_empty() {
         if !s.is_empty() {

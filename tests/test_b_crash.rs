@@ -53,8 +53,22 @@ fn crash_en_cada_frontera_se_recupera_o_reporta() {
                 // La caída fue antes de persistir la intención: no hay nada
                 // que recuperar, y los objetos huérfanos no bloquean nada.
                 assert!(list.is_empty(), "sin prepared todavía: {list:?}");
+                // S0: el run cuyo supervisor murió se reconcilia (failed/
+                // interrumpido) de forma durable; el checkpoint sigue sin
+                // existir (nada preparado que recuperar).
                 let rec = env.aeril_ok(&["recover"]);
-                assert_eq!(rec.as_array().unwrap().len(), 0);
+                let arr = rec.as_array().unwrap();
+                assert!(
+                    !arr.iter().any(|e| e["action"] == "completed_ready"),
+                    "nada que recuperar: {rec}"
+                );
+                assert_eq!(
+                    arr.iter()
+                        .filter(|e| e["action"] == "run_interrupted")
+                        .count(),
+                    1,
+                    "el run interrumpido se reconcilia: {rec}"
+                );
                 let post = env.script(
                     "post",
                     mock_edit("NOTES.md", "# Notas v2\n\nrun posterior\n", "post"),
@@ -98,12 +112,30 @@ fn crash_en_cada_frontera_se_recupera_o_reporta() {
 
                 let rec = env.aeril_ok(&["recover"]);
                 let arr = rec.as_array().unwrap();
-                assert_eq!(arr.len(), 1, "un pendiente: {rec}");
-                assert_eq!(arr[0]["action"], "completed_ready");
+                // S0: coexisten la reconciliación del run (supervisor muerto)
+                // y la recuperación del checkpoint (protocolo Phase 0).
                 assert_eq!(
-                    arr[0]["ref_recreated"],
+                    arr.iter()
+                        .filter(|e| e["action"] == "completed_ready")
+                        .count(),
+                    1,
+                    "un checkpoint pendiente recuperado: {rec}"
+                );
+                let completed = arr
+                    .iter()
+                    .find(|e| e["action"] == "completed_ready")
+                    .unwrap();
+                assert_eq!(
+                    completed["ref_recreated"],
                     point == "prepared",
                     "la ref se re-crea solo cuando aún no existía"
+                );
+                assert_eq!(
+                    arr.iter()
+                        .filter(|e| e["action"] == "run_interrupted")
+                        .count(),
+                    1,
+                    "el run interrumpido se reconcilia: {rec}"
                 );
 
                 // ready con recovered=true y el contenido de los OBJETOS.
@@ -135,7 +167,7 @@ fn crash_en_cada_frontera_se_recupera_o_reporta() {
 
                 // Idempotencia: repetir la recuperación no duplica ni cambia.
                 let rec2 = env.aeril_ok(&["recover"]);
-                assert_eq!(rec2.as_array().unwrap().len(), 0);
+                assert_eq!(rec2.as_array().unwrap().len(), 0, "nada pendiente: {rec2}");
                 let list3 = env.checkpoint_list(&thread);
                 assert_eq!(list3.iter().filter(|c| c["state"] == "ready").count(), 1);
 
@@ -205,7 +237,15 @@ fn crash_externo_con_sigkill_desde_afuera() {
     assert_eq!(signal_of(&status), Some(9), "terminación abrupta externa");
 
     let rec = env.aeril_ok(&["recover"]);
-    assert_eq!(rec.as_array().unwrap()[0]["action"], "completed_ready");
+    let arr = rec.as_array().unwrap();
+    assert!(
+        arr.iter().any(|e| e["action"] == "completed_ready"),
+        "checkpoint recuperado: {rec}"
+    );
+    assert!(
+        arr.iter().any(|e| e["action"] == "run_interrupted"),
+        "run del supervisor muerto reconciliado: {rec}"
+    );
     let list = env.checkpoint_list(&thread);
     assert_eq!(list[0]["state"], "ready");
     assert_eq!(list[0]["recovered"], true);

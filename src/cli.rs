@@ -238,7 +238,9 @@ fn cmd_run(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                 }
             };
             let mut store = open_store(db_path)?;
-            // Reconciliar checkpoints interrumpidos antes de arrancar un run.
+            // S0: reconciliar runs interrumpidos (supervisores muertos) y
+            // checkpoints pendientes antes de arrancar un run nuevo.
+            crate::recovery::reconcile_interrupted_runs(&mut store)?;
             checkpoint::recover_pending(&mut store, &|path: &str| git::open(Path::new(path)).ok())?;
             // Cancelación programada (para pruebas E2E y demos): pide
             // `session/cancel` al motor tras N ms de iniciado el run.
@@ -480,6 +482,7 @@ fn cmd_feedback(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                 .or_else(|| std::env::var("AERIL_BACKEND").ok())
                 .unwrap_or_else(|| "hermes".into());
             let mut store = open_store(db_path)?;
+            crate::recovery::reconcile_interrupted_runs(&mut store)?;
             checkpoint::recover_pending(&mut store, &|path: &str| git::open(Path::new(path)).ok())?;
             let ids: Vec<String> = match p.flag("comments") {
                 Some(csv) => csv
@@ -565,11 +568,48 @@ fn cmd_lease(p: &Parsed, db_path: &Path) -> Result<i32> {
 
 fn cmd_recover(_p: &Parsed, db_path: &Path) -> Result<i32> {
     let mut store = open_store(db_path)?;
+    // S0: runs interrumpidos (supervisor muerto) primero.
+    let run_outcomes = crate::recovery::reconcile_interrupted_runs(&mut store)?;
     let outcomes =
         checkpoint::recover_pending(&mut store, &|path: &str| git::open(Path::new(path)).ok())?;
     // Reconciliación de integraciones interrumpidas (B4): nunca mueve refs,
     // solo registra lo que la ref demuestra.
     let integrations = session::reconcile_integrations(&mut store)?;
+    let mut run_arr: Vec<Value> = run_outcomes
+        .iter()
+        .map(|r| match &r.outcome {
+            crate::recovery::RunOutcome::Interrupted {
+                supervisor,
+                backend,
+                unsafe_state,
+            } => json!({
+                "action": "run_interrupted",
+                "run_id": r.run_id,
+                "thread_id": r.thread_id,
+                "workspace_id": r.workspace_id,
+                "supervisor": supervisor,
+                "backend": backend,
+                "unsafe_state": unsafe_state,
+            }),
+            crate::recovery::RunOutcome::SupervisorAlive { supervisor } => json!({
+                "action": "run_supervisor_alive",
+                "run_id": r.run_id,
+                "thread_id": r.thread_id,
+                "supervisor": supervisor,
+            }),
+            crate::recovery::RunOutcome::SupervisorUnknown => json!({
+                "action": "run_supervisor_unknown",
+                "run_id": r.run_id,
+                "thread_id": r.thread_id,
+                "detail": "sin evidencia de supervisor; no se reconcilia (conservador)",
+            }),
+            crate::recovery::RunOutcome::AlreadyResolved => json!({
+                "action": "run_already_resolved",
+                "run_id": r.run_id,
+                "thread_id": r.thread_id,
+            }),
+        })
+        .collect();
     let arr: Vec<Value> = outcomes
         .iter()
         .map(|o| match o {
@@ -594,7 +634,8 @@ fn cmd_recover(_p: &Parsed, db_path: &Path) -> Result<i32> {
             }
         })
         .collect();
-    let mut arr = arr;
+    run_arr.extend(arr);
+    let mut arr = run_arr;
     for i in integrations {
         arr.push(match i {
             session::IntegrationReconcile::CompletedRecovered {

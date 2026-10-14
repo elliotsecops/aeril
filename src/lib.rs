@@ -13,6 +13,7 @@ pub mod error;
 pub mod export;
 pub mod git;
 pub mod ids;
+pub mod recovery;
 pub mod review;
 pub mod session;
 pub mod store;

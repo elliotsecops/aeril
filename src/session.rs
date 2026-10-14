@@ -115,7 +115,7 @@ impl Runner {
         } else {
             git::head_oid(&repo)?
         };
-        let candidate_ws: Option<String> = if feedback {
+        let raw_candidate: Option<String> = if feedback {
             latest.as_ref().and_then(|r| r.workspace_id.clone())
         } else {
             match latest.as_ref() {
@@ -124,6 +124,18 @@ impl Runner {
                 }
                 _ => None,
             }
+        };
+        // S0 — gate de reuso: nunca reutilizar un workspace que un backend
+        // ajeno podría seguir modificando (o sin evidencia de terminación).
+        let candidate_ws: Option<String> = match raw_candidate {
+            Some(ws) => match crate::recovery::workspace_reuse_verdict(&store.conn, &ws)? {
+                crate::recovery::ReuseVerdict::Safe => Some(ws),
+                crate::recovery::ReuseVerdict::Blocked(reason) => {
+                    crate::recovery::note_reuse_blocked(store, &ws, &reason)?;
+                    None
+                }
+            },
+            None => None,
         };
 
         // ── lease del workspace existente ANTES de verificarlo o tocarlo ────
@@ -523,6 +535,34 @@ impl Runner {
                 };
             }
         };
+        // S0: evidencia durable del backend (pid + starttime) para que la
+        // reconciliación pueda verificar terminación tras la muerte del
+        // supervisor. Sin esta evidencia, el workspace no se reutiliza.
+        if let Some(pid) = client.child_pid() {
+            let ev = payload::BackendSpawned {
+                run_id: run.id.clone(),
+                pid: pid as i64,
+                pid_start: crate::store::leases::process_start_time(pid as i64).unwrap_or(0),
+                program: spec.program.clone(),
+            };
+            if let Err(e) = events::append_typed(
+                &mut store.conn,
+                &run.thread_id,
+                Some(&run.id),
+                events::K_BACKEND_SPAWNED,
+                "system",
+                &ev,
+            ) {
+                let _ = client.kill().await;
+                return TurnResult {
+                    stop_reason: None,
+                    detail: Some(format!(
+                        "no se pudo registrar la evidencia del backend: {e}"
+                    )),
+                    feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                };
+            }
+        }
         if let Err(e) = client.initialize("aeril", env!("CARGO_PKG_VERSION")).await {
             let _ = client.kill().await;
             return TurnResult {

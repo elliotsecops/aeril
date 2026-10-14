@@ -35,6 +35,14 @@ pub const K_FEEDBACK_FAILED: &str = "feedback.failed";
 pub const K_WORKSPACE_RECREATED: &str = "workspace.recreated";
 pub const K_WORKSPACE_LEASE_TAKEN_OVER: &str = "workspace.lease_taken_over";
 pub const K_WORKSPACE_LEASE_LOST: &str = "workspace.lease_lost";
+/// Evidencia durable del backend lanzado por un run (S0): permite verificar
+/// terminación en la reconciliación por PID + starttime.
+pub const K_BACKEND_SPAWNED: &str = "backend.spawned";
+/// Estado de recuperación desconocido/inseguro: un backend pudo sobrevivir al
+/// supervisor; el workspace no se reutiliza automáticamente.
+pub const K_WORKSPACE_RECOVERY_UNSAFE: &str = "workspace.recovery_unsafe";
+/// El gate de reuso bloqueó un workspace y se creó uno nuevo (auditoría).
+pub const K_WORKSPACE_REUSE_BLOCKED: &str = "workspace.reuse_blocked";
 pub const K_INTEGRATION_REQUESTED: &str = "integration.requested";
 pub const K_INTEGRATION_COMPLETED: &str = "integration.completed";
 pub const K_INTEGRATION_BLOCKED: &str = "integration.blocked";
@@ -62,6 +70,39 @@ pub mod payload {
         pub base_oid: String,
         #[serde(default)]
         pub resumed_session: Option<String>,
+        /// Evidencia del SUPERVISOR (proceso de Aeril que lanza el run):
+        /// permite decidir en la reconciliación si un run stale sigue vivo.
+        #[serde(default)]
+        pub supervisor_pid: Option<i64>,
+        #[serde(default)]
+        pub supervisor_pid_start: Option<u64>,
+    }
+
+    /// Backend lanzado por un run (S0): pid + starttime para verificar
+    /// terminación durante la reconciliación de runs interrumpidos.
+    #[derive(Debug, Serialize, Deserialize, Default)]
+    pub struct BackendSpawned {
+        pub run_id: String,
+        pub pid: i64,
+        pub pid_start: u64,
+        pub program: String,
+    }
+
+    /// El backend pudo haber sobrevivido al supervisor: estado de recuperación
+    /// inseguro/desconocido; el workspace queda bloqueado para reuso automático.
+    #[derive(Debug, Serialize, Deserialize, Default)]
+    pub struct WorkspaceRecoveryUnsafe {
+        pub workspace_id: String,
+        pub run_id: String,
+        pub backend_state: String,
+        pub detail: String,
+    }
+
+    /// Un intento de reuso fue bloqueado por el gate (se creó workspace nuevo).
+    #[derive(Debug, Serialize, Deserialize, Default)]
+    pub struct WorkspaceReuseBlocked {
+        pub workspace_id: String,
+        pub reason: String,
     }
 
     #[derive(Debug, Serialize, Deserialize, Default)]
