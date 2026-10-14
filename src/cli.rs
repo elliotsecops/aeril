@@ -122,6 +122,10 @@ fn dispatch(args: &[String], t0: Instant) -> Result<i32> {
         .flag("data-dir")
         .map(PathBuf::from)
         .unwrap_or_else(default_data_dir);
+    // Los procesos hijos (agentes) corren con cwd del worktree: todas las
+    // rutas que Aeril les pasa deben ser ABSOLUTAS.
+    let _ = std::fs::create_dir_all(&data_dir);
+    let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
     let db_path = data_dir.join("aeril.db");
 
     match p.pos.first().map(String::as_str) {

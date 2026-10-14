@@ -176,6 +176,7 @@ def main():
     args = ap.parse_args()
 
     samples = []
+    mem_run_ms = None
     rss_idle_kb = None
     rss_thread_kb = None
     failures = []
@@ -183,7 +184,12 @@ def main():
     for i in range(runs):
         res, _pid = sample(args.bin, args.data_dir, args.timeout, args.mem and i == 0)
         if res.get("ok"):
-            samples.append(res["external_ms"])
+            if args.mem and i == 0:
+                # En modo RSS la muestra incluye la espera deliberada de 5 s:
+                # se reporta como dato, pero NO evalúa el presupuesto de arranque.
+                mem_run_ms = res["external_ms"]
+            else:
+                samples.append(res["external_ms"])
             if "rss_idle_kb" in res:
                 rss_idle_kb = res["rss_idle_kb"]
             if "rss_thread_kb" in res:
@@ -208,6 +214,7 @@ def main():
         "n_fail": len(failures),
         "failures": failures[:5],
         "samples_ms": [round(s, 2) for s in samples_sorted],
+        "mem_run_ms_informativo": round(mem_run_ms, 2) if mem_run_ms else None,
         "p50_ms": round(statistics.median(samples_sorted), 2) if samples else None,
         "p95_ms": round(percentile(samples_sorted, 95), 2) if samples else None,
         "max_ms": round(max(samples_sorted), 2) if samples else None,
@@ -223,7 +230,11 @@ def main():
     }
 
     ok = True
-    if samples and report["p95_ms"] <= args.max_ms and len(failures) == 0:
+    if args.mem:
+        report["startup_verdict"] = "N/A (modo RSS: mide idle vs thread abierto)"
+        if failures:
+            ok = False
+    elif samples and report["p95_ms"] <= args.max_ms and len(failures) == 0:
         report["startup_verdict"] = "PASS"
     else:
         ok = False

@@ -2,6 +2,9 @@
 
 > Rama: `feat/phase0-vertical-slice` · Base: `main` (v0.4) ·
 > Gate definido en `HANDOFF.md` §9 · Fecha: 2026-10-13
+>
+> **RC1 (reliability hardening):** ver `docs/phase0-remediation-matrix.md`
+> (rama `fix/phase0-reliability-rc1`, commits `4e81f7d` y `dfd9416`).
 
 Leyenda:
 **V** = implementado y verificado con test automatizado ·
@@ -15,22 +18,31 @@ Leyenda:
 | Pieza | Estado | Evidencia |
 |---|---|---|
 | Store SQLite (3 tablas, `UNIQUE(thread_id,seq)`, FKs, payloads versionados) | **V** | `store::tests`, `tests/*` (reinicio = proceso nuevo) |
-| Workspace verificado (worktree + base OID + `workspace_id` estable) | **V** | `test_a_*`, `edge_cases::validacion_*` |
+| Workspace verificado (worktree + base OID + `workspace_id` estable) | **V** | `test_a_*`, `wave_a::a6_*` |
+| **Lease de workspace entre procesos de Aeril** (B5) | **V** | `wave_b::b5_*` (run concurrente bloqueado, rm bloqueado, takeover pid/ttl) |
 | Snapshot inmutable del working tree real (sin índice/rama del humano) | **V** | `test_a_*` (OIDs comparados, no texto) |
+| Snapshot: gitlinks/submódulos rechazados explícitamente (A5) | **V** | `wave_a::a5_*` |
+| Límites de patch/archivos con rechazo explícito (B2) | **V** | `wave_b::b2_patch_*` |
 | Protocolo `prepared → ref (CAS por OID) → verify → ready` | **V** | `test_b_crash::crash_en_cada_frontera` |
+| Publicación de refs idempotente ante carreras del mismo OID (B3) | **V** | `wave_b::b3_creacion_*` |
 | Ref divergente: no se sobrescribe, queda `failed` terminal | **V** | `edge_cases::ref_conflictiva_*` |
 | Objetos faltantes: se reporta, jamás se fabrica `ready` | **V** | `edge_cases::objetos_faltantes_*` |
-| Recuperación al reabrir, idempotente, sin tocar el working tree actual | **V** | `test_b_crash` (se ensucia el árbol antes de recuperar) |
+| Recuperación al reabrir, idempotente, sin tocar el working tree actual | **V** | `test_b_crash`; recuperación concurrente: `wave_b::b3_recuperacion_*` |
 | Caída abrupta externa real (SIGKILL desde afuera) | **V** | `test_b_crash::crash_externo_*` |
-| Comentario anclado (snapshot/path/lado/rango/blobs/context hash), solo tras `ready` | **V** | `test_a_*`, `test_b_crash` (comentar antes de ready falla) |
+| Comentario anclado (snapshot/path/lado/rango/blobs/context hash), solo tras `ready` | **V** | `test_a_*`, `test_b_crash` |
 | Patch original reabrible tras nuevas ediciones y borrado del worktree | **V** | `test_a_retencion_de_la_revision_comentada` |
-| Comentario resuelto NO desprotege el snapshot | **V** | `agent_flow::feedback_entregado_*` |
+| Comentarios paginados con resúmenes livianos (B2) | **V** | `wave_b::b2_comentarios_paginados_*` |
 | Adaptador ACP (ndjson/stdio, permisos por `optionId`, cancelación, sesión durable) | **V** | `agent_flow::*`, `edge_cases::cancelacion_*` |
+| Entrada ACP acotada: línea/turno/stderr (B1) | **V** | `wave_b::b1_*` |
+| Cancelación con plazo fijo e cumplimiento no cooperativo (B6) | **V** | `wave_b::b6_*` |
+| Permisos fail-closed con auditoría durable y transmisión separada (A2) | **V** | `wave_a::a2_*` |
+| Resume real de sesión ACP con intento/aceptación registrados (A3) | **V** | `wave_a::a3_*` |
 | Hermes real (edición → checkpoint → comentario → feedback → checkpoint) | **v** | demo manual 2026-10-13 (ver handoff §Hermes) |
-| Feedback con entrega durable (`sent` → `delivered`), fallo explícito sin ack | **V** | `agent_flow::feedback_*` |
-| Validación ligada al OID exacto del snapshot (rechaza workspace desincronizado) | **V** | `edge_cases::validacion_*` |
-| Integración fast-forward a rama explícita; stale/divergente/ocupado bloquean | **V** | `edge_cases::integracion_*` |
-| TUI mínima (threads, timeline, patch, comentar, feedback, integrar, cancelar) | **v** | uso manual + harness de arranque (pty) |
+| Feedback con entrega durable basada en evidencia del turno (A4) | **V** | `wave_a::a4_*`, `agent_flow::feedback_*` |
+| Validación ligada al OID exacto en checkout aislado (A6/B7) | **V** | `wave_a::a6_*`, `wave_a::b7_*` |
+| Integración FF con CAS atómico y rechazo de stale/divergente/ocupado (A1) | **V** | `wave_a::a1_*`, `edge_cases::integracion_*` |
+| Integración: intención durable + reconciliación tras crash (B4) | **V** | `wave_b::b4_*` |
+| TUI mínima (threads, timeline, patch, comentar, feedback, integrar, cancelar) | **v** | uso manual + harness de arranque (pty, abre thread) |
 | Export a texto plano (`jsonl`, `md`) | **V** | usado en todos los tests |
 | Recolector de refs: SOLO listar candidatos | **F** | decidido: en el ensayo no se libera nada (MANIFIESTO §5) |
 | Remapeo de comentarios a snapshots nuevos | **F** | operación separada, posterior (no silenciosa) |
@@ -38,25 +50,22 @@ Leyenda:
 | PTY / emulador `vt100` / paneles divididos | **F** | el multiplexor es Fase 1; Fase 0 mide el corte vertical |
 | `session/fork`, `session/resume` silencioso, multi-sesión | **F** | no usados por el flujo v0 |
 
-## Presupuestos
+## Presupuestos (RC1, 2026-10-13)
 
-Medición: 2026-10-13, ThinkPad X1 Carbon 6th (i7-8550U, 15.4 GiB, NVMe
-`/dev/nvme0n1p5`), build release (`lto=thin`, `strip=symbols`,
-`codegen-units=1`), dataset sintético completo (100 threads, 100.000 eventos,
-10 diffs por thread, DB de 84.1 MB), page cache **warm** del host (declarado;
-no se vació la caché del SO).
+Método y condiciones declarados en `docs/phase0-engineering-handoff.md`
+§Mediciones RC1 (NVMe ext4, caché warm, release LTO, dataset 100×1000×10 con
+comentarios). `make budget` exit 0.
 
 | Métrica | Límite | Medido | Estado |
 |---|---|---|---|
-| Binario release stripped | ≤ 30 MB (decimal) | **5.2 MB** | ✅ PASS |
-| RSS idle TUI (5 s, dataset completo) | ≤ 50 MB | **6.1 MB** | ✅ PASS |
-| Arranque p95 (entrada procesada, externo, n=30) | ≤ 300 ms | **16.9 ms** (p50 13.7, max 17.0) | ✅ PASS |
-| Dependencias de runtime | solo ABI del OS | linux-vdso, libc, libm, libgcc_s, ld-linux + **libz del sistema** (declarada) | ✅ PASS |
-| Caché residente por thread | ≤ 10 MiB | no medido como métrica aislada: la vista carga ≤100 eventos y el RSS total idle es 6.1 MB | ⚠️ **N** |
-| 5 agentes ≤ 500 MB | — | **UNVERIFIED**: Fase 0 mide 1 agente; sin claim | **N** |
-
-Reproducible con `make budget` (ver `bench-data/*.json` y
-`docs/phase0-engineering-handoff.md` §Mediciones).
+| Binario release stripped | ≤ 30 MB (decimal) | **5.4 MB** | ✅ PASS |
+| RSS idle TUI (5 s) | ≤ 50 MB | **6.4 MB** | ✅ PASS |
+| Caché residente por thread (idle → thread abierto) | ≤ 10 MiB | **0.8 MiB** | ✅ PASS |
+| Arranque p95 (entrada que ABRE un thread, externo, n=30) | ≤ 300 ms | **25.2 ms**, 30/30 ok | ✅ PASS |
+| Dependencias de runtime | solo ABI del OS | OS + libz del sistema (declarada) | ✅ PASS |
+| 5 runs concurrentes: **app** | ≤ 500 MB | **9.7 MB** (agentes mock) | ✅ PASS |
+| 5 runs concurrentes: agentes + total | medido aparte | **21.4 MB / 31.1 MB** | informativo |
+| 5 agentes HERMES reales | — | **no medible en v0** (perfil compartido) | ⚠️ declarado |
 
 ## Decisiones registradas (desviaciones o ajustes de Fase 0)
 

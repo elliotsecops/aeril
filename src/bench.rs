@@ -327,24 +327,29 @@ fn read_rss_kb(pid: i64) -> u64 {
     0
 }
 
-/// Suma RSS de los hijos directos del proceso (los agentes mock).
+/// Suma RSS de los hijos directos del proceso (los agentes mock), escaneando
+/// /proc/<pid>/stat por PPID (portable: no depende de CONFIG_PROC_CHILDREN).
 fn children_rss_kb() -> u64 {
-    let mut seen = std::collections::HashSet::new();
+    let me = std::process::id() as i64;
     let mut total = 0u64;
-    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
         return 0;
     };
-    for task in tasks.flatten() {
-        let path = task.path().join("children");
-        let Ok(children) = std::fs::read_to_string(path) else {
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i64>() else {
             continue;
         };
-        for pid_str in children.split_whitespace() {
-            if let Ok(pid) = pid_str.parse::<i64>()
-                && seen.insert(pid)
-            {
-                total += read_rss_kb(pid);
-            }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // "pid (comm) state ppid ..." — comm puede tener espacios: usar el
+        // último ')' como ancla.
+        let Some(after_comm) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = after_comm.1.split_whitespace().collect();
+        if fields.len() >= 2 && fields[1].parse::<i64>().ok() == Some(me) {
+            total += read_rss_kb(pid);
         }
     }
     total
@@ -428,7 +433,14 @@ pub fn scale(data_dir: &Path, runs: u64, delay_ms: u64) -> Result<ScaleReport> {
                 resume_session: false,
                 model: None,
             };
-            runner.start(&mut store, &tid, &opts).map(|_| ())
+            match runner.start(&mut store, &tid, &opts) {
+                Ok(summary) if summary.state == "completed" => Ok(()),
+                Ok(summary) => Err(crate::error::Error::Other(format!(
+                    "run de escala no completado: {} ({:?})",
+                    summary.state, summary.detail
+                ))),
+                Err(e) => Err(e),
+            }
         }));
         // Escalonado: crea workspaces sin pelear por locks internos de git.
         std::thread::sleep(std::time::Duration::from_millis(300));

@@ -11,7 +11,7 @@
 ```bash
 # Compilar y testear (usa 2 jobs por la RAM de la laptop)
 make build          # release
-make test           # 17 tests: unitarios + gate A/B + casos borde
+make test           # 44 tests: unitarios + gates A/B + bordes + regresión RC1
 make clippy         # -D warnings, limpio
 
 # Gate (los dos ya corren en make test, acá a mano):
@@ -112,26 +112,40 @@ make budget-scale   # reporta UNVERIFIED (sin claim de 5 agentes en Fase 0)
   limitación técnica).
 - `budget-scale` (5 agentes) sin verificación en Fase 0: no hay claim.
 
-## Mediciones (make budget, 2026-10-13)
+## Mediciones RC1 (make budget, 2026-10-13, tras la auditoría)
 
-**Declaración del benchmark:**
-- OS/arch: Linux x86_64 · CPU: Intel i7-8550U · RAM: 15.4 GiB · Disco: NVMe (`/dev/nvme0n1p5`).
-- Dataset: fixtures sintéticas 100 threads × 1.000 eventos × 10 diffs (100.000 eventos, DB 84.1 MB, seed 13.2 s).
+**Declaración del benchmark (RC1 §4):**
+- OS/arch: Linux x86_64 · CPU: Intel i7-8550U · RAM: 15.4 GiB · Disco: NVMe `/dev/nvme0n1p5` (fstype **ext4**, reportado por el harness).
+- Dataset: fixtures 100 threads × 1.000 eventos × 10 diffs **+ 10 comentarios por thread** (336.9 MB, seed 19.8 s).
 - Build: release (`lto=thin`, `strip=symbols`, `codegen-units=1`).
-- Condición de caché: **warm** (page cache del host; no se vació la caché del SO — requeriría autorización explícita y no se hizo).
-- Método: spawn externo en pty + beacons internos; el tiempo se toma desde el proceso medidor hasta procesar la primera tecla (definición "UI utilizable" de la v0.4). n=30.
+- Condición de caché: **warm** declarada (no se vació la caché del SO).
+- Endpoint de arranque: el proceso externo mide hasta que la entrada (Enter)
+  **abre un thread real** (timeline + últimos 100 eventos + resúmenes de
+  comentarios). Un fallo cualquiera ⇒ el gate falla (`n_fail == 0`).
 
 | Presupuesto | Límite | Medido | Veredicto |
 |---|---|---|---|
-| Arranque a UI utilizable (p95, externo) | 300 ms | **16.9 ms** (p50 13.7 / min 10.4 / max 17.0) | ✅ PASS |
-| RSS idle (5 s tras arranque, dataset completo) | 50 MB | **6.1 MB** | ✅ PASS |
-| Binario release stripped | 30 MB (decimal) | **5.2 MB** (5.190.992 bytes) | ✅ PASS |
-| Dependencias de runtime (`ldd`) | 0 de app | vdso, libc, libm, libgcc_s, ld-linux + libz1g del sistema (zlib, base de Ubuntu) | ✅ PASS |
-| 5 agentes ≤ 500 MB | — | **UNVERIFIED** (`make budget-scale` falla a propósito: no hay claim) | ⚠️ |
+| Arranque a UI usable que ABRE un thread (p95, n=30, externo) | 300 ms | **25.2 ms** (p50 21.7 / max 89.3; 30/30 ok) | ✅ PASS |
+| RSS idle (5 s) | 50 MB | **6.4 MB** | ✅ PASS |
+| **Caché residente por thread** (RSS idle → thread abierto) | 10 MiB | **0.8 MiB** | ✅ PASS |
+| Binario release stripped | 30 MB (decimal) | **5.4 MB** | ✅ PASS |
+| Dependencias de runtime (`ldd`) | 0 de app | ABI del OS + libz del sistema (declarada) | ✅ PASS |
+| **5 runs concurrentes (app)** | ≤ 500 MB | **9.7 MB** (`aeril bench scale`, 5 agentes mock) | ✅ PASS (app) |
+| Agentes y total con 5 runs | medidos aparte | agentes **21.4 MB**, total **31.1 MB** | informativo |
 
-Salidas crudas: `bench-data/seed.json`, `bench-data/mem.json`,
-`bench-data/start.json`, `bench-data/start.txt` (regenerables con
-`make bench-seed budget`).
+**Advertencia explícita:** el bench de escala usa agentes MOCK y caracteriza el
+overhead de la aplicación. **No prueba** el consumo de Hermes real: los
+procesos de Hermes comparten `~/.hermes` y no es medible de forma aislada en
+v0 (`make budget-scale` imprime esta nota).
+
+Salidas crudas: `bench-data/{seed,start,mem,scale}.json` (regenerables con
+`make bench-seed budget budget-scale`).
+
+## Remediación RC1
+
+Los 13 hallazgos del brief de auditoría (A1–A6, B1–B7) están mapeados a
+correcciones, tests y commits en **`docs/phase0-remediation-matrix.md`**
+(Wave A `4e81f7d`, Wave B `dfd9416`). Los gates A/B originales no regresaron.
 
 ## Próxima prioridad de ingeniería
 

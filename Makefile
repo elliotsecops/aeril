@@ -40,7 +40,8 @@ bench-seed: $(BENCH_STAMP)
 
 $(BENCH_STAMP): $(BIN)
 	@mkdir -p $(DATA_DIR)
-	$(BIN) bench seed --dir $(BENCH_DIR) --threads 100 --events 1000 --diffs 10 | tee $(DATA_DIR)/seed.json
+	@$(BIN) bench seed --dir $(BENCH_DIR) --threads 100 --events 1000 --diffs 10 > $(DATA_DIR)/seed.json
+	@cat $(DATA_DIR)/seed.json
 	@touch $(BENCH_STAMP)
 
 budget-size: $(BIN)
@@ -51,18 +52,19 @@ budget-deps: $(BIN)
 
 budget-mem: $(BIN) bench-seed
 	@$(PYTHON) scripts/bench/startup.py --bin $(BIN) --data-dir $(BENCH_DIR) \
-		--runs 1 --mem --json | tee $(DATA_DIR)/mem.json
+		--runs 1 --mem --json > $(DATA_DIR)/mem.json
+	@cat $(DATA_DIR)/mem.json
 
 budget-start: $(BIN) bench-seed
 	@$(PYTHON) scripts/bench/startup.py --bin $(BIN) --data-dir $(BENCH_DIR) \
-		--runs 30 --json | tee $(DATA_DIR)/start.json
-	@$(PYTHON) scripts/bench/startup.py --bin $(BIN) --data-dir $(BENCH_DIR) \
-		--runs 30 | tee $(DATA_DIR)/start.txt
+		--runs 30 --json > $(DATA_DIR)/start.json
+	@cat $(DATA_DIR)/start.json
 
 # 5 agentes: gate de la APP ≤ 500 MB con runs mock concurrentes; agentes y
 # total medidos aparte. NO prueba Hermes real (perfil compartido, no medible).
 budget-scale: $(BIN)
-	@$(BIN) bench scale --runs 5 --delay-ms 6000 --data-dir $(DATA_DIR)/scale-data | tee $(DATA_DIR)/scale.json
+	@$(BIN) bench scale --runs 5 --delay-ms 6000 --data-dir $(DATA_DIR)/scale-data > $(DATA_DIR)/scale.json
+	@cat $(DATA_DIR)/scale.json
 
 budget: budget-size budget-deps budget-mem budget-start
 

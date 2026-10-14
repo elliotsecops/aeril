@@ -534,6 +534,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                 app.input_processed = true;
                 bench::beacon("input_processed", app.t0);
             }
+            // Punto de medición del benchmark (§4): la entrada ABRIÓ un
+            // thread real (timeline + resúmenes de comentarios renderizados).
+            if !app.thread_opened_beacon && app.detail.is_some() {
+                app.thread_opened_beacon = true;
+                bench::beacon("thread_opened", app.t0);
+            }
         }
     }
     Ok(())
