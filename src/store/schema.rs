@@ -58,7 +58,7 @@ CREATE INDEX idx_events_run ON events(run_id) WHERE run_id IS NOT NULL;
 CREATE INDEX idx_runs_thread ON runs(thread_id, started_ms);
 "#;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// v2: lease de workspace activo (exclusión entre procesos de Aeril).
 /// Tabla pequeña y dedicada: el `INSERT ... ON CONFLICT` dentro de una
@@ -74,6 +74,13 @@ CREATE TABLE leases (
 ) STRICT;
 "#;
 
+/// v3: `pid_start` (starttime del proceso dueño): distingue un PID vivo real
+/// de un PID reutilizado por otro proceso. Sin esto, un TTL vencido podía
+/// transferir el workspace mientras el dueño seguía trabajando (RC2-B5).
+pub const SCHEMA_V3: &str = r#"
+ALTER TABLE leases ADD COLUMN pid_start INTEGER NOT NULL DEFAULT 0;
+"#;
+
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if current >= SCHEMA_VERSION {
@@ -85,6 +92,9 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     }
     if current < 2 {
         tx.execute_batch(SCHEMA_V2)?;
+    }
+    if current < 3 {
+        tx.execute_batch(SCHEMA_V3)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;

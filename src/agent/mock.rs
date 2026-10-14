@@ -34,6 +34,18 @@ struct MockScript {
     /// Ignora `session/cancel` (backend que no coopera; B6).
     #[serde(default)]
     ignore_cancel: bool,
+    /// Emite `frames` notificaciones válidas de `frame_bytes` cada una, para
+    /// stress de memoria del pipeline ACP (RC2-B1).
+    #[serde(default)]
+    flood: Option<FloodSpec>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct FloodSpec {
+    frames: u64,
+    frame_bytes: usize,
+    #[serde(default)]
+    gap_ms: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -187,6 +199,18 @@ fn run_turn(
 ) -> Result<String> {
     if script.notify_setup {
         setup_notifications()?;
+    }
+    if let Some(flood) = &script.flood {
+        for i in 0..flood.frames {
+            // Cada frame es un mensaje válido con messageId propio (sin
+            // coalescing): estrés del pipeline de entrada del cliente.
+            let text = format!("frame {i}: {}", "F".repeat(flood.frame_bytes));
+            chunk_out(&text)?;
+            if flood.gap_ms > 0 && sleep_polling(flood.gap_ms, rx, cancelled, script.ignore_cancel)
+            {
+                return Ok("cancelled".to_string());
+            }
+        }
     }
     if script.exit_after_ms > 0 {
         // Conexión perdida a mitad del turno, sin contenido real antes.

@@ -100,23 +100,119 @@ enum ServerMsg {
         id: u64,
         result: std::result::Result<Value, RpcError>,
     },
+}
+
+/// Presupuesto de bytes EN VUELO del pipeline ACP (RC2-B1).
+///
+/// El productor (lector de stdout) **reserva bytes antes de interpretar JSON**
+/// y el consumidor los libera al terminar cada frame (Drop del guard). La cola
+/// transporta la LÍNEA CRUDA (sin decodificar): el costo en cola es el tamaño
+/// real del wire, no una representación amplificada. Un frame individual mayor
+/// que el presupuesto espera a que la cola se vacíe y transita solo.
+struct InflightBudget {
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+    current: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    budget: usize,
+}
+
+impl InflightBudget {
+    fn new(budget: usize) -> Self {
+        let budget = budget.max(1);
+        InflightBudget {
+            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(budget)),
+            current: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            budget,
+        }
+    }
+
+    /// Reserva cupo para un frame. Backpressure real: espera si la cola está
+    /// llena. Devuelve los permits retenidos (a liberar por el consumidor).
+    async fn reserve(&self, size: usize) -> Option<u32> {
+        // Los frames mayores que el presupuesto ocupan TODO el cupo: no pueden
+        // coexistir en cola con otros (garantía de cota, sin alloc extra).
+        let want = if size >= self.budget {
+            self.budget
+        } else {
+            size.max(1)
+        } as u32;
+        let permits = tokio::sync::Semaphore::acquire_many_owned(self.sem.clone(), want)
+            .await
+            .ok()?;
+        let now = self
+            .current
+            .fetch_add(want as usize, std::sync::atomic::Ordering::SeqCst)
+            + want as usize;
+        self.peak
+            .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        std::mem::forget(permits); // se libera vía release() del consumidor
+        Some(want)
+    }
+
+    fn release(&self, permits: u32) {
+        self.current
+            .fetch_sub(permits as usize, std::sync::atomic::Ordering::SeqCst);
+        self.sem.add_permits(permits as usize);
+    }
+}
+
+/// Lo que cruza el canal interno productor → consumidor.
+enum Incoming {
+    /// Frame crudo encolado (sin decodificar) + su reserva de presupuesto.
+    Frame(QueuedFrame),
+    /// Fin del canal con causa (EOF, límite, error de lectura).
     Closed(String),
 }
 
-/// Mensaje entrante + tamaño en bytes (para el presupuesto por turno).
-struct Frame {
-    msg: ServerMsg,
+/// Frame crudo encolado (sin decodificar) + su reserva de presupuesto.
+struct QueuedFrame {
+    line: String,
     size: usize,
+    permits: u32,
+    budget: std::sync::Arc<InflightBudget>,
 }
 
-/// Límite por línea/mensaje ACP: rechazo explícito ANTES de asignar sin cota.
-fn max_line_bytes() -> usize {
-    crate::util::env_usize("AERIL_ACP_MAX_LINE_BYTES", 16 * 1024 * 1024)
+impl QueuedFrame {
+    fn decoded(&self) -> Result<ServerMsg> {
+        classify(&self.line)
+    }
 }
 
-/// Límite acumulado de bytes recibidos en un turno (o fase de control).
-fn max_turn_bytes() -> usize {
-    crate::util::env_usize("AERIL_ACP_MAX_TURN_BYTES", 64 * 1024 * 1024)
+/// Guard del consumidor: libera la reserva SIEMPRE (éxito, error, cancelación
+/// o cierre del canal), porque se libera en Drop.
+impl Drop for QueuedFrame {
+    fn drop(&mut self) {
+        self.budget.release(self.permits);
+    }
+}
+
+/// Límites del pipeline de entrada ACP. Defaults conservadores para produccion;
+/// los tests usan `spawn_with_limits` con valores chicos y deterministas.
+#[derive(Debug, Clone, Copy)]
+pub struct AcpLimits {
+    /// Máximo por línea/mensaje: rechazo explícito antes de asignar sin cota.
+    pub max_line_bytes: usize,
+    /// Máximo acumulado de bytes recibidos en un turno (o fase de control).
+    pub max_turn_bytes: usize,
+    /// Presupuesto de bytes EN VUELO en la cola cruda productor→consumidor.
+    pub inflight_bytes: usize,
+}
+
+impl AcpLimits {
+    pub fn from_env() -> Self {
+        AcpLimits {
+            max_line_bytes: crate::util::env_usize("AERIL_ACP_MAX_LINE_BYTES", 4 * 1024 * 1024),
+            max_turn_bytes: crate::util::env_usize("AERIL_ACP_MAX_TURN_BYTES", 64 * 1024 * 1024),
+            inflight_bytes: crate::util::env_usize("AERIL_ACP_INFLIGHT_BYTES", 8 * 1024 * 1024),
+        }
+    }
+}
+
+impl Default for AcpLimits {
+    fn default() -> Self {
+        AcpLimits::from_env()
+    }
 }
 
 /// Lee una línea con cota estricta de memoria: nunca se acumulan más de
@@ -263,7 +359,9 @@ fn classify(line: &str) -> Result<ServerMsg> {
 pub struct AcpClient {
     stdin: ChildStdin,
     child: Child,
-    rx: mpsc::Receiver<Frame>,
+    rx: mpsc::Receiver<Incoming>,
+    budget: std::sync::Arc<InflightBudget>,
+    limits: AcpLimits,
     next_id: u64,
     stderr_tail: Arc<Mutex<Vec<String>>>,
     pub session_id: Option<String>,
@@ -281,12 +379,24 @@ fn env_secs(name: &str, default: u64) -> Duration {
 
 impl AcpClient {
     pub async fn spawn(spec: &BackendSpec, cwd: &Path) -> Result<AcpClient> {
+        Self::spawn_with_limits(spec, cwd, AcpLimits::from_env()).await
+    }
+
+    /// Como [`AcpClient::spawn`] con límites explícitos (tests deterministas).
+    pub async fn spawn_with_limits(
+        spec: &BackendSpec,
+        cwd: &Path,
+        limits: AcpLimits,
+    ) -> Result<AcpClient> {
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // Grupo de procesos propio: kill() mata también a los workers
+            // que el backend haya lanzado.
+            .process_group(0)
             .kill_on_drop(true);
         let mut child = cmd
             .spawn()
@@ -311,59 +421,59 @@ impl AcpClient {
             });
         }
 
-        let (tx, rx) = mpsc::channel(1024);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            loop {
-                match read_bounded_line(&mut reader, max_line_bytes()).await {
-                    Ok(Some(bytes)) => {
-                        let size = bytes.len();
-                        let line = String::from_utf8_lossy(&bytes).into_owned();
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-                        let msg = match classify(&line) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Frame {
-                                        msg: ServerMsg::Closed(e.to_string()),
-                                        size,
-                                    })
-                                    .await;
+        let budget = std::sync::Arc::new(InflightBudget::new(limits.inflight_bytes));
+        let (tx, rx) = mpsc::channel(64);
+        {
+            let budget = budget.clone();
+            let max_line = limits.max_line_bytes;
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    match read_bounded_line(&mut reader, max_line).await {
+                        Ok(Some(bytes)) => {
+                            let size = bytes.len();
+                            if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+                                continue;
+                            }
+                            // Presupuesto ANTES de interpretar/encolar: el
+                            // productor se frena si la cola está llena.
+                            let Some(permits) = budget.reserve(size).await else {
+                                break;
+                            };
+                            let line = String::from_utf8_lossy(&bytes).into_owned();
+                            let frame = QueuedFrame {
+                                line,
+                                size,
+                                permits,
+                                budget: budget.clone(),
+                            };
+                            if tx.send(Incoming::Frame(frame)).await.is_err() {
+                                // Canal cerrado: el guard del frame libera la
+                                // reserva en Drop.
                                 break;
                             }
-                        };
-                        if tx.send(Frame { msg, size }).await.is_err() {
+                        }
+                        Ok(None) => {
+                            let _ = tx.send(Incoming::Closed("EOF del backend".into())).await;
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Incoming::Closed(format!("entrada rechazada: {e}")))
+                                .await;
                             break;
                         }
                     }
-                    Ok(None) => {
-                        let _ = tx
-                            .send(Frame {
-                                msg: ServerMsg::Closed("EOF del backend".into()),
-                                size: 0,
-                            })
-                            .await;
-                        break;
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Frame {
-                                msg: ServerMsg::Closed(format!("entrada rechazada: {e}")),
-                                size: 0,
-                            })
-                            .await;
-                        break;
-                    }
                 }
-            }
-        });
+            });
+        }
 
         Ok(AcpClient {
             stdin,
             child,
             rx,
+            budget,
+            limits,
             next_id: 1,
             stderr_tail,
             session_id: None,
@@ -433,7 +543,7 @@ impl AcpClient {
             .await?;
         let mut control_bytes: usize = 0;
         loop {
-            let frame = match timeout(self.control_timeout, self.rx.recv()).await {
+            let incoming = match timeout(self.control_timeout, self.rx.recv()).await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Err(self.closed_err("el canal del backend se cerró")),
                 Err(_) => {
@@ -443,15 +553,26 @@ impl AcpClient {
                     )));
                 }
             };
-            control_bytes += frame.size;
-            if control_bytes > max_turn_bytes() {
+            let slot = match incoming {
+                Incoming::Closed(reason) => return Err(self.closed_err(&reason)),
+                Incoming::Frame(slot) => slot,
+            };
+            control_bytes += slot.size;
+            if control_bytes > self.limits.max_turn_bytes {
                 let _ = self.kill().await;
                 return Err(Error::backend(format!(
                     "la fase de control excedió el máximo de entrada ({} bytes)",
-                    max_turn_bytes()
+                    self.limits.max_turn_bytes
                 )));
             }
-            match frame.msg {
+            let msg = match slot.decoded() {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = self.kill().await;
+                    return Err(e);
+                }
+            };
+            match msg {
                 ServerMsg::Response { id: rid, result } if rid == id => {
                     return result.map_err(|e| Error::backend(format!("`{method}` falló: {e}")));
                 }
@@ -472,7 +593,6 @@ impl AcpClient {
                     self.dispatch_server_request(&id, &method, &params, obs)
                         .await?;
                 }
-                ServerMsg::Closed(reason) => return Err(self.closed_err(&reason)),
             }
         }
     }
@@ -650,7 +770,7 @@ impl AcpClient {
                     })).await;
                 }
                 msg = timeout(wait, recv) => {
-                    let frame = match msg {
+                    let incoming = match msg {
                         Ok(Some(m)) => m,
                         Ok(None) => return Err(self.closed_err("el canal del backend se cerró durante el turno")),
                         Err(_) => {
@@ -667,17 +787,28 @@ impl AcpClient {
                             )));
                         }
                     };
+                    let slot = match incoming {
+                        Incoming::Closed(reason) => return Err(self.closed_err(&reason)),
+                        Incoming::Frame(slot) => slot,
+                    };
                     // Presupuesto acumulado del turno: el tamaño por línea ya
                     // está acotado; acá se acota el total.
-                    turn_bytes += frame.size;
-                    if turn_bytes > max_turn_bytes() {
+                    turn_bytes += slot.size;
+                    if turn_bytes > self.limits.max_turn_bytes {
                         let _ = self.kill().await;
                         return Err(Error::backend(format!(
                             "el turno excedió el máximo de entrada acumulada ({} bytes); backend terminado",
-                            max_turn_bytes()
+                            self.limits.max_turn_bytes
                         )));
                     }
-                    match frame.msg {
+                    let msg = match slot.decoded() {
+                        Ok(m) => m,
+                        Err(e) => {
+                            let _ = self.kill().await;
+                            return Err(e);
+                        }
+                    };
+                    match msg {
                         ServerMsg::Response { id: rid, result } if rid == id => {
                             let v = result.map_err(|e| Error::backend(format!("prompt falló: {e}")))?;
                             let stop = v.get("stopReason").and_then(Value::as_str).unwrap_or("end_turn");
@@ -698,18 +829,53 @@ impl AcpClient {
                         ServerMsg::Request { id, method, params } => {
                             self.dispatch_server_request(&id, &method, &params, obs).await?;
                         }
-                        ServerMsg::Closed(reason) => return Err(self.closed_err(&reason)),
                     }
                 }
             }
         }
     }
 
-    /// Termina el proceso del backend.
+    /// Bytes actualmente en vuelo (reservados en la cola cruda).
+    pub fn inflight_bytes(&self) -> usize {
+        self.budget
+            .current
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Pico de bytes en vuelo desde el arranque del cliente (instrumentación
+    /// de tests: la cota del pipeline).
+    pub fn inflight_peak_bytes(&self) -> usize {
+        self.budget.peak.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Presupuesto declarado de bytes en vuelo.
+    pub fn inflight_budget_bytes(&self) -> usize {
+        self.budget.budget
+    }
+
+    /// Termina el proceso del backend y TODO su grupo de procesos (los
+    /// workers independientes no sobreviven al padre).
     pub async fn kill(&mut self) -> Result<()> {
+        if let Some(pid) = self.child.id() {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
         Ok(())
+    }
+}
+
+impl Drop for AcpClient {
+    fn drop(&mut self) {
+        // Best-effort: sin el grupo, un worker del backend podría sobrevivir
+        // al cierre inesperado del cliente.
+        if let Some(pid) = self.child.id() {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
     }
 }
 

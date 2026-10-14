@@ -147,6 +147,7 @@ fn dispatch(args: &[String], t0: Instant) -> Result<i32> {
         Some("comment") => cmd_comment(&p, &db_path),
         Some("feedback") => cmd_feedback(&p, &data_dir, &db_path),
         Some("recover") => cmd_recover(&p, &db_path),
+        Some("lease") => cmd_lease(&p, &db_path),
         Some("worktree") => cmd_worktree(&p, &data_dir, &db_path),
         Some("integrate") => cmd_integrate(&p, &db_path),
         Some("validate") => cmd_validate(&p, &data_dir, &db_path),
@@ -516,6 +517,49 @@ fn cmd_feedback(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
     }
 }
 
+// ── lease ────────────────────────────────────────────────────────────────────
+
+fn cmd_lease(p: &Parsed, db_path: &Path) -> Result<i32> {
+    match p.pos.get(1).map(String::as_str) {
+        Some("status") => {
+            let store = open_store(db_path)?;
+            let list = crate::store::leases::list(&store.conn)?;
+            let arr: Vec<Value> = list
+                .iter()
+                .map(|(ws, info)| {
+                    json!({
+                        "workspace_id": ws,
+                        "run_id": info.run_id,
+                        "pid": info.pid,
+                        "owner_alive": crate::store::leases::owner_alive(info),
+                        "heartbeat_age_ms": crate::timeutil::now_ms() - info.renewed_ms,
+                        "ttl_ms": info.ttl_ms,
+                    })
+                })
+                .collect();
+            print_json(&Value::Array(arr))?;
+            Ok(0)
+        }
+        Some("release") => {
+            let ws = p.require("workspace")?;
+            let force = p.yes("force");
+            let mut store = open_store(db_path)?;
+            let info = crate::store::leases::release_external(&mut store.conn, &ws, force)?;
+            print_json(&json!({
+                "released": true,
+                "workspace_id": ws,
+                "previous_run_id": info.run_id,
+                "previous_pid": info.pid,
+                "forced": force,
+            }))?;
+            Ok(0)
+        }
+        other => Err(Error::invalid(format!(
+            "lease {other:?} no soportado (status|release --workspace W [--force])"
+        ))),
+    }
+}
+
 // ── recover ──────────────────────────────────────────────────────────────────
 
 fn cmd_recover(_p: &Parsed, db_path: &Path) -> Result<i32> {
@@ -583,10 +627,8 @@ fn cmd_worktree(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                 .ok_or_else(|| Error::invalid("el run no tiene workspace"))?;
             if let Some(info) = crate::store::leases::active(&store.conn, &ws)? {
                 return Err(Error::conflict(format!(
-                    "el workspace {ws} tiene un run activo (run {}, pid {}, renovado hace {} ms): no se borra el worktree en uso",
-                    info.run_id,
-                    info.pid,
-                    crate::timeutil::now_ms() - info.renewed_ms
+                    "el workspace {ws} tiene un run activo (run {}, pid {}): el proceso dueño sigue vivo; no se borra el worktree en uso; si el proceso debe detenerse, usá `aeril lease release {ws} --force`",
+                    info.run_id, info.pid
                 )));
             }
             let repo = git::open(Path::new(&row.repo_path))?;

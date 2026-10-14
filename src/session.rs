@@ -69,7 +69,6 @@ pub struct RunSummary {
     pub state: String,
     pub stop_reason: Option<String>,
     pub engine_session_id: Option<String>,
-    pub session_resumed: bool,
     pub snapshot: Option<checkpoint::CaptureOutcome>,
     pub detail: Option<String>,
 }
@@ -132,21 +131,21 @@ impl Runner {
         // un lease vencido o de un proceso muerto se toma y se registra.
         let pre_run_id = new_id();
         let mut lease_guard: Option<LeaseGuard> = None;
+        // Señal de pérdida de ownership: si el guard la emite, el turno se
+        // cancela y el run se marca fallido (nunca completitud normal).
+        let mut lease_lost_rx: Option<oneshot::Receiver<()>> = None;
         if let Some(ws) = &candidate_ws {
             match leases::try_acquire(
                 &mut store.conn,
                 ws,
                 &pre_run_id,
                 std::process::id() as i64,
-                leases::DEFAULT_TTL_MS,
+                leases::ttl_ms(),
             )? {
-                leases::AcquireOutcome::Busy {
-                    run_id: busy_run,
-                    pid,
-                    age_ms,
-                } => {
+                leases::AcquireOutcome::Busy { info, age_ms } => {
                     return Err(Error::conflict(format!(
-                        "workspace {ws} en uso por el run {busy_run} (pid {pid}, renovado hace {age_ms} ms); esperá a que termine o resolvé el lease vencido"
+                        "workspace {ws} en uso: el proceso dueño sigue vivo (run {}, pid {}, heartbeat hace {age_ms} ms); un TTL vencido no transfiere ownership; recuperación explícita: `aeril lease release {ws} [--force]`",
+                        info.run_id, info.pid
                     )));
                 }
                 leases::AcquireOutcome::Acquired { took_over } => {
@@ -166,11 +165,14 @@ impl Runner {
                             },
                         )?;
                     }
+                    let (lost_tx, lost_rx) = oneshot::channel();
                     lease_guard = Some(LeaseGuard::start(
                         self.db_path.clone(),
                         ws.clone(),
                         pre_run_id.clone(),
+                        lost_tx,
                     ));
+                    lease_lost_rx = Some(lost_rx);
                 }
             }
         }
@@ -245,22 +247,20 @@ impl Runner {
             .map(|g| g.workspace_id != target.workspace_id)
             .unwrap_or(true);
         if needs_lease {
+            // El guard viejo (y su receiver) se descartan juntos: un sender
+            // huérfano dispararía la cancelación del turno nuevo.
             drop(lease_guard.take());
             match leases::try_acquire(
                 &mut store.conn,
                 &target.workspace_id,
                 &pre_run_id,
                 std::process::id() as i64,
-                leases::DEFAULT_TTL_MS,
+                leases::ttl_ms(),
             )? {
-                leases::AcquireOutcome::Busy {
-                    run_id: busy_run,
-                    pid,
-                    age_ms,
-                } => {
+                leases::AcquireOutcome::Busy { info, age_ms } => {
                     return Err(Error::conflict(format!(
-                        "workspace {} en uso por el run {busy_run} (pid {pid}, renovado hace {age_ms} ms)",
-                        target.workspace_id
+                        "workspace {} en uso: el proceso dueño sigue vivo (run {}, pid {}, heartbeat hace {age_ms} ms); un TTL vencido no transfiere ownership; recuperación explícita: `aeril lease release {} [--force]`",
+                        target.workspace_id, info.run_id, info.pid, target.workspace_id
                     )));
                 }
                 leases::AcquireOutcome::Acquired { took_over } => {
@@ -280,11 +280,14 @@ impl Runner {
                             },
                         )?;
                     }
+                    let (lost_tx, lost_rx) = oneshot::channel();
                     lease_guard = Some(LeaseGuard::start(
                         self.db_path.clone(),
                         target.workspace_id.clone(),
                         pre_run_id.clone(),
+                        lost_tx,
                     ));
+                    lease_lost_rx = Some(lost_rx);
                 }
             }
         }
@@ -349,10 +352,14 @@ impl Runner {
             &prompt,
             opts,
             prev_session.as_deref(),
+            lease_lost_rx,
         ));
         drop(rt);
 
         // ── cierre del run ───────────────────────────────────────────────────
+        // Pérdida de ownership: el run NUNCA reporta completitud normal y no
+        // captura checkpoint (deja de ser dueño del workspace).
+        let lease_lost = lease_guard.as_ref().map(|g| g.lost()).unwrap_or(false);
         let delivered = turn.feedback_delivered;
         let (mut state, mut detail, stop_reason) = match turn {
             TurnResult {
@@ -380,6 +387,29 @@ impl Runner {
                 ..
             } => ("failed", detail, None),
         };
+        if lease_lost {
+            let ws = lease_guard
+                .as_ref()
+                .map(|g| g.workspace_id.clone())
+                .unwrap_or_default();
+            let _ = events::append_typed(
+                &mut store.conn,
+                thread_id,
+                Some(&run.id),
+                events::K_WORKSPACE_LEASE_LOST,
+                "system",
+                &payload::WorkspaceLeaseLost {
+                    workspace_id: ws.clone(),
+                    run_id: run.id.clone(),
+                    reason: "ownership transferido a otro proceso durante el turno".into(),
+                },
+            );
+            state = "failed";
+            detail = Some(format!(
+                "lease del workspace {ws} perdido durante el turno; run abortado sin completar (detalle: {})",
+                detail.unwrap_or_else(|| "sin detalle".into())
+            ));
+        }
 
         // Feedback sin evidencia de procesamiento = fallo explícito (jamás se
         // declara entregado sin ack del backend).
@@ -445,7 +475,6 @@ impl Runner {
             state: state.to_string(),
             stop_reason,
             engine_session_id,
-            session_resumed: false,
             snapshot,
             detail,
         })
@@ -462,6 +491,7 @@ impl Runner {
         prompt: &str,
         opts: &RunOptions,
         prev_session: Option<&str>,
+        lease_lost_rx: Option<oneshot::Receiver<()>>,
     ) -> TurnResult {
         let _ = repo;
         let mut client = match AcpClient::spawn(spec, worktree).await {
@@ -576,6 +606,8 @@ impl Runner {
             };
         }
 
+        // Cancelación efectiva: la del usuario O la pérdida de lease.
+        let effective_cancel = merge_cancels(self.cancel.take(), lease_lost_rx);
         let stop = {
             let mut observer = PersistingObserver {
                 store,
@@ -588,9 +620,7 @@ impl Runner {
                 turn_started: false,
                 tools: HashMap::new(),
             };
-            let res = client
-                .prompt(prompt, &mut observer, self.cancel.take())
-                .await;
+            let res = client.prompt(prompt, &mut observer, effective_cancel).await;
             // El último mensaje acumulado del turno se persiste SIEMPRE,
             // aunque el turno haya fallado (es evidencia de lo que dijo el motor).
             let flush = observer.flush_message();
@@ -642,49 +672,70 @@ struct TurnResult {
     feedback_delivered: Option<bool>,
 }
 
-/// Guard del lease de workspace: renueva en un thread propio y libera al
-/// soltarse (Drop). El lease coordina SOLO procesos de Aeril; no aísla de
-/// procesos externos con los permisos del usuario.
+/// Guard del lease de workspace: renueva en un thread propio, ABORTA si
+/// pierde ownership (señal al turno) y libera al soltarse (Drop).
+///
+/// Invariante RC2-B5: un fallo de renovación (0 filas o error del store) NO
+/// permite seguir con ownership desconocido: se marca `lost`, se señala el
+/// turno (que cancela el backend) y el run termina fallido.
 struct LeaseGuard {
     db_path: PathBuf,
     workspace_id: String,
     run_id: String,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     renewer: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LeaseGuard {
-    fn start(db_path: PathBuf, workspace_id: String, run_id: String) -> Self {
+    fn start(
+        db_path: PathBuf,
+        workspace_id: String,
+        run_id: String,
+        lost_tx: oneshot::Sender<()>,
+    ) -> Self {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
+        let lost = std::sync::Arc::new(AtomicBool::new(false));
+        let lost_thread = lost.clone();
         let db = db_path.clone();
         let ws = workspace_id.clone();
         let rid = run_id.clone();
+        let interval = crate::store::leases::renew_interval_secs();
         let renewer = std::thread::spawn(move || {
-            let mut ticks: u32 = 0;
+            let mut lost_tx = Some(lost_tx);
+            let mut ticks: u64 = 0;
             loop {
-                if stop_thread.load(Ordering::Relaxed) {
+                if lost_thread.load(Ordering::Relaxed) {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 ticks += 1;
-                if !ticks.is_multiple_of(15) {
+                if !ticks.is_multiple_of(interval) {
                     continue;
                 }
-                match Store::open(&db) {
-                    Ok(store) => match leases::renew(&store.conn, &ws, &rid) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            eprintln!(
-                                "aeril: lease del workspace {ws} perdido; la exclusión entre procesos de Aeril ya no está garantizada"
-                            );
-                            return;
+                let outcome = match Store::open(&db) {
+                    Ok(store) => crate::store::leases::renew(&store.conn, &ws, &rid),
+                    Err(e) => Err(e),
+                };
+                match outcome {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        lost_thread.store(true, Ordering::SeqCst);
+                        if let Some(tx) = lost_tx.take() {
+                            let _ = tx.send(());
                         }
-                        Err(e) => eprintln!("aeril: renovación de lease falló: {e}"),
-                    },
+                        return;
+                    }
                     Err(e) => {
-                        eprintln!("aeril: no se pudo abrir el store para renovar el lease: {e}")
+                        // Error de renovación = ownership desconocido: abortar,
+                        // nunca seguir a ciegas.
+                        eprintln!(
+                            "aeril: renovación de lease falló ({e}); abortando por ownership desconocido"
+                        );
+                        lost_thread.store(true, Ordering::SeqCst);
+                        if let Some(tx) = lost_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        return;
                     }
                 }
             }
@@ -693,15 +744,41 @@ impl LeaseGuard {
             db_path,
             workspace_id,
             run_id,
-            stop,
+            lost,
             renewer: Some(renewer),
+        }
+    }
+
+    fn lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Combina hasta dos señales de cancelación en una sola (la primera que llegue).
+fn merge_cancels(
+    a: Option<oneshot::Receiver<()>>,
+    b: Option<oneshot::Receiver<()>>,
+) -> Option<oneshot::Receiver<()>> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(r), None) | (None, Some(r)) => Some(r),
+        (Some(ra), Some(rb)) => {
+            let (tx, rx) = oneshot::channel();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = ra => {}
+                    _ = rb => {}
+                }
+                let _ = tx.send(());
+            });
+            Some(rx)
         }
     }
 }
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.lost.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Ok(store) = Store::open(&self.db_path) {
             let _ = leases::release(&store.conn, &self.workspace_id, &self.run_id);
         }

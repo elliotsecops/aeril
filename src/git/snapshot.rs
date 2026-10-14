@@ -43,6 +43,51 @@ fn unsupported_entry(entry: &git2::StatusEntry<'_>, abs: &std::path::Path) -> Op
     None
 }
 
+/// Caminos con gitlink (submódulo) según el ÍNDICE del worktree: la
+/// inspección es independiente del status, porque el status puede omitir
+/// escrituras bajo un gitlink no inicializado (RC2-A5).
+fn gitlink_paths(repo: &Repository) -> Result<Vec<String>> {
+    let index = repo.index()?;
+    let mut out = Vec::new();
+    for entry in index.iter() {
+        // 0o160000 = gitlink (submódulo), en el modo crudo del índice.
+        if entry.mode == 0o160000 {
+            out.push(String::from_utf8_lossy(&entry.path).into_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// Guard RC2-A5: ninguna escritura bajo un gitlink puede quedar fuera del
+/// snapshot. Inicializado → el puntero se captura desde el árbol base y los
+/// cambios se rechazan vía status (RC1). No inicializado → si hay CUALQUIER
+/// contenido en el directorio, no se puede garantizar captura completa:
+/// rechazo explícito (jamás tratarlo como archivos comunes).
+fn check_gitlink_workdir(workdir: &std::path::Path, path: &str) -> Result<()> {
+    let dir = workdir.join(path);
+    if !dir.exists() {
+        return Ok(());
+    }
+    if dir.join(".git").exists() {
+        return Ok(()); // inicializado: puntero en árbol base + status (RC1)
+    }
+    let mut entries = std::fs::read_dir(&dir)?;
+    if entries.next().is_some() {
+        return Err(Error::unsupported(format!(
+            "submódulo no inicializado con contenido bajo su path: `{path}` — capturar esto no está soportado en v0 \
+             (inicializá el submódulo con `git submodule update --init` o quitá esos archivos)"
+        )));
+    }
+    Ok(())
+}
+
+fn guard_gitlinks(repo: &Repository, workdir: &std::path::Path) -> Result<()> {
+    for path in gitlink_paths(repo)? {
+        check_gitlink_workdir(workdir, &path)?;
+    }
+    Ok(())
+}
+
 /// Captura el estado del WORKING TREE como objetos inmutables.
 ///
 /// Devuelve `Ok(None)` si el contenido es idéntico a la base: no hay nada
@@ -71,6 +116,8 @@ pub fn capture(
         .workdir()
         .ok_or_else(|| Error::unsupported("worktree sin working dir"))?
         .to_path_buf();
+    // RC2-A5: gitlinks inspeccionados por índice, no por status.
+    guard_gitlinks(worktree_repo, &workdir)?;
 
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
@@ -162,6 +209,7 @@ pub fn current_tree(worktree_repo: &Repository, base_oid: &str) -> Result<String
         .workdir()
         .ok_or_else(|| Error::unsupported("worktree sin working dir"))?
         .to_path_buf();
+    guard_gitlinks(worktree_repo, &workdir)?;
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)

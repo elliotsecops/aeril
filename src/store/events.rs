@@ -34,6 +34,7 @@ pub const K_FEEDBACK_DELIVERED: &str = "feedback.delivered";
 pub const K_FEEDBACK_FAILED: &str = "feedback.failed";
 pub const K_WORKSPACE_RECREATED: &str = "workspace.recreated";
 pub const K_WORKSPACE_LEASE_TAKEN_OVER: &str = "workspace.lease_taken_over";
+pub const K_WORKSPACE_LEASE_LOST: &str = "workspace.lease_lost";
 pub const K_INTEGRATION_REQUESTED: &str = "integration.requested";
 pub const K_INTEGRATION_COMPLETED: &str = "integration.completed";
 pub const K_INTEGRATION_BLOCKED: &str = "integration.blocked";
@@ -250,8 +251,17 @@ pub mod payload {
         pub reason: String,
     }
 
-    /// Toma de control de un lease vencido o de un proceso muerto (advisory:
-    /// solo coordina procesos de Aeril, no aísla de procesos externos).
+    /// Pérdida de ownership durante un run: el run se aborta, no completa.
+    #[derive(Debug, Serialize, Deserialize, Default)]
+    pub struct WorkspaceLeaseLost {
+        pub workspace_id: String,
+        pub run_id: String,
+        pub reason: String,
+    }
+
+    /// Toma de control de un lease de un proceso PROBADAMENTE muerto
+    /// (pid ausente o reutilizado). Advisory: coordina Aeril, no aísla de
+    /// procesos externos.
     #[derive(Debug, Serialize, Deserialize, Default)]
     pub struct WorkspaceLeaseTakenOver {
         pub workspace_id: String,

@@ -484,13 +484,23 @@ fn b5_run_concurrente_y_borrado_bloqueados_por_lease() {
 }
 
 #[test]
-fn b5_lease_vencido_por_ttl_se_toma_y_se_registra() {
-    let env = TestEnv::new("rc1-b5-ttl");
-    let thread = env.thread_new("b5t");
+fn b5_lease_de_dueno_muerto_se_toma_y_se_registra() {
+    // RC2-B5: un TTL vencido con dueño VIVO ya NO transfiere ownership (eso se
+    // prueba en tests/rc2_b5.rs). La transferencia automática queda solo para
+    // dueños PROBADAMENTE muertos.
+    let env = TestEnv::new("rc1-b5-dead");
+    let thread = env.thread_new("b5d");
     let script = env.script("s", mock_edit("NOTES.md", "# v2\n", "x"));
     let _ = env.run_start(&thread, "x", &script);
 
-    // Lease falso: PID vivo (el de este test) pero renovación vencida.
+    // PID inexistente (proceso creado y reapeado): dueño probadamente muerto.
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let dead_pid = victim.id() as i64;
+    victim.kill().unwrap();
+    victim.wait().unwrap();
     let store = aeril::store::Store::open(&env.data.join("aeril.db")).unwrap();
     let ws: String = store
         .conn
@@ -500,13 +510,12 @@ fn b5_lease_vencido_por_ttl_se_toma_y_se_registra() {
             |r| r.get(0),
         )
         .unwrap();
-    let my_pid = std::process::id() as i64;
     store
         .conn
         .execute(
             &format!(
-                "INSERT INTO leases (workspace_id, run_id, pid, acquired_ms, renewed_ms, ttl_ms)
-                 VALUES ('{ws}', 'run-ajeno', {my_pid}, 0, 0, 60000)"
+                "INSERT INTO leases (workspace_id, run_id, pid, pid_start, acquired_ms, renewed_ms, ttl_ms)
+                 VALUES ('{ws}', 'run-ajeno', {dead_pid}, 0, 0, 0, 60000)"
             ),
             [],
         )
@@ -516,7 +525,7 @@ fn b5_lease_vencido_por_ttl_se_toma_y_se_registra() {
     let run = env.run_start(&thread, "x", &script2);
     assert_eq!(run["state"], "completed", "run: {run}");
     let takeover = events_of(&env, &thread, "workspace.lease_taken_over");
-    assert_eq!(takeover.last().unwrap()["payload"]["reason"], "ttl vencido");
+    assert_eq!(takeover.last().unwrap()["payload"]["reason"], "pid muerto");
 }
 
 // ── B6: plazo de cancelación ─────────────────────────────────────────────────
