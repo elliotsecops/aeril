@@ -1,6 +1,6 @@
 # Fase 1 — Plan de ingeniería (aprobado 2026-10-14)
 
-> Baseline: `main @ 201515d` · Estado: **S0 en ejecución** (rama `feat/phase1-s0-reconciliation`).
+> Baseline: `main @ 4d14e09` · **S0 integrado y aceptado** (PASS S0-R1, `e38a7d4` en main) · **S1 completado: verdicto CONDITIONAL — single-Hermes sigue siendo el default soportado** (`docs/phase1-s1-hermes-isolation.md`) · **S2 implementado** (`331667196eebef6e308c1376f64e147d8b8a864d`).
 > Objetivo: **dos agentes concurrentes** (dos threads, mismo repo, un workspace verificado
 > cada uno) con estado durable, revisión independiente y recuperación segura.
 > Toda la validación primaria es **mock determinista**; Hermes real en paralelo queda
@@ -40,9 +40,9 @@ restringe procesos externos. Se documentará en la UI/CLI y en `docs/phase1-*`.
 
 | # | Paso | Entregable | Estado |
 |---|---|---|---|
-| **S0** | **Reconciliación durable de runs interrumpidos** | `run.ended failed/interrupted` idempotente al reabrir; evidencia de supervisor y backend; gate de reuso conservador | ✅ `130c94f` (7 tests S0; suite 69/69) |
-| S1 | Spike de aislamiento de perfiles de Hermes (time-box 0.5 día) | Informe con evidencia (`HERMES_HOME`/`HOME` por proceso, sesiones/state.db, credenciales sin copiar secretos) + decisión registrada | pendiente |
-| S2 | Estado de runs activos (`run list --active` = runs⋈leases) | CLI + proyección; sin migraciones | pendiente |
+| **S0** | **Reconciliación durable de runs interrumpidos** | `run.ended failed/interrupted` idempotente al reabrir; evidencia de supervisor y backend; gate de reuso conservador | ✅ **integrado y aceptado** (`e38a7d4` en main; +7 tests S0 y suite de seguridad R1) |
+| S1 | Spike de aislamiento de perfiles de Hermes | Informe con evidencia (`HERMES_HOME`, state.db/installs/locks por perfil, kill aislado, credenciales) | ✅ **CONDITIONAL**: estado aislado verificado; sesiones reales y credenciales por perfil pendientes ⇒ single-Hermes default (`docs/phase1-s1-hermes-isolation.md`) |
+| S2 | Estado de runs activos | `aeril run list [--active] [--limit]`: supervisor (alive/dead/unknown) + lease (owned/missing/held_by_other) + status efectivo; solo lectura, sin migraciones | ✅ `331667196eebef6e308c1376f64e147d8b8a864d` (8 tests S2; suite 83/83; make budget sin cambios) |
 | S3 | TUI concurrente (2 runs, cancelar por run) | uso manual + pty | pendiente |
 | S4 | `workspace list` + ciclo de vida | CLI + tests | pendiente |
 | S5 | E2E de concurrencia (mock) | `tests/phase1_concurrency.rs` (G1–G7, G9) | pendiente |
