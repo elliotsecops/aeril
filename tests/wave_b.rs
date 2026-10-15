@@ -463,7 +463,7 @@ fn b5_run_concurrente_y_borrado_bloqueados_por_lease() {
     let rm = env.aeril(&["worktree", "rm", "--thread", &thread]);
     assert!(!rm.status.success());
     assert!(
-        String::from_utf8_lossy(&rm.stderr).contains("run activo"),
+        String::from_utf8_lossy(&rm.stderr).contains("lease con dueño VIVO"),
         "stderr: {}",
         String::from_utf8_lossy(&rm.stderr)
     );

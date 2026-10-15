@@ -349,23 +349,39 @@ fn s4_lease_vivo_bloquea_borrado_y_rc21() {
         "mensaje: {err}"
     );
 
-    // 3. Supervisor muerto: sigue bloqueado (stale, backend quizá vivo) y
-    //    exige `--unsafe-ok` o reconciliación.
+    // 3. Supervisor muerto: el lease stale sigue presente y el fence final
+    //    bloquea (S4-R1: cualquier lease presente bloquea; ya no se borra a
+    //    ciegas aunque el dueño esté muerto).
     sigkill(child.id());
     let _ = child.wait();
     let out = env.aeril(&["worktree", "rm", "--thread", &thread]);
     assert!(!out.status.success(), "stale no se borra a ciegas");
     let err = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(err.contains("no es seguro para borrar"), "guard S4: {err}");
+    assert!(
+        err.contains("lease registrado de un dueño sin vida verificada"),
+        "fence de lease: {err}"
+    );
     assert!(wt.is_dir());
 
-    // 4. Backend muerto + reconciliación ⇒ veredicto Safe ⇒ borrado normal.
+    // 4. Backend muerto + reconciliación + lease liberado por su ciclo de vida
+    //    ⇒ borrado normal (sin override).
     kill_mock_of(&env, &thread);
     run_recover(&env);
     let out = env.aeril(&["worktree", "rm", "--thread", &thread]);
     assert!(
+        !out.status.success(),
+        "el lease stale bloquea hasta resolverlo por su ciclo de vida"
+    );
+    let out = env.aeril(&["lease", "release", "--workspace", &ws]);
+    assert!(
         out.status.success(),
-        "tras reconciliar debería borrar: {}",
+        "release de dueño muerto: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = env.aeril(&["worktree", "rm", "--thread", &thread]);
+    assert!(
+        out.status.success(),
+        "tras reconciliar y liberar debería borrar: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!wt.exists(), "worktree borrado");

@@ -897,12 +897,28 @@ fn test_rm_barrier(name: &str) {
     }
 }
 
+/// Motivo de rechazo por lease para `worktree rm` (S4-R1): el mismo mensaje se
+/// usa en el chequeo barato y en el fence final transaccional.
+fn rm_lease_refusal(ws: &str, info: &crate::store::leases::LeaseInfo) -> Error {
+    if crate::store::leases::owner_alive(info) {
+        Error::conflict(format!(
+            "el workspace {ws} tiene un lease con dueño VIVO (run {}, pid {}): su lease NO se libera, ni con `--force` (RC2.1) y el borrado se rechaza. Terminá el proceso dueño (cierre normal, SIGTERM o SIGKILL), verificá su muerte (p. ej. `ps -p {}`) y reintentá",
+            info.run_id, info.pid, info.pid
+        ))
+    } else {
+        Error::conflict(format!(
+            "el workspace {ws} tiene un lease registrado de un dueño sin vida verificada (run {}, pid {}): el borrado se rechaza — cualquier lease presente bloquea en el fence final. Resolvelo por su ciclo de vida: verificá la muerte del proceso y liberá con `aeril lease release --workspace {ws}` (que rechaza dueños vivos), y reintentá",
+            info.run_id, info.pid
+        ))
+    }
+}
+
 fn cmd_worktree(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
     match p.pos.get(1).map(String::as_str) {
         Some("rm") => {
             let thread_id = p.require("thread")?;
             let unsafe_ok = p.yes("unsafe-ok");
-            let store = open_store(db_path)?;
+            let mut store = open_store(db_path)?;
             let row = threads::get(&store.conn, &thread_id)?
                 .ok_or_else(|| Error::not_found(format!("thread {thread_id}")))?;
             let run = runs::latest(&store.conn, &thread_id)?
@@ -910,30 +926,89 @@ fn cmd_worktree(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
             let ws = run
                 .workspace_id
                 .ok_or_else(|| Error::invalid("el run no tiene workspace"))?;
+
+            // 1) Chequeo barato (sin lock): un dueño VIVO se rechaza temprano.
             if let Some(info) = crate::store::leases::active(&store.conn, &ws)? {
-                // RC2.1: un dueño VIVO no se desplaza jamás; `--force` no pisa
-                // leases vivos. La única vía es terminar y verificar el proceso.
+                return Err(rm_lease_refusal(&ws, &info));
+            }
+
+            // 2) Preparación (repo abrible) FUERA de la transacción final.
+            let repo = git::open(Path::new(&row.repo_path))?;
+            test_rm_barrier("AERIL_TEST_RM_BARRIER_PRE_TX");
+
+            // 3) Decisión final serializada con `leases::try_acquire`: ambos usan
+            //    TransactionBehavior::Immediate, así que una adquisición no
+            //    puede colarse entre el chequeo y el borrado. La transacción
+            //    serializa contra adquisiciones de lease de Aeril; NO es una
+            //    transacción atómica DB+filesystem (el rollback no deshace el
+            //    borrado de archivos).
+            let tx = store
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+            // 3a) La identidad del target no cambió desde la selección.
+            let current_ws = runs::latest(&tx, &thread_id)?
+                .and_then(|r| r.workspace_id)
+                .ok_or_else(|| {
+                    Error::conflict(
+                        "el thread quedó sin run durante la operación; borrado abortado",
+                    )
+                })?;
+            if current_ws != ws {
                 return Err(Error::conflict(format!(
-                    "el workspace {ws} tiene un run activo (run {}, pid {}): el proceso dueño sigue vivo y su lease NO se libera, ni con `--force` (RC2.1). No se borra un worktree en uso. Terminá el proceso dueño (cierre normal, SIGTERM o SIGKILL), verificá su muerte (p. ej. `ps -p {}`) y reintentá",
-                    info.run_id, info.pid, info.pid
+                    "el thread cambió de workspace durante la operación ({ws} → {current_ws}); borrado abortado; reintentá"
                 )));
             }
-            test_rm_barrier("AERIL_TEST_RM_BARRIER_PRE_TX");
-            // S4: sin dueño vivo todavía puede haber un backend atribuible vivo
-            // (p. ej. supervisor muerto y backend huérfano) o evidencia no
-            // verificable. El veredicto S0 de reuso decide; borrar exige acción
-            // explícita del usuario cuando está bloqueado.
+
+            // 3b) Fence final de lease: CUALQUIER fila presente bloquea (un
+            //     lease stale se resuelve por el ciclo de vida existente).
+            if let Some(info) = crate::store::leases::get(&tx, &ws)? {
+                return Err(rm_lease_refusal(&ws, &info));
+            }
+
+            // 3c) Guard específico de borrado (D1): un run sin resolver con
+            //     supervisor VIVO o DESCONOCIDO se rechaza por defecto aunque no
+            //     haya lease; `--unsafe-ok` es un reconocimiento explícito de
+            //     riesgo, no una prueba de que el workspace dejó de modificarse.
+            if let Some(latest) = runs::latest_of_workspace(&tx, &ws)?
+                && (latest.state == "starting" || latest.state == "running")
+            {
+                let view = crate::recovery::supervisor_view(&tx, &latest)?;
+                let blocked = matches!(
+                    view.liveness,
+                    crate::recovery::LivenessView::Alive | crate::recovery::LivenessView::Unknown
+                );
+                if blocked && !unsafe_ok {
+                    return Err(Error::conflict(format!(
+                        "el workspace {ws} tiene un run sin resolver (run {}, estado {}) con supervisor {} ({}): el borrado por defecto se rechaza. `--unsafe-ok` NO termina backends ni prueba que el workspace haya dejado de modificarse; si verificaste manualmente que no queda ningún proceso escribiendo, repetí con `--unsafe-ok`",
+                        latest.id,
+                        latest.state,
+                        if matches!(view.liveness, crate::recovery::LivenessView::Alive) {
+                            "vivo"
+                        } else {
+                            "desconocido"
+                        },
+                        view.detail
+                    )));
+                }
+            }
+
+            // 3d) Evidencia S0 de backend/recovery (sin cambios de semántica):
+            //     bloqueado ⇒ exige acción explícita del usuario.
             if !unsafe_ok
                 && let crate::recovery::ReuseVerdict::Blocked(reason) =
-                    crate::recovery::workspace_reuse_verdict(&store.conn, &ws)?
+                    crate::recovery::workspace_reuse_verdict(&tx, &ws)?
             {
                 return Err(Error::conflict(format!(
                     "el workspace {ws} no es seguro para borrar: {reason}. Aeril solo verifica procesos del grupo que él creó; si comprobaste manualmente que no queda ningún backend escribiendo en el worktree, repetí con `--unsafe-ok` (acción explícita; no se tocan checkpoints, refs ni comentarios)"
                 )));
             }
-            let repo = git::open(Path::new(&row.repo_path))?;
+
             test_rm_barrier("AERIL_TEST_RM_BARRIER_IN_TX");
+
+            // 4) Borrado con el lock de escritura todavía tomado; commit después.
             git::worktree::remove(&repo, data_dir, &ws)?;
+            tx.commit()?;
             print_json(&json!({"removed": true, "workspace_id": ws, "unsafe_ok": unsafe_ok}))?;
             Ok(0)
         }

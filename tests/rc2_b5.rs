@@ -337,8 +337,8 @@ fn b5_rm_bloqueado_con_ttl_vencido_y_dueno_vivo() {
     );
     let stderr = String::from_utf8_lossy(&rm.stderr);
     assert!(
-        stderr.contains("sigue vivo") || stderr.contains("run activo"),
-        "error explícito: {stderr}"
+        stderr.contains("dueño VIVO") && stderr.contains("NO se libera, ni con `--force`"),
+        "error explícito (RC2.1): {stderr}"
     );
     let _ = a.kill();
     let _ = a.wait();

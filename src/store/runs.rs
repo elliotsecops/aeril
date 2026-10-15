@@ -121,6 +121,20 @@ pub fn get(conn: &Connection, thread_id: &str, run_id: &str) -> Result<Option<Ru
     }
 }
 
+/// Run más reciente asociado a un workspace (S4-R1): el guard de borrado
+/// evalúa la ejecución vigente del workspace, no solo la del thread.
+pub fn latest_of_workspace(conn: &Connection, workspace_id: &str) -> Result<Option<RunRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLS} FROM runs WHERE workspace_id = ?1
+         ORDER BY started_ms DESC, id DESC LIMIT 1"
+    ))?;
+    let mut rows = stmt.query_map(params![workspace_id], row_to_run)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
 pub fn latest(conn: &Connection, thread_id: &str) -> Result<Option<RunRow>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM runs WHERE thread_id = ?1 ORDER BY started_ms DESC, id DESC LIMIT 1"
