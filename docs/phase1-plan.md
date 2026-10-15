@@ -1,6 +1,6 @@
 # Fase 1 — Plan de ingeniería (aprobado 2026-10-14)
 
-> Baseline: `main @ 99d2f7b` · **S0 integrado y aceptado** (PASS S0-R1, `e38a7d4` en main) · **S1 CONDITIONAL — single-Hermes sigue siendo el default soportado** (`docs/phase1-s1-hermes-isolation.md`) · **S2 integrado** (PASS de auditoría independiente; `b63f582` en main) · **S3 integrado** (CONDITIONAL PASS de auditoría independiente; `99d2f7b` en main) · **S4 implementado** (`60921bc5e01e7ae1c90dbe47336184fcf4473d6a`) · **S4-R1 (borrado seguro) en `fix/phase1-s4-deletion-safety`** (`ecdbd38eb14466ac0e1b667de40d4a44d9042e14`; rojo reproducido en `dac8ab2`).
+> Baseline: `main @ 880b7c7` · **S0 integrado y aceptado** (PASS S0-R1, `e38a7d4`) · **S1 CONDITIONAL — single-Hermes default** (`docs/phase1-s1-hermes-isolation.md`) · **S2 integrado** (PASS auditoría; `b63f582`) · **S3 integrado** (CONDITIONAL PASS; `99d2f7b`) · **S4 + S4-R1 integrados y aceptados** (PASS auditoría S4-R1; `880b7c7` en main) · **S5 implementado** (`d1d7ff03230a8c324c1f628ac80a9283a1f798ef`).
 > Objetivo: **dos agentes concurrentes** (dos threads, mismo repo, un workspace verificado
 > cada uno) con estado durable, revisión independiente y recuperación segura.
 > Toda la validación primaria es **mock determinista**; Hermes real en paralelo queda
@@ -45,7 +45,7 @@ restringe procesos externos. Se documentará en la UI/CLI y en `docs/phase1-*`.
 | S2 | Estado de runs activos | `aeril run list [--active] [--limit]`: supervisor (alive/dead/unknown) + lease (owned/missing/held_by_other) + status efectivo; solo lectura, sin migraciones | ✅ **integrado** (`b63f582`; 8 tests S2; suite 83/83; make budget sin cambios) |
 | S3 | TUI concurrente (2 runs, cancelar por run) | `n` nuevo run en el thread abierto; slots por invocación (N=2, 1/thread, Hermes real 1/vez); `x` cancela solo el thread seleccionado y el slot se libera únicamente con el ack terminal; `q` bloqueado con runs vivos; mismo panel único; harness PTY solo para tests | ✅ **integrado y aceptado** (CONDITIONAL PASS; `99d2f7b` en main; 9 tests T1–T9) |
 | S4 | `workspace list` + ciclo de vida | `workspace list [--thread T] [--limit N]` (solo lectura, dedupe por workspace, estados y elegibilidad de reuso) + guard de `worktree rm` (lease vivo RC2.1; `--unsafe-ok` explícito) + rehidratación verificada | ✅ `60921bc5e01e7ae1c90dbe47336184fcf4473d6a` (11 tests S4; suite 103/103; budget PASS) |
-| S5 | E2E de concurrencia (mock) | `tests/phase1_concurrency.rs` (G1–G7, G9) | pendiente |
+| S5 | E2E de concurrencia (mock) | `tests/phase1_concurrency.rs`: G1–G9 con topologías explícitas (TUI única / procesos CLI independientes / kill de backend vs SIGKILL del proceso completo) | ✅ `d1d7ff03230a8c324c1f628ac80a9283a1f798ef` (11 tests; suite 121/121 ×3; budget + scale PASS) |
 | S6 | Presupuestos + docs de fase | `make budget*` extendido, `docs/phase1-status.md` | pendiente |
 
 ### S4 — Semántica de `workspace list` y borrado seguro
@@ -100,6 +100,40 @@ restringe procesos externos. Se documentará en la UI/CLI y en `docs/phase1-*`.
   solo cubre el cierre del runner, no panics en el resto de la TUI; (b) no se
   endureció el panic hook: un panic del runner puede ensuciar el frame del PTY
   hasta el próximo redraw. Se registran como trabajo futuro; no son gates de S4.
+
+### S5 — Concurrencia end-to-end: topologías y límites
+
+`tests/phase1_concurrency.rs` (G1–G9). Topología REAL de cada gate (no se
+declara aislamiento de procesos por hilo):
+
+- **TUI única** (G1/G3/G4/G5/G7/G8): los supervisores son **hilos Rust del
+  mismo proceso Aeril**; los backends mock son procesos hijos con grupo propio.
+- **Procesos CLI independientes** sobre el mismo store/repo (G2a/G6/G9): el
+  fallo de auditoría de G6 se inyecta **por proceso** (`AERIL_FAULT_APPEND` en
+  A), nunca global; G9 lanza dos `integrate` competidores con `--expect`.
+- **G2b** distingue dos casos: (1) se mata SOLO el grupo de procesos del
+  backend de A dentro de la TUI — B sigue y completa, A termina failed sin
+  checkpoint; (2) SIGKILL del proceso TUI COMPLETO — ahí AMBOS runs quedan sin
+  supervisor (los supervisores eran hilos del mismo proceso) y la
+  reconciliación S0 los resuelve. **No se afirma que B sobreviva al SIGKILL
+  del proceso completo.**
+- **Crash de supervisor ≠ falla de backend**: un crash (G2a) es la muerte del
+  proceso que supervisa; una falla de backend (G2b-1) es la muerte del grupo
+  del agente con el supervisor vivo.
+
+Hermes (G8): la TUI mantiene **1 Hermes real por vez** (rechazo visible).
+Concurrencia con **mock verificada**; sesiones ACP reales concurrentes **NO
+verificadas**; aislamiento de estado por `HERMES_HOME` verificado en S1;
+aislamiento de credenciales del host **no garantizado**; onboarding
+multi-perfil **no implementado**. `engine.session` reporta
+`attempted/accepted/verified`; en v0 `verified=false` y **no se afirma**
+restauración de contexto ni recuperación de ediciones no capturadas.
+
+Mediciones G7 (build debug, escenario real de 2 runs): startup con historia
+~100 ms; TUI 10.3 MB; mocks 5.7 MB c/u; combinado 21.7 MB; latencia de
+consultas ≤6 ms. `make budget` (p95 12.7 ms, idle 7.1 MB, delta 0.79 MiB,
+binario 5.6 MB) y `make budget-scale` (5 runs: app 10.0 MB, total 31.4 MB) en
+verde. Los mocks NO son Hermes.
 
 ## 3. Gates de aceptación
 
