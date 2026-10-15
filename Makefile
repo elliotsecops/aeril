@@ -4,8 +4,9 @@
 #   binario ≤ 30 MB (decimal) · RSS idle ≤ 50 MB · arranque p95 ≤ 300 ms
 #   (entrada procesada, medido desde fuera del proceso).
 # `make budget` corre los presupuestos controlables en esta máquina.
-# `budget-scale` (5 agentes) NO se puede verificar en Fase 0: reporta
-# UNVERIFIED y falla a propósito hasta que exista la medición real.
+# `budget-scale` mide 5 runs mock concurrentes (app ≤ 500 MB; agentes y total
+# aparte; NO prueba Hermes real). `budget-two` (S6) mide el escenario real de
+# 2 runs: RSS de TUI/mocks, arranque con runs activos y latencia de consultas.
 
 CARGO ?= cargo
 PYTHON ?= python3
@@ -15,7 +16,7 @@ BENCH_DIR := $(DATA_DIR)/bench
 JOBS ?= 2
 
 .PHONY: all build test fmt clippy budget budget-size budget-deps \
-        budget-mem budget-start budget-scale clean
+        budget-mem budget-start budget-scale budget-two clean
 
 all: build
 
@@ -59,6 +60,15 @@ budget-start: $(BIN) bench-seed
 	@$(PYTHON) scripts/bench/startup.py --bin $(BIN) --data-dir $(BENCH_DIR) \
 		--runs 30 --json > $(DATA_DIR)/start.json
 	@cat $(DATA_DIR)/start.json
+
+# Escenario real de 2 runs mock concurrentes (S6 §3): RSS de la TUI, RSS de
+# cada backend mock por separado, arranque de una TUI con 2 runs activos y
+# latencia de consultas. Data dir DESCARTABLE: se recrea en cada corrida.
+# NO prueba Hermes real (los mocks no son Hermes).
+budget-two: $(BIN)
+	@$(PYTHON) scripts/bench/two_run.py --bin $(BIN) --data-dir $(DATA_DIR)/two-run \
+		--json > $(DATA_DIR)/two_run.json
+	@cat $(DATA_DIR)/two_run.json
 
 # 5 agentes: gate de la APP ≤ 500 MB con runs mock concurrentes; agentes y
 # total medidos aparte. NO prueba Hermes real (perfil compartido, no medible).
