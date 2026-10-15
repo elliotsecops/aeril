@@ -160,14 +160,27 @@ def capture_identity(pid, expected_start=None, require_mock=True):
 def terminate_verified(candidate):
     """Señala SIGKILL SOLO si la identidad se verifica (starttime + mock).
 
-    Usa pidfd como handle estable: verificación → pidfd_open → re-verificación
-    → señal por pidfd (cierra la carrera de reutilización de PID entre la
-    verificación y el envío). Sin pidfd disponible, cae a verificar-y-kill
-    inmediato (ventana residual mínima, documentada). Nunca señala PIDs no
-    verificados.
+    S6-R2: exige un starttime ORIGINAL registrado, válido y positivo ANTES de
+    intentar cualquier señal. Si falta (missing/None/0/inválido) se devuelve
+    `uncertain` sin llamar a os.kill/pidfd_open/pidfd_send_signal: la identidad
+    original no se puede verificar y JAMÁS se infiere del proceso vivo para
+    autorizar la terminación.
+
+    Con starttime válido usa pidfd como handle estable: verificación →
+    pidfd_open → re-verificación → señal por pidfd (cierra la carrera de
+    reutilización de PID entre la verificación y el envío). Sin pidfd
+    disponible, cae a verificar-y-kill inmediato (ventana residual mínima,
+    documentada). Nunca señala PIDs no verificados.
     """
     pid = candidate["pid"]
     expected = candidate.get("starttime")
+    if not isinstance(expected, int) or isinstance(expected, bool) or expected <= 0:
+        return {
+            "pid": pid,
+            "result": "uncertain",
+            "reason": "sin starttime original registrado (missing/None/0): "
+            "la identidad del proceso no es verificable; no se señaliza",
+        }
     if not os.path.exists(f"/proc/{pid}"):
         return {"pid": pid, "result": "already_dead"}
     if capture_identity(pid, expected_start=expected) is None:
