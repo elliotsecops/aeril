@@ -1,6 +1,6 @@
 # Fase 1 — Plan de ingeniería (aprobado 2026-10-14)
 
-> Baseline: `main @ b63f582` · **S0 integrado y aceptado** (PASS S0-R1, `e38a7d4` en main) · **S1 CONDITIONAL — single-Hermes sigue siendo el default soportado** (`docs/phase1-s1-hermes-isolation.md`) · **S2 integrado** (PASS de auditoría independiente; `b63f582` en main) · **S3 implementado** (`b3cbcf1ec932ae44a055e007c10e23236a3a7c70`).
+> Baseline: `main @ 99d2f7b` · **S0 integrado y aceptado** (PASS S0-R1, `e38a7d4` en main) · **S1 CONDITIONAL — single-Hermes sigue siendo el default soportado** (`docs/phase1-s1-hermes-isolation.md`) · **S2 integrado** (PASS de auditoría independiente; `b63f582` en main) · **S3 integrado** (CONDITIONAL PASS de auditoría independiente; `99d2f7b` en main) · **S4 implementado** (`60921bc5e01e7ae1c90dbe47336184fcf4473d6a`).
 > Objetivo: **dos agentes concurrentes** (dos threads, mismo repo, un workspace verificado
 > cada uno) con estado durable, revisión independiente y recuperación segura.
 > Toda la validación primaria es **mock determinista**; Hermes real en paralelo queda
@@ -43,10 +43,45 @@ restringe procesos externos. Se documentará en la UI/CLI y en `docs/phase1-*`.
 | **S0** | **Reconciliación durable de runs interrumpidos** | `run.ended failed/interrupted` idempotente al reabrir; evidencia de supervisor y backend; gate de reuso conservador | ✅ **integrado y aceptado** (`e38a7d4` en main; +7 tests S0 y suite de seguridad R1) |
 | S1 | Spike de aislamiento de perfiles de Hermes | Informe con evidencia (`HERMES_HOME`, state.db/installs/locks por perfil, kill aislado, credenciales) | ✅ **CONDITIONAL**: estado aislado verificado; sesiones reales y credenciales por perfil pendientes ⇒ single-Hermes default (`docs/phase1-s1-hermes-isolation.md`) |
 | S2 | Estado de runs activos | `aeril run list [--active] [--limit]`: supervisor (alive/dead/unknown) + lease (owned/missing/held_by_other) + status efectivo; solo lectura, sin migraciones | ✅ **integrado** (`b63f582`; 8 tests S2; suite 83/83; make budget sin cambios) |
-| S3 | TUI concurrente (2 runs, cancelar por run) | `n` nuevo run en el thread abierto; slots por invocación (N=2, 1/thread, Hermes real 1/vez); `x` cancela solo el thread seleccionado y el slot se libera únicamente con el ack terminal; `q` bloqueado con runs vivos; mismo panel único; harness PTY solo para tests | ✅ `b3cbcf1ec932ae44a055e007c10e23236a3a7c70` (9 tests T1–T9; suite 92/92; budget PASS; escala 5 runs app 9.7 MB) |
-| S4 | `workspace list` + ciclo de vida | CLI + tests | pendiente |
+| S3 | TUI concurrente (2 runs, cancelar por run) | `n` nuevo run en el thread abierto; slots por invocación (N=2, 1/thread, Hermes real 1/vez); `x` cancela solo el thread seleccionado y el slot se libera únicamente con el ack terminal; `q` bloqueado con runs vivos; mismo panel único; harness PTY solo para tests | ✅ **integrado y aceptado** (CONDITIONAL PASS; `99d2f7b` en main; 9 tests T1–T9) |
+| S4 | `workspace list` + ciclo de vida | `workspace list [--thread T] [--limit N]` (solo lectura, dedupe por workspace, estados y elegibilidad de reuso) + guard de `worktree rm` (lease vivo RC2.1; `--unsafe-ok` explícito) + rehidratación verificada | ✅ `60921bc5e01e7ae1c90dbe47336184fcf4473d6a` (11 tests S4; suite 103/103; budget PASS) |
 | S5 | E2E de concurrencia (mock) | `tests/phase1_concurrency.rs` (G1–G7, G9) | pendiente |
 | S6 | Presupuestos + docs de fase | `make budget*` extendido, `docs/phase1-status.md` | pendiente |
+
+### S4 — Semántica de `workspace list` y borrado seguro
+
+- **Inspección read-only.** `aeril workspace list [--thread T] [--limit N]` agrega el
+  run más reciente por `workspace_id` (dedupe: un workspace reutilizado por varios
+  runs aparece UNA vez) y reutiliza la verificación de worktree (git), los
+  clasificadores supervisor/lease de S0/S2 y el veredicto de reuso S0. No
+  reconcilia, no crea worktrees y no toca el filesystem ni la DB.
+- **Estados (`status`) con precedencia documentada**: `repo_unavailable`
+  (diagnóstico por workspace si el repo no abre) → `unsafe_for_reuse` (evento
+  durable `workspace.recovery_unsafe`; nunca se olvida, D4) → `verified_leased`
+  (lease con dueño vivo y worktree ok) → `stale_or_uncertain` (run sin resolver
+  sin lease vivo) → `missing_worktree` / `invalid_worktree` (invalid|mismatched) →
+  `unsafe_for_reuse` (veredicto S0 bloqueado) → `verified_available`.
+  `reuse.eligible` combina worktree utilizable + veredicto S0 + ausencia de lease
+  vivo; `reuse.reason` explica el motivo.
+- **Worktree ausente ≠ snapshot ausente.** Los checkpoints viven en eventos +
+  refs por OID y sobreviven al borrado del worktree; `workspace list` reporta el
+  worktree, no la memoria de revisión.
+- **Borrado.** `aeril worktree rm --thread T [--unsafe-ok]`: un lease con dueño
+  vivo bloquea SIEMPRE (RC2.1; `--force` no lo desplaza y el mensaje ya no lo
+  sugiere como bypass: hay que terminar y verificar el proceso). Sin dueño vivo,
+  el veredicto S0 decide: bloqueado ⇒ el borrado exige `--unsafe-ok` (acción
+  explícita; no se tocan checkpoints, refs, ramas ni comentarios). Aeril solo
+  puede verificar procesos del grupo que él creó; no se declara verificación de
+  procesos fuera de esa frontera.
+- **Rehidratación.** Con el worktree borrado, un feedback sobre un snapshot
+  `ready` recrea el worktree en el OID del snapshot (evento `workspace.recreated`)
+  y lo registra; la sesión del motor se reporta aparte (`attempted/accepted`). No
+  se afirma restauración de contexto del motor ni recuperación de ediciones no
+  capturadas.
+- **Follow-up S3 (no bloqueante, fuera del alcance de S4)**: (a) `catch_unwind`
+  solo cubre el cierre del runner, no panics en el resto de la TUI; (b) no se
+  endureció el panic hook: un panic del runner puede ensuciar el frame del PTY
+  hasta el próximo redraw. Se registran como trabajo futuro; no son gates de S4.
 
 ## 3. Gates de aceptación
 
