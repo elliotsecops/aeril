@@ -149,6 +149,7 @@ fn dispatch(args: &[String], t0: Instant) -> Result<i32> {
         Some("recover") => cmd_recover(&p, &db_path),
         Some("lease") => cmd_lease(&p, &db_path),
         Some("worktree") => cmd_worktree(&p, &data_dir, &db_path),
+        Some("workspace") => cmd_workspace(&p, &data_dir, &db_path),
         Some("integrate") => cmd_integrate(&p, &db_path),
         Some("validate") => cmd_validate(&p, &data_dir, &db_path),
         Some("export") => cmd_export(&p, &db_path),
@@ -717,10 +718,167 @@ fn cmd_recover(_p: &Parsed, db_path: &Path) -> Result<i32> {
 
 // ── worktree ─────────────────────────────────────────────────────────────────
 
+// ── workspace ────────────────────────────────────────────────────────────────
+
+/// Vista de solo lectura de un workspace (S4). Reutiliza los clasificadores
+/// existentes: verificación de worktree (git), supervisor/liveness (S0/S2) y
+/// el veredicto de reuso (S0). Nunca muta: ni DB, ni filesystem, ni leases.
+fn workspace_view(store: &Store, data_dir: &Path, w: &runs::WorkspaceRow) -> Result<Value> {
+    use crate::recovery::{LivenessView, ReuseVerdict};
+    let ws = &w.workspace_id;
+
+    let run = runs::get(&store.conn, &w.thread_id, &w.latest_run_id)?
+        .ok_or_else(|| Error::integrity(format!("run {} no encontrado", w.latest_run_id)))?;
+    let supervisor = crate::recovery::supervisor_view(&store.conn, &run)?;
+    let sup_status = match supervisor.liveness {
+        LivenessView::Alive => "alive",
+        LivenessView::Dead => "dead",
+        LivenessView::Unknown => "unknown",
+    };
+
+    let lease = crate::store::leases::get(&store.conn, ws)?;
+    let lease_live = lease
+        .as_ref()
+        .map(crate::store::leases::owner_alive)
+        .unwrap_or(false);
+    let lease_json = match &lease {
+        Some(info) => json!({
+            "run_id": info.run_id,
+            "pid": info.pid,
+            "owner_alive": crate::store::leases::owner_alive(info),
+        }),
+        None => Value::Null,
+    };
+
+    let unsafe_note = crate::recovery::workspace_recovery_unsafe(&store.conn, ws)?;
+
+    // Verificación del worktree. Si el repo no abre: diagnóstico por workspace
+    // (jamás se declara válido en silencio).
+    let repo_path = w.repo_path.clone().unwrap_or_default();
+    let expected_path = git::worktree::path_for(data_dir, ws);
+    let (wt_status, wt_detail) = match git::open(Path::new(&repo_path)) {
+        Err(e) => (
+            "repo_unavailable".to_string(),
+            format!("no se pudo abrir el repo {repo_path}: {e}"),
+        ),
+        Ok(repo) => match &w.base_oid {
+            None => (
+                "invalid".to_string(),
+                "el run no registra base_oid".to_string(),
+            ),
+            Some(base) => match git::worktree::verify(&repo, data_dir, ws, base) {
+                git::worktree::VerifyOutcome::Ok => ("ok".to_string(), String::new()),
+                git::worktree::VerifyOutcome::Missing => (
+                    "missing".to_string(),
+                    "worktree no registrado (¿borrado o nunca creado?)".to_string(),
+                ),
+                git::worktree::VerifyOutcome::Invalid(d) => ("invalid".to_string(), d),
+                git::worktree::VerifyOutcome::Mismatched(d) => ("mismatched".to_string(), d),
+            },
+        },
+    };
+
+    // Elegibilidad de reuso = veredicto S0 + worktree utilizable + sin lease vivo.
+    let verdict = crate::recovery::workspace_reuse_verdict(&store.conn, ws)?;
+    let (mut eligible, mut reuse_reason) = match (&wt_status[..], verdict) {
+        ("ok", ReuseVerdict::Safe) => (true, String::new()),
+        ("ok", ReuseVerdict::Blocked(reason)) => (false, reason),
+        (status, _) => (
+            false,
+            format!("worktree no utilizable ({status}): {wt_detail}"),
+        ),
+    };
+    if eligible
+        && lease_live
+        && let Some(info) = &lease
+    {
+        eligible = false;
+        reuse_reason = format!(
+            "lease vivo (run {}, pid {}): no se reutiliza mientras el dueño siga vivo",
+            info.run_id, info.pid
+        );
+    }
+
+    // Estado operativo (precedencia: seguridad > uso > presencia > disponibilidad).
+    let wt_label = match wt_status.as_str() {
+        "missing" => Some("missing_worktree"),
+        "invalid" | "mismatched" => Some("invalid_worktree"),
+        _ => None,
+    };
+    let unresolved = run.state == "starting" || run.state == "running";
+    let status: &str = if wt_status == "repo_unavailable" {
+        "repo_unavailable"
+    } else if unsafe_note.is_some() {
+        "unsafe_for_reuse"
+    } else if lease_live && wt_status == "ok" {
+        "verified_leased"
+    } else if unresolved && !lease_live {
+        "stale_or_uncertain"
+    } else if let Some(label) = wt_label {
+        label
+    } else if !eligible {
+        "unsafe_for_reuse"
+    } else {
+        "verified_available"
+    };
+
+    Ok(json!({
+        "workspace_id": ws,
+        "thread_id": w.thread_id,
+        "latest_run_id": w.latest_run_id,
+        "latest_run_state": run.state,
+        "repo_path": repo_path,
+        "worktree_path": w
+            .worktree_path
+            .clone()
+            .unwrap_or_else(|| expected_path.to_string_lossy().into_owned()),
+        "expected_worktree_path": expected_path.to_string_lossy(),
+        "branch": w.branch,
+        "base_oid": w.base_oid,
+        "worktree": {"status": wt_status, "detail": wt_detail},
+        "lease": lease_json,
+        "supervisor": {"status": sup_status, "detail": supervisor.detail},
+        "recovery_unsafe": unsafe_note.is_some(),
+        "recovery_unsafe_detail": unsafe_note.as_ref().map(|n| n.detail.clone()),
+        "reuse": {"eligible": eligible, "reason": reuse_reason},
+        "status": status,
+        "started_ms": w.started_ms,
+        "ended_ms": w.ended_ms,
+    }))
+}
+
+fn cmd_workspace(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
+    match p.pos.get(1).map(String::as_str) {
+        Some("list") => {
+            let thread_filter = p.flag("thread");
+            let limit: i64 = p
+                .flag("limit")
+                .map(|v| v.parse())
+                .transpose()
+                .map_err(|_| Error::invalid("--limit inválido"))?
+                .unwrap_or(100);
+            let store = open_store(db_path)?;
+            // SOLO LECTURA: no se reconcilia, no se toca el filesystem y no se
+            // crean worktrees durante una consulta.
+            let rows = runs::workspaces_latest(&store.conn, thread_filter.as_deref(), limit)?;
+            let arr: Vec<Value> = rows
+                .iter()
+                .map(|w| workspace_view(&store, data_dir, w))
+                .collect::<Result<_>>()?;
+            print_json(&Value::Array(arr))?;
+            Ok(0)
+        }
+        other => Err(Error::invalid(format!(
+            "workspace {other:?} no soportado (list [--thread T] [--limit N])"
+        ))),
+    }
+}
+
 fn cmd_worktree(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
     match p.pos.get(1).map(String::as_str) {
         Some("rm") => {
             let thread_id = p.require("thread")?;
+            let unsafe_ok = p.yes("unsafe-ok");
             let store = open_store(db_path)?;
             let row = threads::get(&store.conn, &thread_id)?
                 .ok_or_else(|| Error::not_found(format!("thread {thread_id}")))?;
@@ -730,17 +888,33 @@ fn cmd_worktree(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                 .workspace_id
                 .ok_or_else(|| Error::invalid("el run no tiene workspace"))?;
             if let Some(info) = crate::store::leases::active(&store.conn, &ws)? {
+                // RC2.1: un dueño VIVO no se desplaza jamás; `--force` no pisa
+                // leases vivos. La única vía es terminar y verificar el proceso.
                 return Err(Error::conflict(format!(
-                    "el workspace {ws} tiene un run activo (run {}, pid {}): el proceso dueño sigue vivo; no se borra el worktree en uso; si el proceso debe detenerse, usá `aeril lease release {ws} --force`",
-                    info.run_id, info.pid
+                    "el workspace {ws} tiene un run activo (run {}, pid {}): el proceso dueño sigue vivo y su lease NO se libera, ni con `--force` (RC2.1). No se borra un worktree en uso. Terminá el proceso dueño (cierre normal, SIGTERM o SIGKILL), verificá su muerte (p. ej. `ps -p {}`) y reintentá",
+                    info.run_id, info.pid, info.pid
+                )));
+            }
+            // S4: sin dueño vivo todavía puede haber un backend atribuible vivo
+            // (p. ej. supervisor muerto y backend huérfano) o evidencia no
+            // verificable. El veredicto S0 de reuso decide; borrar exige acción
+            // explícita del usuario cuando está bloqueado.
+            if !unsafe_ok
+                && let crate::recovery::ReuseVerdict::Blocked(reason) =
+                    crate::recovery::workspace_reuse_verdict(&store.conn, &ws)?
+            {
+                return Err(Error::conflict(format!(
+                    "el workspace {ws} no es seguro para borrar: {reason}. Aeril solo verifica procesos del grupo que él creó; si comprobaste manualmente que no queda ningún backend escribiendo en el worktree, repetí con `--unsafe-ok` (acción explícita; no se tocan checkpoints, refs ni comentarios)"
                 )));
             }
             let repo = git::open(Path::new(&row.repo_path))?;
             git::worktree::remove(&repo, data_dir, &ws)?;
-            print_json(&json!({"removed": true, "workspace_id": ws}))?;
+            print_json(&json!({"removed": true, "workspace_id": ws, "unsafe_ok": unsafe_ok}))?;
             Ok(0)
         }
-        other => Err(Error::invalid(format!("worktree {other:?} no soportado"))),
+        other => Err(Error::invalid(format!(
+            "worktree {other:?} no soportado (rm --thread T [--unsafe-ok])"
+        ))),
     }
 }
 

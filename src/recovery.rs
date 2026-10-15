@@ -644,6 +644,33 @@ pub fn effective_status(run: &RunRow, supervisor: &SupervisorView) -> &'static s
     }
 }
 
+/// Nota durable `workspace.recovery_unsafe` más reciente de un workspace
+/// (S4): si existe, el workspace NUNCA se reutiliza automáticamente (D4).
+/// Devuelve el payload para poder mostrar el detalle en diagnósticos.
+pub fn workspace_recovery_unsafe(
+    conn: &Connection,
+    workspace_id: &str,
+) -> Result<Option<events::payload::WorkspaceRecoveryUnsafe>> {
+    let mut stmt = conn.prepare(
+        "SELECT payload FROM events WHERE kind = ?1
+           AND json_extract(payload, '$.workspace_id') = ?2
+         ORDER BY created_ms DESC, id DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(
+        params![events::K_WORKSPACE_RECOVERY_UNSAFE, workspace_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    match rows.next() {
+        Some(payload_text) => {
+            let payload_text = payload_text?;
+            Ok(Some(serde_json::from_str(&payload_text).map_err(|e| {
+                crate::error::Error::integrity(format!("payload de {workspace_id} ilegible: {e}"))
+            })?))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Gate de reuso (Runner): ¿es seguro reutilizar este workspace?
 ///
 /// - estado `workspace.recovery_unsafe` previo → Blocked SIEMPRE: la

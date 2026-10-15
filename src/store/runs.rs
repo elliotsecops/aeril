@@ -148,6 +148,56 @@ pub fn list_recent(conn: &Connection, active_only: bool, limit: i64) -> Result<V
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Fila agregada por workspace para `workspace list` (S4): el run más
+/// reciente de cada `workspace_id` (dedupe; un workspace reutilizado por
+/// varios runs aparece UNA vez). Solo lectura.
+#[derive(Debug, Clone)]
+pub struct WorkspaceRow {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub latest_run_id: String,
+    pub repo_path: Option<String>,
+    pub worktree_path: Option<String>,
+    pub branch: Option<String>,
+    pub base_oid: Option<String>,
+    pub state: String,
+    pub started_ms: i64,
+    pub ended_ms: Option<i64>,
+}
+
+pub fn workspaces_latest(
+    conn: &Connection,
+    thread_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<WorkspaceRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.workspace_id, r.thread_id, r.id, r.repo_path, r.worktree_path, r.branch,
+                r.base_oid, r.state, r.started_ms, r.ended_ms
+         FROM runs r
+         WHERE r.workspace_id IS NOT NULL
+           AND r.id = (SELECT r2.id FROM runs r2 WHERE r2.workspace_id = r.workspace_id
+                       ORDER BY r2.started_ms DESC, r2.id DESC LIMIT 1)
+           AND (?1 IS NULL OR r.thread_id = ?1)
+         ORDER BY r.started_ms DESC, r.id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![thread_id, limit.max(1)], |row| {
+        Ok(WorkspaceRow {
+            workspace_id: row.get(0)?,
+            thread_id: row.get(1)?,
+            latest_run_id: row.get(2)?,
+            repo_path: row.get(3)?,
+            worktree_path: row.get(4)?,
+            branch: row.get(5)?,
+            base_oid: row.get(6)?,
+            state: row.get(7)?,
+            started_ms: row.get(8)?,
+            ended_ms: row.get(9)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn list(conn: &Connection, thread_id: &str) -> Result<Vec<RunRow>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM runs WHERE thread_id = ?1 ORDER BY started_ms ASC, id ASC"
