@@ -874,6 +874,29 @@ fn cmd_workspace(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
     }
 }
 
+/// Barrera de sincronización SOLO PARA TESTS (no existe en release: se
+/// compila fuera con `cfg(not(debug_assertions))`). Si la env
+/// `AERIL_TEST_RM_BARRIER_*` apunta a un directorio, escribe `<dir>/ready` y
+/// espera `<dir>/go` (máx. 30 s). Sin la env no hace absolutamente nada.
+fn test_rm_barrier(name: &str) {
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = name;
+    }
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(dir) = std::env::var(name) {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::write(dir.join("ready"), b"1");
+            let go = dir.join("go");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !go.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 fn cmd_worktree(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
     match p.pos.get(1).map(String::as_str) {
         Some("rm") => {
@@ -895,6 +918,7 @@ fn cmd_worktree(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                     info.run_id, info.pid, info.pid
                 )));
             }
+            test_rm_barrier("AERIL_TEST_RM_BARRIER_PRE_TX");
             // S4: sin dueño vivo todavía puede haber un backend atribuible vivo
             // (p. ej. supervisor muerto y backend huérfano) o evidencia no
             // verificable. El veredicto S0 de reuso decide; borrar exige acción
@@ -908,6 +932,7 @@ fn cmd_worktree(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                 )));
             }
             let repo = git::open(Path::new(&row.repo_path))?;
+            test_rm_barrier("AERIL_TEST_RM_BARRIER_IN_TX");
             git::worktree::remove(&repo, data_dir, &ws)?;
             print_json(&json!({"removed": true, "workspace_id": ws, "unsafe_ok": unsafe_ok}))?;
             Ok(0)
