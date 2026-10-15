@@ -64,6 +64,20 @@ fn send(v: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Fixture S5: expande `{cwd_basename}` al nombre del directorio de sesión.
+/// Los tests de concurrencia obtienen así contenido único por worktree (el
+/// basename del worktree ES el workspace_id) sin ningún cambio de producto.
+fn expand_cwd_placeholders(content: &str, cwd: &Path) -> String {
+    if !content.contains("{cwd_basename}") {
+        return content.to_string();
+    }
+    let base = cwd
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    content.replace("{cwd_basename}", &base)
+}
+
 fn safe_join(cwd: &Path, rel: &str) -> Result<PathBuf> {
     if rel.is_empty() || Path::new(rel).is_absolute() || rel.split('/').any(|c| c == "..") {
         return Err(Error::invalid(format!(
@@ -307,13 +321,14 @@ fn run_turn(
         }
 
         if allowed {
+            let content = expand_cwd_placeholders(&edit.content, cwd);
             match edit.op.as_str() {
                 "write" => {
                     let path = safe_join(cwd, &edit.path)?;
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::write(&path, &edit.content)?;
+                    std::fs::write(&path, &content)?;
                 }
                 "append" => {
                     let path = safe_join(cwd, &edit.path)?;
@@ -321,7 +336,7 @@ fn run_turn(
                         .create(true)
                         .append(true)
                         .open(&path)?;
-                    f.write_all(edit.content.as_bytes())?;
+                    f.write_all(content.as_bytes())?;
                 }
                 other => {
                     return Err(Error::invalid(format!(

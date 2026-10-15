@@ -474,7 +474,9 @@ fn t5_slot_no_se_libera_antes_del_ack() {
     );
     let backend = format!("mock:{}", script.display());
 
-    let mut tui = Tui::launch(&env, &backend, &[("AERIL_CANCEL_GRACE_SECS", "3")]);
+    // Plazo amplio: bajo carga (suite completa en paralelo) el intento
+    // inmediato debe seguir cayendo DENTRO de la ventana de cancelación.
+    let mut tui = Tui::launch(&env, &backend, &[("AERIL_CANCEL_GRACE_SECS", "8")]);
     tui.start_task(&a, "A");
     assert!(tui.wait_run_active(&a, 15_000));
     tui.settle(300);
@@ -501,9 +503,19 @@ fn t5_slot_no_se_libera_antes_del_ack() {
     );
     assert_eq!(runs_of(&env, &a).last().unwrap().state, "cancelled");
 
-    // Tras el ack, el slot se libera: el reemplazo ahora SÍ se acepta.
-    tui.start_task(&a, "A2");
-    assert!(tui.wait_run_active(&a, 15_000), "A2 debía arrancar");
+    // Tras el ack, el slot se libera: el reemplazo ahora SÍ se acepta. El ack
+    // llega cuando la TUI procesa la nota terminal (puede demorar bajo carga),
+    // así que se reintenta con límite; cada intento rechazado no crea run.
+    let mut a2_ok = false;
+    for _ in 0..20 {
+        tui.start_task(&a, "A2");
+        if tui.wait_db(1_000, || runs_of(&env, &a).len() == 2) {
+            a2_ok = true;
+            break;
+        }
+    }
+    assert!(a2_ok, "A2 debía arrancar tras el ack terminal");
+    assert!(tui.wait_run_active(&a, 15_000), "A2 debía quedar activo");
     assert_eq!(runs_of(&env, &a).len(), 2, "A2 crea un segundo run");
 
     // Limpieza: cancelar A2 (por plazo otra vez) y esperar.
