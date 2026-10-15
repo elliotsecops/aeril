@@ -66,6 +66,7 @@ budget-start: $(BIN) bench-seed
 # latencia de consultas. Data dir DESCARTABLE: se recrea en cada corrida.
 # NO prueba Hermes real (los mocks no son Hermes).
 budget-two: $(BIN)
+	@mkdir -p $(DATA_DIR)
 	@$(PYTHON) scripts/bench/two_run.py --bin $(BIN) --data-dir $(DATA_DIR)/two-run \
 		--json > $(DATA_DIR)/two_run.json
 	@cat $(DATA_DIR)/two_run.json
@@ -73,6 +74,7 @@ budget-two: $(BIN)
 # 5 agentes: gate de la APP ≤ 500 MB con runs mock concurrentes; agentes y
 # total medidos aparte. NO prueba Hermes real (perfil compartido, no medible).
 budget-scale: $(BIN)
+	@mkdir -p $(DATA_DIR)
 	@$(BIN) bench scale --runs 5 --delay-ms 6000 --data-dir $(DATA_DIR)/scale-data > $(DATA_DIR)/scale.json
 	@cat $(DATA_DIR)/scale.json
 

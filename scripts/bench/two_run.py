@@ -11,14 +11,33 @@ S6 §3: reproduce el escenario de G1 con el binario release y reporta:
 - Latencia de consultas (`run list --active`, `workspace list`).
 - Condiciones del host (CPU/RAM/fstype del data dir).
 
+S6-R1 (seguridad y reproducibilidad):
+- Ciclo de vida SEGURO del data dir: solo se limpia un directorio que lleva el
+  sentinel `.aeril-bench-two-run` (propiedad establecida por una corrida
+  previa); un directorio ajeno se rechaza sin tocarlo. Targets inseguros
+  (raíz, home, ancestros del checkout, directorios del sistema, symlinks)
+  se rechazan.
+- Limpieza de backends con IDENTIDAD: los PIDs se asocian a los runs de ESTA
+  invocación, se verifica `/proc/<pid>/stat` starttime + cmdline (`__mock-agent`)
+  antes de señalar, y se señaliza por `pidfd` (Python ≥3.9 con
+  `signal.pidfd_send_signal`) para cerrar la carrera de reutilización de PID.
+  Identidad no verificable ⇒ NO se señala (fail-closed) y se reporta.
+- Validación de integridad: `"ok": true` exige exactamente 2 runs activos en
+  workspaces distintos, 2 backends vivos con identidad verificada, TUI viva y
+  RSS válidos (nunca ceros silenciosos).
+
 Método: pty real + beacons + lectura del store con sqlite3 (stdlib). El data
-dir es DESCARTABLE: se recrea en cada corrida.
+dir es DESCARTABLE (se recrea solo si el sentinel lo acredita).
 
 Uso:
   two_run.py --bin target/release/aeril --data-dir bench-data/two-run [--json]
+
+Códigos de salida: 0 ok · 1 medición inválida · 2 rechazo de seguridad del
+data dir · 3 ok con incertidumbre de limpieza (backends no verificables).
 """
 
 import argparse
+import hashlib
 import json
 import os
 import pty
@@ -29,10 +48,158 @@ import subprocess
 import sys
 import time
 
+SENTINEL = ".aeril-bench-two-run"
+SYSTEM_DENY = (
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/boot",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/run",
+    "/var",
+)
+
 KEY_ESC = b"\x1b"
 KEY_DOWN = b"\x1b[B"
 KEY_UP = b"\x1b[A"
 KEY_ENTER = b"\r"
+
+
+def refuse(msg):
+    print(f"two_run: RECHAZADO: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+# ── ciclo de vida seguro del data dir (finding A) ───────────────────────────
+
+
+def safe_prepare_data_dir(raw):
+    """Prepara el data dir del benchmark. Solo borra directorios acreditados
+    por el sentinel; cualquier otro existente se rechaza sin tocarlo."""
+    abs_path = os.path.abspath(raw)
+    if os.path.islink(abs_path):
+        refuse(f"el target es un symlink: {abs_path}")
+    p = os.path.realpath(abs_path)
+    home = os.path.realpath(os.path.expanduser("~"))
+    cwd = os.path.realpath(os.getcwd())
+    if p == os.sep or p == home:
+        refuse(f"target inseguro (raíz o home): {p}")
+    if p == cwd or cwd.startswith(p + os.sep):
+        refuse(f"el target contiene el checkout: {p}")
+    if p in SYSTEM_DENY or any(p.startswith(d + os.sep) for d in SYSTEM_DENY):
+        refuse(f"target dentro de un directorio del sistema: {p}")
+    if len([c for c in p.split(os.sep) if c]) < 2:
+        refuse(f"target demasiado superficial para ser descartable: {p}")
+    if os.path.exists(p):
+        if not os.path.isdir(p):
+            refuse(f"el target existe y no es un directorio: {p}")
+        if not os.path.exists(os.path.join(p, SENTINEL)):
+            refuse(
+                f"el directorio existe y NO lleva el sentinel {SENTINEL} "
+                f"(no pertenece a este benchmark): {p}; no se borra ni se "
+                f"sobreescribe. Usá otro --data-dir o removelo manualmente."
+            )
+        shutil.rmtree(p)
+    os.makedirs(p)
+    with open(os.path.join(p, SENTINEL), "w") as f:
+        f.write(f"aeril bench two-run\nowner_pid={os.getpid()}\ncreated_ms={int(time.time()*1000)}\n")
+    return p
+
+
+# ── identidad de procesos (finding B) ───────────────────────────────────────
+
+
+def read_starttime(pid):
+    """Campo 22 de /proc/<pid>/stat (starttime en ticks). None si no se puede."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+        tail = data[data.rfind(b")") + 2 :].split()
+        return int(tail[19])  # estado = campo 3 ⇒ starttime = índice 19
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def read_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        return None
+
+
+def read_exe(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+
+
+def capture_identity(pid, expected_start=None, require_mock=True):
+    """Identidad verificable AHORA: starttime + cmdline (+ exe informativo).
+
+    Devuelve None si el proceso no existe, no se puede leer, no es un mock
+    (`__mock-agent` ausente) o el starttime no coincide con el esperado.
+    """
+    start = read_starttime(pid)
+    cmd = read_cmdline(pid)
+    if start is None or cmd is None:
+        return None
+    if require_mock and "__mock-agent" not in cmd:
+        return None
+    if expected_start is not None and start != expected_start:
+        return None
+    return {"pid": pid, "starttime": start, "cmdline": cmd, "exe": read_exe(pid)}
+
+
+def terminate_verified(candidate):
+    """Señala SIGKILL SOLO si la identidad se verifica (starttime + mock).
+
+    Usa pidfd como handle estable: verificación → pidfd_open → re-verificación
+    → señal por pidfd (cierra la carrera de reutilización de PID entre la
+    verificación y el envío). Sin pidfd disponible, cae a verificar-y-kill
+    inmediato (ventana residual mínima, documentada). Nunca señala PIDs no
+    verificados.
+    """
+    pid = candidate["pid"]
+    expected = candidate.get("starttime")
+    if not os.path.exists(f"/proc/{pid}"):
+        return {"pid": pid, "result": "already_dead"}
+    if capture_identity(pid, expected_start=expected) is None:
+        return {
+            "pid": pid,
+            "result": "uncertain",
+            "reason": "identidad no verificable (starttime/cmdline no coinciden)",
+        }
+    fd = None
+    try:
+        if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+            fd = os.pidfd_open(pid, 0)
+            if capture_identity(pid, expected_start=expected) is None:
+                return {
+                    "pid": pid,
+                    "result": "uncertain",
+                    "reason": "identidad cambió entre verificación y pidfd",
+                }
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+        return {"pid": pid, "result": "killed"}
+    except ProcessLookupError:
+        return {"pid": pid, "result": "already_dead"}
+    except OSError as e:
+        return {"pid": pid, "result": "uncertain", "reason": f"señal falló: {e}"}
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+# ── utilidades de medición ──────────────────────────────────────────────────
 
 
 def host_info(data_dir):
@@ -73,6 +240,17 @@ def read_rss_kb(pid):
     return None
 
 
+def sha256_of(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 def read_beacon(path):
     if not os.path.exists(path):
         return []
@@ -90,16 +268,6 @@ def drain(fd, seconds):
             except OSError:
                 return
         time.sleep(0.002)
-
-
-def wait_beacon(beacon, stage, timeout, fd):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        for line in read_beacon(beacon):
-            if line.get("stage") == stage:
-                return line
-        drain(fd, 0.05)
-    return None
 
 
 def spawn_tui(bin_path, data_dir, beacon=None, backend=None):
@@ -147,17 +315,19 @@ def runs_running(db_path):
     )
 
 
-def backend_pids(db_path):
+def backend_payloads(db_path, run_ids):
+    """Payloads `backend.spawned` de LOS runs de esta invocación (finding B#1)."""
     out = []
     for (payload,) in sql(
-        db_path, "SELECT payload FROM events WHERE kind = 'backend.spawned'"
+        db_path,
+        "SELECT payload FROM events WHERE kind = 'backend.spawned'",
     ):
         try:
             p = json.loads(payload)
-            if p.get("pid"):
-                out.append(int(p["pid"]))
         except Exception:  # noqa: BLE001
-            pass
+            continue
+        if p.get("run_id") in run_ids and p.get("pid"):
+            out.append(p)
     return out
 
 
@@ -170,6 +340,17 @@ def wait_db(fn, timeout):
     return False
 
 
+class Invalid(Exception):
+    """Medición inválida: el reporte sale con ok=false y código 1."""
+
+
+def fail(report, msg):
+    report["ok"] = False
+    report["error"] = msg
+    print(f"two_run: medición INVÁLIDA: {msg}", file=sys.stderr)
+    return report
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
@@ -177,10 +358,7 @@ def main():
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    data_dir = os.path.abspath(args.data_dir)
-    if os.path.exists(data_dir):
-        shutil.rmtree(data_dir)
-    os.makedirs(data_dir)
+    data_dir = safe_prepare_data_dir(args.data_dir)
     db_path = os.path.join(data_dir, "aeril.db")
     repo = os.path.join(data_dir, "repo")
     os.makedirs(repo)
@@ -203,12 +381,9 @@ def main():
 
     threads = {}
     for title in ("two-b", "two-a"):  # el último creado queda primero
-        out = json.loads(
-            cli("thread", "new", "--repo", repo, "--title", title).stdout
-        )
+        out = json.loads(cli("thread", "new", "--repo", repo, "--title", title).stdout)
         threads[title] = out["thread_id"]
         time.sleep(0.05)
-    order = [threads["two-a"], threads["two-b"]]
 
     script = os.path.join(data_dir, "mock.json")
     with open(script, "w") as f:
@@ -229,11 +404,24 @@ def main():
         )
     backend = f"mock:{script}"
 
-    report = {"host": host_info(data_dir), "method": "pty real + beacons + sqlite"}
-    beacon1 = os.path.join(data_dir, ".beacon-tui1")
-    pid1, fd1 = spawn_tui(args.bin, data_dir, beacon=beacon1, backend=backend)
+    report = {
+        "host": host_info(data_dir),
+        "method": "pty real + beacons + sqlite; limpieza identity-aware (pidfd)",
+        "bin_path": os.path.abspath(args.bin),
+        "bin_sha256": sha256_of(args.bin),
+    }
+    # Runs/backends de ESTA invocación (para asociación y limpieza).
+    known_run_ids = []
+    identities = {}  # pid -> identidad capturada mientras estaba vivo
+    pid1 = None
+    fd1 = None
+    cleanup = {"killed": [], "already_dead": [], "uncertain": []}
+    exit_code = 1
     try:
-        assert wait_stage(beacon1, "first_draw", 10, fd1), "TUI1 no dibujó"
+        beacon1 = os.path.join(data_dir, ".beacon-tui1")
+        pid1, fd1 = spawn_tui(args.bin, data_dir, beacon=beacon1, backend=backend)
+        if wait_stage(beacon1, "first_draw", 10, fd1) is None:
+            raise Invalid("TUI1 no dibujó el primer frame")
         # Abrir A (selección inicial) y lanzar el run.
         os.write(fd1, KEY_ENTER)
         drain(fd1, 0.2)
@@ -241,7 +429,9 @@ def main():
         drain(fd1, 0.2)
         os.write(fd1, b"tarea A")
         os.write(fd1, KEY_ENTER)
-        assert wait_db(lambda: len(runs_running(db_path)) == 1, 15), "A no arrancó"
+        if not wait_db(lambda: len(runs_running(db_path)) == 1, 15):
+            raise Invalid("el run A no arrancó")
+        known_run_ids = [r[0] for r in runs_running(db_path)]
         # Ir a B y lanzar el segundo run.
         os.write(fd1, KEY_ESC)
         drain(fd1, 0.2)
@@ -253,22 +443,58 @@ def main():
         drain(fd1, 0.2)
         os.write(fd1, b"tarea B")
         os.write(fd1, KEY_ENTER)
-        assert wait_db(lambda: len(runs_running(db_path)) == 2, 15), "B no arrancó"
+        if not wait_db(lambda: len(runs_running(db_path)) == 2, 15):
+            raise Invalid("el run B no arrancó")
+        known_run_ids = [r[0] for r in runs_running(db_path)]
         drain(fd1, 1.0)  # dejar estabilizar RSS
 
+        # ── validación de integridad (finding D) ────────────────────────────
+        runs = runs_running(db_path)
+        if len(runs) != 2:
+            raise Invalid(f"se esperaban 2 runs activos, hay {len(runs)}")
+        run_ids = [r[0] for r in runs]
+        workspaces = [r[2] for r in runs]
+        if len(set(run_ids)) != 2 or len(set(workspaces)) != 2 or None in workspaces:
+            raise Invalid(f"runs/workspaces no distintos: {runs}")
+        payloads = backend_payloads(db_path, set(run_ids))
+        pids = sorted({int(p["pid"]) for p in payloads})
+        if len(pids) != 2:
+            raise Invalid(f"se esperaban 2 backends distintos, hay {pids}")
+        for p in payloads:
+            pid = int(p["pid"])
+            expected = int(p.get("pid_start") or 0) or None
+            ident = capture_identity(pid, expected_start=expected)
+            if ident is None:
+                raise Invalid(
+                    f"identidad del backend {pid} no verificable (pid_start={expected})"
+                )
+            identities[pid] = ident
+        try:
+            os.kill(pid1, 0)
+        except OSError:
+            raise Invalid("la TUI no está viva")
+
         tui_rss = read_rss_kb(pid1)
-        mocks = backend_pids(db_path)
-        mock_rss = {str(p): read_rss_kb(p) for p in mocks}
-        combined = tui_rss + sum(v or 0 for v in mock_rss.values())
+        if not tui_rss or tui_rss <= 0:
+            raise Invalid("RSS de la TUI inválido")
+        mock_rss = {}
+        for pid in pids:
+            rss = read_rss_kb(pid)
+            if not rss or rss <= 0:
+                raise Invalid(f"RSS del backend {pid} inválido")
+            mock_rss[str(pid)] = rss
+        combined = tui_rss + sum(mock_rss.values())
 
         # Arranque de una SEGUNDA TUI con dos runs activos en el store.
         beacon2 = os.path.join(data_dir, ".beacon-tui2")
         pid2, fd2 = spawn_tui(args.bin, data_dir, beacon=beacon2)
         try:
-            assert wait_stage(beacon2, "first_draw", 10, fd2), "TUI2 no dibujó"
+            if wait_stage(beacon2, "first_draw", 10, fd2) is None:
+                raise Invalid("TUI2 no dibujó el primer frame")
             os.write(fd2, b"r")  # primera tecla procesada
             ev = wait_stage(beacon2, "input_processed", 10, fd2)
-            assert ev is not None, "TUI2 sin input_processed"
+            if ev is None:
+                raise Invalid("TUI2 sin input_processed")
             startup_active_ms = ev["internal_us"] / 1000.0
         finally:
             try:
@@ -280,6 +506,9 @@ def main():
                 os.close(fd2)
             except OSError:
                 pass
+        # La medición de arranque debe haber sido con 2 runs todavía activos.
+        if len(runs_running(db_path)) != 2:
+            raise Invalid("los runs cambiaron durante la medición de arranque")
 
         # Latencia de consultas con dos runs activos.
         q = []
@@ -293,6 +522,10 @@ def main():
             {
                 "ok": True,
                 "runs_active": 2,
+                "run_ids": run_ids,
+                "workspaces": workspaces,
+                "backend_pids": pids,
+                "backend_identity": {str(k): v for k, v in identities.items()},
                 "tui_rss_kb": tui_rss,
                 "mock_rss_kb": mock_rss,
                 "combined_rss_kb": combined,
@@ -304,27 +537,75 @@ def main():
                 },
             }
         )
+        exit_code = 0
+    except Invalid as e:
+        fail(report, str(e))
+        exit_code = 1
+    except Exception as e:  # noqa: BLE001
+        fail(report, f"error inesperado: {e}")
+        exit_code = 1
     finally:
-        for p in backend_pids(db_path):
-            try:
-                os.kill(p, signal.SIGKILL)
-            except OSError:
-                pass
+        cleanup = cleanup_processes(pid1, fd1, db_path, known_run_ids, identities)
+    report["cleanup"] = cleanup
+    if exit_code == 0 and cleanup["uncertain"]:
+        print(
+            f"two_run: advertencia: limpieza con incertidumbre: {cleanup['uncertain']}",
+            file=sys.stderr,
+        )
+        exit_code = 3
+    return finish(report, cleanup, exit_code)
+
+
+def cleanup_processes(pid1, fd1, db_path, known_run_ids, identities):
+    """Limpieza identity-aware: primero el hijo TUI (propio), luego una gracia
+    para la salida normal de los backends, y solo después verificación +
+    pidfd-señal de los PIDs asociados a los runs de esta invocación."""
+    result = {"killed": [], "already_dead": [], "uncertain": []}
+    if pid1 is not None:
         try:
             os.kill(pid1, signal.SIGKILL)
-            os.waitpid(pid1, 0)
+            os.waitpid(pid1, 0)  # hijo propio: reapear siempre
         except OSError:
             pass
+    if fd1 is not None:
         try:
             os.close(fd1)
         except OSError:
             pass
+    # Gracia: al morir la TUI, los mocks detectan el cierre de stdio y salen
+    # solos; la mayoría no requiere señal.
+    time.sleep(1.5)
+    candidates = []
+    if db_path and os.path.exists(db_path):
+        try:
+            for p in backend_payloads(db_path, set(known_run_ids)):
+                pid = int(p["pid"])
+                ident = identities.get(pid)
+                candidates.append(
+                    {
+                        "pid": pid,
+                        # Preferir el starttime capturado en vivo; si no, el
+                        # persistido por Aeril (backend.spawned.pid_start).
+                        "starttime": (ident or {}).get("starttime")
+                        or (int(p.get("pid_start") or 0) or None),
+                    }
+                )
+        except sqlite3.Error:
+            pass
+    for cand in candidates:
+        outcome = terminate_verified(cand)
+        result[outcome["result"]].append(outcome)
+    return result
 
-    if args.json:
-        print(json.dumps(report, indent=2))
-    else:
-        print(report)
-    return 0 if report.get("ok") else 1
+
+def finish(report, cleanup, exit_code):
+    report.setdefault("cleanup", cleanup)
+    if "ok" not in report:
+        report["ok"] = False
+    if exit_code == 0 and not report["ok"]:
+        exit_code = 1
+    print(json.dumps(report, indent=2))
+    return exit_code
 
 
 if __name__ == "__main__":

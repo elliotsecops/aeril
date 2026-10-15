@@ -4,13 +4,14 @@ Un terminal donde el agente de IA es un **participante nativo** del entorno: cad
 
 **La promesa:** corre completo en un ThinkPad de 2018 con 16 GB. No necesitás comprar una laptop nueva.
 
-> Estado: **Fase 0 completa y auditada; Fase 1 con aceptación de ingeniería para
-> concurrencia mock (N=2).** Registro de aceptación: [`docs/phase1-status.md`](docs/phase1-status.md).
+> Estado: **Fase 0 completa y auditada; Fase 1 con gates de producto verdes y
+> aceptación de ingeniería pendiente de re-verificación independiente (S6-R1:
+> tooling del benchmark en remediación).** Registro: [`docs/phase1-status.md`](docs/phase1-status.md).
 > Commit certificado Fase 0: [`41ab86cc`](https://github.com/elliotsecops/aeril/commit/41ab86cc28acad3476da3662723fd2411d6db16b) (62/62 tests).
 > S5 (G1–G9) certificado: [`1cfe627`](https://github.com/elliotsecops/aeril/commit/1cfe6279cf9de6260493da937590b63c116c49ac).
-> Phase 1 engineering acceptance is complete for deterministic mock-agent
-> concurrency (N=2). Real concurrent authenticated Hermes sessions and verified
-> conversational-context restoration remain outside the certified scope.
+> Concurrencia mock determinista (N=2) validada; sesiones Hermes reales
+> concurrentes y restauración verificada de contexto quedan **fuera del alcance
+> certificado**.
 
 **Entregado en Fase 0** (el corte vertical completo, un thread):
 

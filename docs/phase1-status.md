@@ -4,6 +4,14 @@
 > `feat/phase1-s6-final-acceptance` · Este documento es el registro de
 > aceptación auditable de la Fase 1. No reemplaza a `MANIFIESTO.md`.
 
+> **Estado S6 (actualizado tras la auditoría):** la auditoría independiente de
+> S6 devolvió **FAIL** contra `9ea0e68`, confinado al **tooling del benchmark**
+> (A: limpieza destructiva de `--data-dir`; B: terminación de PIDs sin
+> identidad; C: targets standalone del Makefile; D: validación de mediciones).
+> Los gates de producto quedaron verdes. La remediación vive en
+> `fix/phase1-s6-benchmark-safety` (SHA en el commit de entrega de S6-R1) y
+> **queda pendiente de re-verificación independiente**: S6 **no** está aceptado.
+
 ## 0. Verdicto de readiness (tres claims separados)
 
 **A. Ingeniería de concurrencia mock de Fase 1 — COMPLETA.**
@@ -46,14 +54,14 @@ Hermes autenticado. No se infiere readiness productivo de tests mock.
 | # | Verdicto | Commit certificado | Capacidades verificadas | Evidencia | Límites |
 |---|---|---|---|---|---|
 | **F0/RC2.1** | PASS (auditoría) | `41ab86cc` (FF) | corte vertical, checkpoints, leases+fence, presupuestos | `docs/phase0-*`, 62 tests | mock + demo Hermes real; sin concurrencia |
-| **S0** | PASS (S0-R1 `e38a7d4`) | `130c94f`→`6adaa5d` | reconciliación durable de runs interrumpidos, evidencia supervisor/backend, gate de reuso conservador | `tests/phase1_s0.rs`, `tests/phase1_s0_safety.rs` | identidad no verificable ⇒ bloqueo conservador |
+| **S0** | PASS (auditoría S0-R1) | **`e38a7d4`** (certificado; histórico: `130c94f`→`6adaa5d`) | reconciliación durable de runs interrumpidos, evidencia supervisor/backend, gate de reuso conservador | `tests/phase1_s0.rs`, `tests/phase1_s0_safety.rs` | identidad no verificable ⇒ bloqueo conservador |
 | **S1** | **CONDITIONAL** | `4d14e09` | `HERMES_HOME` honrado end-to-end; state.db/installs/caches/locks por perfil; cero escrituras a `~/.hermes`; kills aislados | `docs/phase1-s1-hermes-isolation.md` | sesiones reales y credenciales por perfil NO provisionadas; ~132 MiB RSS por `hermes acp` (no presupuestado) |
 | **S2** | PASS (auditoría) | `b63f582` (FF) | `run list [--active]`: supervisor alive/dead/unknown + lease owned/missing/held_by_other + status efectivo, solo lectura | `tests/phase1_s2.rs` (8) | señales de lectura; la resolución es de S0 |
 | **S3** | CONDITIONAL PASS (auditoría) | `99d2f7b` (FF) | TUI N=2: slots por invocación, 1 run/thread, cancelación por thread con ack, salida segura, Hermes real 1/vez | `tests/phase1_s3.rs` (9) | follow-ups de panic (ver §6) |
 | **S4** | auditoría detectó D1/D2 | `60921bc`→`48e94af` | `workspace list` read-only, dedupe, estados/elegibilidad, borrado guardado | `tests/phase1_s4.rs` (11) | reemplazado por S4-R1 |
 | **S4-R1** | PASS (auditoría) | `dac8ab2` (rojo) → `ecdbd38` → `880b7c7` (FF) | borrado seguro: guard de supervisor vivo/desconocido (D1) + fence transaccional de lease (D2); `--unsafe-ok` no pisa leases | `tests/phase1_s4_r1.rs` (7) | fences serializan contra adquisiciones de Aeril, no contra procesos externos |
 | **S5** | PASS (auditoría) | `1cfe627` (FF) | G1–G9 end-to-end (matriz §3) | `tests/phase1_concurrency.rs` (11) | mock determinista; Hermes real concurrente NO verificado |
-| **S6** | este documento | `4096b15` | presupuestos release re-medidos, registro de aceptación, límites declarados | §4/§5 + `make budget*` | sin features nuevas |
+| **S6** | **FAIL de auditoría (solo tooling de bench) → remediación S6-R1** | `4096b15` (candidato fallido `9ea0e68`); remediación en `fix/phase1-s6-benchmark-safety` | presupuestos release re-medidos, registro de aceptación, límites declarados; S6-R1 corrige ciclo de vida del data dir, limpieza identity-aware (pidfd), targets standalone y validación de mediciones | §4/§5 + `make budget*` + `tests/phase1_s6_bench.rs` + unittest de seguridad | aceptación S6 pendiente de re-verificación independiente |
 
 ## 3. Matriz final G1–G9
 
@@ -199,8 +207,9 @@ $B thread new --repo /ruta/al/repo --title B
 $B                                   # abre la TUI (backend mock: --backend mock:<script>)
 ```
 
-1. En la TUI: `Enter` abre el thread A · `n` · escribí `tarea A` · `Enter`.
-2. `Esc` · `↓` al thread B · `Enter` · `n` · `tarea B` · `Enter`.
+1. En la TUI: el **último thread creado aparece primero** (la lista ordena por
+   actividad: `B` está arriba) · `Enter` abre **B** · `n` · escribí `tarea B` · `Enter`.
+2. `Esc` · `↓` al thread **A** · `Enter` · `n` · `tarea A` · `Enter`.
 3. Observá dos runs activos (header `runs 2/2`; o `$B run list --active`).
 4. `Esc` · seleccioná A · `x` (cancelar); B completa solo.
 5. Revisá: `$B checkpoint list --thread A` / `--thread B`; `$B workspace list`;
@@ -210,8 +219,11 @@ $B                                   # abre la TUI (backend mock: --backend mock
 
 ## 8. Declaración de cierre
 
-Con S6 en verde (121/121 + fmt + Clippy + presupuestos release), la Fase 1 puede
-cerrarse **formalmente como hito de ingeniería para concurrencia mock
-determinista (N=2)**, con las limitaciones de §6 declaradas y sin claim de
-readiness productivo general ni de Hermes real concurrente. El cierre formal
-queda sujeto a la aceptación independiente de S6.
+Los gates de producto de Fase 1 (121/121 + fmt + Clippy + presupuestos release)
+siguen verdes, pero la **auditoría de S6 devolvió FAIL en el tooling del
+benchmark** (hallazgos A–D) y su remediación (S6-R1) **todavía no fue
+re-verificada de forma independiente**: S6 no se declara aceptado y **no se
+anuncia el cierre formal de Fase 1**. El cierre queda sujeto a la aceptación
+independiente de S6-R1 sobre `fix/phase1-s6-benchmark-safety`, con las
+limitaciones de §6 declaradas y sin claim de readiness productivo general ni de
+Hermes real concurrente.
