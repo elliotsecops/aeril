@@ -1,6 +1,6 @@
 # Fase 1 — Plan de ingeniería (aprobado 2026-10-14)
 
-> Baseline: `main @ 880b7c7` · **S0 integrado y aceptado** (PASS S0-R1, `e38a7d4`) · **S1 CONDITIONAL — single-Hermes default** (`docs/phase1-s1-hermes-isolation.md`) · **S2 integrado** (PASS auditoría; `b63f582`) · **S3 integrado** (CONDITIONAL PASS; `99d2f7b`) · **S4 + S4-R1 integrados y aceptados** (PASS auditoría S4-R1; `880b7c7` en main) · **S5 implementado** (`d1d7ff03230a8c324c1f628ac80a9283a1f798ef`).
+> Baseline: `main @ 1cfe627` · **S0** integrado y aceptado (PASS S0-R1, `e38a7d4`) · **S1** CONDITIONAL — single-Hermes default (`docs/phase1-s1-hermes-isolation.md`) · **S2** integrado (PASS, `b63f582`) · **S3** integrado (CONDITIONAL PASS, `99d2f7b`) · **S4 + S4-R1** integrados y aceptados (PASS, `880b7c7`) · **S5** integrado (PASS, `1cfe627`) · **S6** implementado (`4096b15`; registro de aceptación en `docs/phase1-status.md`).
 > Objetivo: **dos agentes concurrentes** (dos threads, mismo repo, un workspace verificado
 > cada uno) con estado durable, revisión independiente y recuperación segura.
 > Toda la validación primaria es **mock determinista**; Hermes real en paralelo queda
@@ -45,8 +45,8 @@ restringe procesos externos. Se documentará en la UI/CLI y en `docs/phase1-*`.
 | S2 | Estado de runs activos | `aeril run list [--active] [--limit]`: supervisor (alive/dead/unknown) + lease (owned/missing/held_by_other) + status efectivo; solo lectura, sin migraciones | ✅ **integrado** (`b63f582`; 8 tests S2; suite 83/83; make budget sin cambios) |
 | S3 | TUI concurrente (2 runs, cancelar por run) | `n` nuevo run en el thread abierto; slots por invocación (N=2, 1/thread, Hermes real 1/vez); `x` cancela solo el thread seleccionado y el slot se libera únicamente con el ack terminal; `q` bloqueado con runs vivos; mismo panel único; harness PTY solo para tests | ✅ **integrado y aceptado** (CONDITIONAL PASS; `99d2f7b` en main; 9 tests T1–T9) |
 | S4 | `workspace list` + ciclo de vida | `workspace list [--thread T] [--limit N]` (solo lectura, dedupe por workspace, estados y elegibilidad de reuso) + guard de `worktree rm` (lease vivo RC2.1; `--unsafe-ok` explícito) + rehidratación verificada | ✅ `60921bc5e01e7ae1c90dbe47336184fcf4473d6a` (11 tests S4; suite 103/103; budget PASS) |
-| S5 | E2E de concurrencia (mock) | `tests/phase1_concurrency.rs`: G1–G9 con topologías explícitas (TUI única / procesos CLI independientes / kill de backend vs SIGKILL del proceso completo) | ✅ `d1d7ff03230a8c324c1f628ac80a9283a1f798ef` (11 tests; suite 121/121 ×3; budget + scale PASS) |
-| S6 | Presupuestos + docs de fase | `make budget*` extendido, `docs/phase1-status.md` | pendiente |
+| S5 | E2E de concurrencia (mock) | `tests/phase1_concurrency.rs`: G1–G9 con topologías explícitas (TUI única / procesos CLI independientes / kill de backend vs SIGKILL del proceso completo) | ✅ **integrado y aceptado** (PASS auditoría; `1cfe627` en main; 11 tests) |
+| S6 | Presupuestos + docs de fase | `docs/phase1-status.md` (registro de aceptación), `make budget-two` (escenario real de 2 runs), límites priorizados y verdicto de readiness A/B/C | ✅ `4096b15` (este corte; suite 121/121; budget + scale + two PASS) |
 
 ### S4 — Semántica de `workspace list` y borrado seguro
 
