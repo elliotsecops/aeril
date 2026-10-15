@@ -175,6 +175,44 @@ class IdentityTest(unittest.TestCase):
                 proc.kill()
                 proc.wait()
 
+    def test_missing_starttime_never_signaled(self):
+        # S6-R2: sin starttime original registrado NO se puede verificar la
+        # identidad; jamás se infiere del proceso vivo para autorizar la señal.
+        proc = self._spawn_mockish()
+        try:
+            outcome = two_run.terminate_verified({"pid": proc.pid})
+            self.assertEqual(outcome["result"], "uncertain", outcome)
+            self.assertIn("starttime", outcome.get("reason", ""), outcome)
+            self.assertIsNone(proc.poll(), "sin starttime registrado NO se señaliza")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    def test_none_starttime_never_signaled(self):
+        proc = self._spawn_mockish()
+        try:
+            outcome = two_run.terminate_verified({"pid": proc.pid, "starttime": None})
+            self.assertEqual(outcome["result"], "uncertain", outcome)
+            self.assertIn("starttime", outcome.get("reason", ""), outcome)
+            self.assertIsNone(proc.poll(), "starttime=None NO se señaliza")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    def test_zero_starttime_never_signaled(self):
+        proc = self._spawn_mockish()
+        try:
+            outcome = two_run.terminate_verified({"pid": proc.pid, "starttime": 0})
+            self.assertEqual(outcome["result"], "uncertain", outcome)
+            self.assertIn("starttime", outcome.get("reason", ""), outcome)
+            self.assertIsNone(proc.poll(), "starttime=0 NO se señaliza")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
     def test_dead_pid_not_signaled(self):
         proc = subprocess.Popen(
             [sys.executable, "-c", "pass"],
