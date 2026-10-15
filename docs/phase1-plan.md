@@ -1,6 +1,6 @@
 # Fase 1 — Plan de ingeniería (aprobado 2026-10-14)
 
-> Baseline: `main @ 99d2f7b` · **S0 integrado y aceptado** (PASS S0-R1, `e38a7d4` en main) · **S1 CONDITIONAL — single-Hermes sigue siendo el default soportado** (`docs/phase1-s1-hermes-isolation.md`) · **S2 integrado** (PASS de auditoría independiente; `b63f582` en main) · **S3 integrado** (CONDITIONAL PASS de auditoría independiente; `99d2f7b` en main) · **S4 implementado** (`60921bc5e01e7ae1c90dbe47336184fcf4473d6a`).
+> Baseline: `main @ 99d2f7b` · **S0 integrado y aceptado** (PASS S0-R1, `e38a7d4` en main) · **S1 CONDITIONAL — single-Hermes sigue siendo el default soportado** (`docs/phase1-s1-hermes-isolation.md`) · **S2 integrado** (PASS de auditoría independiente; `b63f582` en main) · **S3 integrado** (CONDITIONAL PASS de auditoría independiente; `99d2f7b` en main) · **S4 implementado** (`60921bc5e01e7ae1c90dbe47336184fcf4473d6a`) · **S4-R1 (borrado seguro) en `fix/phase1-s4-deletion-safety`** (`ecdbd38eb14466ac0e1b667de40d4a44d9042e14`; rojo reproducido en `dac8ab2`).
 > Objetivo: **dos agentes concurrentes** (dos threads, mismo repo, un workspace verificado
 > cada uno) con estado durable, revisión independiente y recuperación segura.
 > Toda la validación primaria es **mock determinista**; Hermes real en paralelo queda
@@ -66,13 +66,31 @@ restringe procesos externos. Se documentará en la UI/CLI y en `docs/phase1-*`.
 - **Worktree ausente ≠ snapshot ausente.** Los checkpoints viven en eventos +
   refs por OID y sobreviven al borrado del worktree; `workspace list` reporta el
   worktree, no la memoria de revisión.
-- **Borrado.** `aeril worktree rm --thread T [--unsafe-ok]`: un lease con dueño
-  vivo bloquea SIEMPRE (RC2.1; `--force` no lo desplaza y el mensaje ya no lo
-  sugiere como bypass: hay que terminar y verificar el proceso). Sin dueño vivo,
-  el veredicto S0 decide: bloqueado ⇒ el borrado exige `--unsafe-ok` (acción
-  explícita; no se tocan checkpoints, refs, ramas ni comentarios). Aeril solo
-  puede verificar procesos del grupo que él creó; no se declara verificación de
-  procesos fuera de esa frontera.
+- **Borrado (S4-R1).** `aeril worktree rm --thread T [--unsafe-ok]`:
+  - **Cualquier lease presente en el chequeo final serializado bloquea el
+    borrado**, incluso stale (un lease stale se resuelve por su ciclo de vida:
+    verificar la muerte del proceso y `aeril lease release --workspace W`, que
+    rechaza dueños vivos). Un dueño VIVO no se desplaza jamás (RC2.1; `--force`
+    no lo pisa y el mensaje ya no lo sugiere como bypass).
+  - **Por defecto se rechaza un run sin resolver con supervisor vivo o
+    desconocido aunque falte el lease** (D1): el lease no es la única evidencia
+    de ejecución. `--unsafe-ok` es un reconocimiento explícito de riesgo — NO
+    termina backends ni prueba que el workspace haya dejado de modificarse — y
+    tampoco pisa el fence de lease.
+  - **Serialización (D2)**: la decisión final y el borrado corren dentro de una
+    transacción `IMMEDIATE` (el mismo mecanismo de `leases::try_acquire`), con
+    re-lectura de identidad del target, del lease y de los guards S0/supervisor
+    usando la conexión de la transacción. Si una adquisición gana primero, el
+    borrado aborta; si el borrado gana, la adquisición espera y después aplica
+    sus reglas ordinarias (verificación falla ⇒ crea workspace nuevo; no escribe
+    en el path borrado). No es una transacción atómica DB+filesystem: la
+    transacción serializa contra adquisiciones de lease de Aeril.
+  - El borrado **preserva checkpoints, refs, ramas y comentarios**; Aeril solo
+    verifica procesos del grupo que él creó y no declara verificación fuera de
+    esa frontera.
+  - Los límites conocidos del camino de panic de S3 **siguen pendientes y no
+    bloquean** S4/S4-R1 (catch_unwind solo cubre el cierre del runner; el panic
+    hook no se endureció).
 - **Rehidratación.** Con el worktree borrado, un feedback sobre un snapshot
   `ready` recrea el worktree en el OID del snapshot (evento `workspace.recreated`)
   y lo registra; la sesión del motor se reporta aparte (`attempted/accepted`). No
