@@ -19,4 +19,11 @@ CHEQUEO PRE-AUTH SANITIZADO: p-A y p-B → authMethods=[hermes-setup],
 session/new falla honestamente ('not connected to any AI provider');
 sin autenticación ambiental. Sin sesiones autenticadas generadas.
 
+NOTA DE PRECISIÓN (posterior al chequeo): el chequeo materializa el runtime
+del perfil (installs/logs/state.db). El string 'credential_pool' aparece
+entonces en 78 archivos por perfil, TODOS código fuente de Hermes en
+installs/.../workspace/hermes_cli/*.py (identificador en su propio código),
+NO datos de credenciales. Verificado: sin auth.json en ningún perfil,
+sin sesiones ('No sessions found.'), state.db creado por el chequeo pre-auth.
+
 NO se tocó: repo-A/B, san-home-A/B, diagnósticos, ~/.hermes, main, la rama.
