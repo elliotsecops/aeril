@@ -225,6 +225,14 @@ grep -rl "credential_pool" "$S" 2>/dev/null | wc -l   # esperado: 0
 # ~/.hermes, repos del usuario y el resto del sistema NO están en el manifest.
 ```
 
+## 12. Próximo paso
+
+1. Usuario aprueba el **reset** de `p-A`/`p-B` (paso 0 de §4).
+2. Usuario ejecuta E2 (runbook §4) y reporta etiquetas de `auth list`.
+3. Se reanuda el spike: E3/E4 (prompts canary con `--permissions ask-human`
+   — aprobación humana por edición — o `approve-verified-edits` acotado al
+   repo), E7-pico, L1–L4 → informe final → GO/NO-GO con auditoría.
+
 ## 13. Revisión de evidencia histórica (T4)
 
 Se escanearon **todos los blobs alguna vez commiteados en la rama**
@@ -236,11 +244,3 @@ archivos eliminados en R1 (p. ej. `probe-B-e1.json`) siguen en la historia de
 Git y contienen únicamente la **etiqueta de proveedor no-secreta** `gemini`
 (identidad de proveedor, no un valor). No se reproduce ningún valor en este
 informe.
-
-## 12. Próximo paso
-
-1. Usuario aprueba el **reset** de `p-A`/`p-B` (paso 0 de §4).
-2. Usuario ejecuta E2 (runbook §4) y reporta etiquetas de `auth list`.
-3. Se reanuda el spike: E3/E4 (prompts canary con `--permissions ask-human`
-   — aprobación humana por edición — o `approve-verified-edits` acotado al
-   repo), E7-pico, L1–L4 → informe final → GO/NO-GO con auditoría.
