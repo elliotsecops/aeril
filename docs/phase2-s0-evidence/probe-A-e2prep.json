@@ -1,0 +1,33 @@
+{
+  "env_mode": "sanitized",
+  "hermes_home": "/home/elliot/p2s0-spike/p-A",
+  "san_home": "/home/elliot/p2s0-spike/san-home-A",
+  "repo": "/home/elliot/p2s0-spike/repo-A",
+  "permissions_policy": "deny",
+  "pid": 988648,
+  "timings_ms": {
+    "initialize": 26282.6,
+    "spawn_to_initialize": 26283.2,
+    "session_new": 1622.8,
+    "terminate": 15.7
+  },
+  "rss_kb": {
+    "idle_after_init": 137152,
+    "idle_end_of_hold": 137152
+  },
+  "session_id": null,
+  "session_new_error": {
+    "code": -32603,
+    "message": "Internal error",
+    "details": "Hermes is not connected to any AI provider yet. Run `hermes model` to pick one (the free Nous tier needs no API key), type `/login` in chat, or add a key with `hermes auth add <provider>`. (Advanced: "
+  },
+  "prompt_error": null,
+  "event_kinds": {},
+  "permissions": [],
+  "terminated": "signal 15",
+  "inherited_mode_auth_ops": false,
+  "auth_methods": [
+    "hermes-setup"
+  ],
+  "disk_kb_home": 1312598
+}
