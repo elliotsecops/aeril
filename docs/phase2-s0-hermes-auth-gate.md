@@ -278,6 +278,66 @@ grep -rl "credential_pool" "$S/p-A" "$S/p-B" 2>/dev/null | wc -l   # esperado: 0
    — aprobación humana por edición — o `approve-verified-edits` acotado al
    repo), E7-pico, L1–L4 → informe final → GO/NO-GO con auditoría.
 
+## 14. Revisión E2 (credenciales) y decisión de seguridad
+
+**E2 — resultado por perfil** (metadata-only; sin leer/comparar/hashear valores):
+- p-A y p-B: credencial **nous** `device_code` (oauth), `auth status nous` =
+  "logged in", `active_provider="nous"`, ids de registro distintos
+  (`f87efb` / `7a9348`); flujos device-code interactivos separados en
+  `HERMES_HOME`/`HOME` sanitizados distintos.
+- **Independencia de grants**: *fuertemente indicada* (flujos y registros
+  separados por perfil) pero **no demostrable criptográficamente con
+  metadata** y, por política, no se comparan materiales de token. La
+  verificación autoritativa por archivo no está disponible en este nivel.
+
+**Hallazgo — `gh_cli` en ambos perfiles (contaminación confirmada)**:
+- El registro `copilot` (`api_key`, `source=gh_cli`) está **persistido** en
+  `credential_pool` de ambos `auth.json` (`updated_at` coincide con el auth
+  interactivo del usuario).
+- **Raíz**: `git_credentials.py::_gh_cli_token` / `github_api.py::_gh_cli_token`
+  ejecutan el subproceso `gh auth token`; `hermes auth list` **sí lo invoca**
+  (strace: `execve("/usr/bin/gh", ["gh","auth","token"])`). Bajo el env
+  sanitizado, `gh auth status` responde "not logged in" (verificado) ⇒ la
+  discovery está **bloqueada en runtime**; el registro persistido provino de un
+  flujo de auth cuyo entorno permitió a `gh` ver el login del host (p. ej. HOME
+  real en esa ejecución). No se puede reconstruir retroactivamente ese entorno.
+- **Registros inesperados**: SÍ — `copilot` en ambos perfiles (derivado del host).
+
+**¿Fallback inesperado a Copilot?** **No** en la configuración actual:
+`providers={nous: enabled}` (copilot no habilitado), sin `config.yaml` ⇒
+`get_fallback_chain()` vacío, `requested != "auto"` ⇒ un `AuthError` de nous
+**no** cae a otro proveedor (`runtime_provider.py:1074-1081`), y el rung de
+pool es del proveedor solicitado. Residual: si en el futuro se configura una
+cadena de fallback o se cambia `active_provider`, el registro persistido podría
+ser elegible ⇒ conviene removerlo.
+
+**Decisión de seguridad**: el lanzamiento sanitizado es suficiente para
+**prevenir discovery nueva** (verificado), pero **no** para la garantía de
+"perfiles solo con credenciales propias" mientras el registro derivado del host
+esté presente ⇒ configuración actual **insuficiente** para las garantías
+declaradas de E2.
+
+**Mitigación mínima propuesta**:
+1. **Harness (hecho)**: `GH_CONFIG_DIR=<san-home>/.config/gh` en los modos
+   sanitized/nohome — defensa en profundidad: aunque HOME se herede por error,
+   `gh` no puede leer la config del host (verificado con HOME señuelo).
+   32/32 tests.
+2. **Perfiles (PENDIENTE — requiere aprobación del usuario; no ejecutado)**:
+   remover el registro ajeno por perfil y re-verificar:
+   ```bash
+   S=/home/elliot/p2s0-spike
+   for P in A B; do
+     env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME=$S/san-home-$P \
+         XDG_CONFIG_HOME=$S/san-home-$P/.config GH_CONFIG_DIR=$S/san-home-$P/.config/gh \
+         HERMES_HOME=$S/p-$P /home/elliot/.local/bin/hermes auth remove copilot 1
+     env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME=$S/san-home-$P \
+         XDG_CONFIG_HOME=$S/san-home-$P/.config GH_CONFIG_DIR=$S/san-home-$P/.config/gh \
+         HERMES_HOME=$S/p-$P /home/elliot/.local/bin/hermes auth list   # solo nous
+   done
+   ```
+3. **GO/NO-GO para E3**: **NO-GO** hasta completar (2) y re-verificar
+   metadata-only; después **GO** para E3 (prompts canary con `ask-human`).
+
 ## 13. Revisión de evidencia histórica (T4)
 
 Se escanearon **todos los blobs alguna vez commiteados en la rama**

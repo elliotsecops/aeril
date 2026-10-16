@@ -84,6 +84,10 @@ def build_env(mode, san_home, hermes_home, env_allow=()):
         env["XDG_CACHE_HOME"] = os.path.join(san_home, ".cache")
         env["XDG_DATA_HOME"] = os.path.join(san_home, ".local", "share")
         env["XDG_STATE_HOME"] = os.path.join(san_home, ".local", "state")
+    # Defensa en profundidad (E2): `gh auth token` no debe poder leer la config
+    # del host aunque HOME se herede por error; GH_CONFIG_DIR apunta a un dir
+    # vacío del entorno sanitizado (gh lo respeta por encima de HOME/XDG).
+    env["GH_CONFIG_DIR"] = os.path.join(san_home, ".config", "gh")
     for name in env_allow:
         if name not in SAFE_ENV_ALLOW:
             print(

@@ -320,6 +320,18 @@ class EnvAndHomeTest(unittest.TestCase):
             del os.environ["ANTHROPIC_AUTH_TOKEN"]
             del os.environ["SSH_AUTH_SOCK"]
 
+    def test_gh_config_dir_points_into_san_home(self):
+        env = probe.build_env("sanitized", "/tmp/san", "/tmp/hermes")
+        self.assertEqual(env.get("GH_CONFIG_DIR"), "/tmp/san/.config/gh")
+        env2 = probe.build_env("nohome", "/tmp/san", "/tmp/hermes")
+        self.assertEqual(env2.get("GH_CONFIG_DIR"), "/tmp/san/.config/gh")
+
+    def test_gh_config_dir_not_allowlisted(self):
+        self.assertNotIn("GH_CONFIG_DIR", probe.SAFE_ENV_ALLOW)
+        with self.assertRaises(SystemExit) as cm:
+            probe.build_env("sanitized", "/tmp/san", "/tmp/hermes", ("GH_CONFIG_DIR",))
+        self.assertEqual(cm.exception.code, 3)
+
     def test_ssh_auth_sock_not_allowlisted(self):
         self.assertNotIn("SSH_AUTH_SOCK", probe.SAFE_ENV_ALLOW)
         with self.assertRaises(SystemExit) as cm:
