@@ -1,0 +1,36 @@
+{
+  "env_mode": "sanitized",
+  "hermes_home": "/home/elliot/p2s0-spike/p-B",
+  "san_home": "/home/elliot/p2s0-spike/san-home-B",
+  "repo": "/home/elliot/p2s0-spike/repo-B",
+  "permissions_policy": "deny",
+  "pid": 1055151,
+  "timings_ms": {
+    "initialize": 2252.8,
+    "spawn_to_initialize": 2253.4,
+    "terminate": 15.8
+  },
+  "rss_kb": {
+    "idle_after_init": 131424,
+    "idle_end_of_hold": 131424
+  },
+  "session_id": null,
+  "session_new_error": null,
+  "prompt_error": null,
+  "event_kinds": {},
+  "permissions": [],
+  "terminated": "signal 15",
+  "inherited_mode_auth_ops": false,
+  "wall": {
+    "spawn_unix_ms": 1792193626765
+  },
+  "auth_methods": [
+    "nous",
+    "hermes-setup"
+  ],
+  "load_status": "ok",
+  "replay_kinds_delta": {},
+  "replay_total": 0,
+  "canary_found": false,
+  "disk_kb_home": 1317772
+}

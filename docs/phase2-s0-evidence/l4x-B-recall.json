@@ -1,0 +1,51 @@
+{
+  "env_mode": "sanitized",
+  "hermes_home": "/home/elliot/p2s0-spike/p-B",
+  "san_home": "/home/elliot/p2s0-spike/san-home-B",
+  "repo": "/home/elliot/p2s0-spike/repo-B",
+  "permissions_policy": "deny",
+  "pid": 1061985,
+  "timings_ms": {
+    "initialize": 2341.4,
+    "spawn_to_initialize": 2342.0,
+    "prompt": 3678.9,
+    "terminate": 31.7
+  },
+  "rss_kb": {
+    "prompt_peak": 253480,
+    "idle_after_init": 253672,
+    "idle_end_of_hold": 253672
+  },
+  "session_id": null,
+  "session_new_error": null,
+  "prompt_error": null,
+  "event_kinds": {
+    "user_message_chunk": 1,
+    "agent_thought_chunk": 42,
+    "agent_message_chunk": 12,
+    "available_commands_update": 1,
+    "usage_update": 2
+  },
+  "permissions": [],
+  "terminated": "signal 15",
+  "inherited_mode_auth_ops": false,
+  "wall": {
+    "spawn_unix_ms": 1792193957722,
+    "prompt_start_unix_ms": 1792193962313,
+    "prompt_end_unix_ms": 1792193966071
+  },
+  "auth_methods": [
+    "nous",
+    "hermes-setup"
+  ],
+  "load_status": "ok",
+  "replay_kinds_delta": {
+    "user_message_chunk": 1,
+    "agent_message_chunk": 1,
+    "agent_thought_chunk": 1
+  },
+  "replay_total": 3,
+  "prompt_stop_reason": "end_turn",
+  "canary_found": true,
+  "disk_kb_home": 1318235
+}

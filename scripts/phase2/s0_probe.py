@@ -38,6 +38,7 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 HERMES = "/home/elliot/.local/bin/hermes"
@@ -322,6 +323,11 @@ class AcpClient:
         )
 
     def canary_seen(self, canary):
+        # Los updates llegan como DELTAS: el canary puede partirse entre
+        # chunks, así que se busca en la concatenación (y por chunk, por si el
+        # backend envía el mensaje completo).
+        if canary in "".join(self._transient_texts):
+            return True
         return any(canary in t for t in self._transient_texts)
 
 
@@ -406,6 +412,8 @@ def cmd_probe(args):
         ),
     }
     t0 = time.monotonic()
+    t0_wall = time.time() * 1000
+    report["wall"] = {"spawn_unix_ms": round(t0_wall)}
     proc = subprocess.Popen(
         [HERMES, "acp"],
         env=env,
@@ -447,11 +455,30 @@ def cmd_probe(args):
                         "details": details,
                     }
                 else:
-                    client.session_id = (r.get("result") or {}).get("sessionId")
+                    res = r.get("result") or {}
+                    client.session_id = res.get("sessionId")
                     report["session_id"] = client.session_id
+                    models = res.get("models") or {}
+                    report["models"] = {
+                        "current": models.get("currentModelId"),
+                        "available": [m.get("modelId") for m in (models.get("availableModels") or [])],
+                    }
             except (TimeoutError, RuntimeError) as e:
                 report["session_new_error"] = {"message": str(e)[:200]}
+        if args.model and client.session_id:
+            r = client.request(
+                "session/set_model",
+                {"sessionId": client.session_id, "modelId": args.model},
+                timeout=args.req_timeout,
+            )
+            report["set_model"] = "ok" if "result" in r else "error"
+            if "error" in r:
+                report["set_model_error"] = {
+                    "code": r["error"].get("code"),
+                    "message": str(r["error"].get("message"))[:160],
+                }
         if args.load:
+            before_kinds = dict(client.event_kinds)
             try:
                 r = client.request(
                     "session/load",
@@ -467,8 +494,28 @@ def cmd_probe(args):
                 client.session_id = args.load
             except (TimeoutError, RuntimeError) as e:
                 report["load_error"] = {"message": str(e)[:200]}
+            delta = {}
+            for k in set(before_kinds) | set(client.event_kinds):
+                d = client.event_kinds.get(k, 0) - before_kinds.get(k, 0)
+                if d > 0:
+                    delta[k] = d
+            report["replay_kinds_delta"] = delta
+            report["replay_total"] = sum(delta.values())
         if args.prompt and client.session_id:
+            peak = {"rss": 0}
+            stop = threading.Event()
+
+            def _sample():
+                while not stop.is_set():
+                    rss = rss_kb(proc.pid)
+                    if rss:
+                        peak["rss"] = max(peak["rss"], rss)
+                    time.sleep(0.15)
+
+            sampler = threading.Thread(target=_sample, daemon=True)
+            sampler.start()
             t = time.monotonic()
+            report["wall"]["prompt_start_unix_ms"] = round(time.time() * 1000)
             try:
                 r = client.request(
                     "session/prompt",
@@ -488,6 +535,11 @@ def cmd_probe(args):
                     report["prompt_stop_reason"] = (r.get("result") or {}).get("stopReason")
             except (TimeoutError, RuntimeError) as e:
                 report["prompt_error"] = {"message": str(e)[:200]}
+            finally:
+                stop.set()
+                sampler.join(timeout=2)
+                report["wall"]["prompt_end_unix_ms"] = round(time.time() * 1000)
+                report["rss_kb"]["prompt_peak"] = peak["rss"] or None
         if args.canary:
             report["canary_found"] = client.canary_seen(args.canary)
         time.sleep(2.0)
@@ -593,6 +645,7 @@ def main():
     p.add_argument("--hold", type=float, default=0.0)
     p.add_argument("--ping-after", type=float, default=0.0)
     p.add_argument("--session-new", action="store_true")
+    p.add_argument("--model", default=None)
     p.add_argument("--prompt", default=None)
     p.add_argument("--canary", default=None)
     p.add_argument("--load", default=None)

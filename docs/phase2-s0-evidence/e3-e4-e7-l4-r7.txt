@@ -1,0 +1,29 @@
+P2-S0 E3/E4/E7/L1-L4 — validación autenticada (evidencia, redactada)
+==================================================================
+
+Gate 0: PASS (20/20) — nous logged in, active_provider=nous, copilot vacío+suprimido,
+HOME/HERMES_HOME/GH_CONFIG_DIR independientes, gh del host bloqueado, versión 0.21.5+8877.g865ba90.
+
+E3 (free model nous:upstage/solar-mini4:free, dos procesos, un writer por perfil):
+- set_model=ok · session/new ok · dos turnos REALES solapados: A 3.06s / B 6.18s,
+  A[567651,570807] B[567599,573914] ⇒ solape real; stop=end_turn ambos.
+- canary propio=True en ambos; store: nonce propio presente, nonce ajeno ausente (sin cruce).
+- sesiones distintas (e390bf47 / db5c5e9f); permisos: [] (default-deny, prompts read-only).
+- No-fallback: session_model_usage → billing_provider=nous + base URL Nous en ambos;
+  copilot sigue vacío. (request_count no incrementa con tier free.)
+- Hallazgo: modelos pagos fallan con 404 insufficient_credits_for_paid_model y Hermes
+  escribe un boundary de turno fallido, pero el ACP responde stop=end_turn (ver defectos).
+
+E4: sessions por store separadas (A∩B=∅; id de A ausente en B);
+control id-ajeno y id-desconocido: load_status=ok (quirk V5) pero replay=0 y canary=False (L1-only).
+
+L1-L4 (canary session-only impredecible; 0 tool calls; sin MEMORY.md):
+- L1 load aceptado=True · L2 sesión en su store=True · L3 replay>0 (user/tool/agent chunks)=True · L4 recall=True
+- Controles: fresh sin load=False · id desconocido=False · id de A bajo B=False.
+  (El primer intento usó memoria del perfil — confound detectado y aislado con protocolo session-only.)
+
+E7: RSS pico/idle por proceso ≈262 MB; agregado 2 procesos ≈524 MB; disco/perfil:
+408M / 407M; warm init ~1.7-2.0s; cold 26.7s (S1/previo);
+host: MemAvailable 4.4-4.5 GiB, pressure 0, swap 504M; Aeril app no participó (presupuestos Fase 1 aparte).
+Budgets plan §5: pico ≤320MiB PASS (262); agregado ≤768MiB PASS (524); warm ≤10s PASS;
+cold ≤120s PASS; IDLE ≤192MiB EXCEDIDO (262 con sesión cargada) ⇒ re-baseline en P2-S4.

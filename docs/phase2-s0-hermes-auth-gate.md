@@ -127,7 +127,7 @@ re-evaluará el contrato.
   init 1.96 s / 2.05 s; RSS idle 126/128 MB; sin strays.
 - Disco: **407 MiB en disco por perfil** (`du`).
 
-## 4. E2 — Autenticación interactiva — **PENDIENTE (usuario)**
+## 4. E2 — Autenticación interactiva — **SUPERSEDED: COMPLETADA** (ver §15)
 
 ⚠️ **No ejecutada.** No se usaron credenciales del host ni `gh`; no se copió
 `auth.json`.
@@ -219,13 +219,13 @@ reales; no se relajan ahora. **Mocks ≠ Hermes** y **Aeril ≠ Hermes**.
   **no** es aislamiento (código con los mismos permisos puede leer rutas
   absolutas del host; plan corregido §2C).
 
-## 9. L1–L4 (restauración) — no testeado
+## 9. L1–L4 (restauración) — **SUPERSEDED: testeado y verificado** (ver §15)
 
 Requiere sesiones autenticadas. Protocolo listo (canary impredecible por trial
 + controles negativos). Si L4 no se demuestra: `verified=false` y no bloquea
 P2-S1.
 
-## 10. Recomendación y blockers
+## 10. Recomendación y blockers — **SUPERSEDED por §15** (NO-GO levantado)
 
 **Recomendación para P2-S1: CONDITIONAL — PENDIENTE de E2.**
 
@@ -270,7 +270,7 @@ grep -rl "credential_pool" "$S/p-A" "$S/p-B" 2>/dev/null | wc -l   # esperado: 0
 # NO se borran repo-A/B, san-home-A/B ni el resto del scratch (manifest mínimo).
 ```
 
-## 12. Próximo paso
+## 12. Próximo paso — **SUPERSEDED: ver §15** (E3/E4/E7/L1–L4 completados)
 
 1. Usuario aprueba el **reset** de `p-A`/`p-B` (paso 0 de §4).
 2. Usuario ejecuta E2 (runbook §4) y reporta etiquetas de `auth list`.
@@ -278,7 +278,19 @@ grep -rl "credential_pool" "$S/p-A" "$S/p-B" 2>/dev/null | wc -l   # esperado: 0
    — aprobación humana por edición — o `approve-verified-edits` acotado al
    repo), E7-pico, L1–L4 → informe final → GO/NO-GO con auditoría.
 
-## 14. Revisión E2 (credenciales) y decisión de seguridad
+## 13. Revisión de evidencia histórica (T4)
+
+Se escanearon **todos los blobs alguna vez commiteados en la rama**
+(`git rev-list 47f0318..HEAD` → 27 blobs bajo `scripts/phase2/**` y
+`docs/phase2-s0*`) contra patrones de credenciales (GitHub/OpenAI/Google/
+Slack/AWS/JWT/GitLab/Bearer/hex largos/keywords). Resultado: **0 valores de
+credenciales encontrados** — ninguna remediación de secretos requerida. Los
+archivos eliminados en R1 (p. ej. `probe-B-e1.json`) siguen en la historia de
+Git y contienen únicamente la **etiqueta de proveedor no-secreta** `gemini`
+(identidad de proveedor, no un valor). No se reproduce ningún valor en este
+informe.
+
+## 14. Revisión E2 (credenciales) y decisión de seguridad — **SUPERSEDED en su NO-GO por §15**
 
 **E2 — resultado por perfil** (metadata-only; sin leer/comparar/hashear valores):
 - p-A y p-B: credencial **nous** `device_code` (oauth), `auth status nous` =
@@ -338,14 +350,64 @@ declaradas de E2.
 3. **GO/NO-GO para E3**: **NO-GO** hasta completar (2) y re-verificar
    metadata-only; después **GO** para E3 (prompts canary con `ask-human`).
 
-## 13. Revisión de evidencia histórica (T4)
+## 15. E3/E4/E7/L1–L4 — Validación autenticada real (R7) — **supersede los HOLD de E2/R6**
 
-Se escanearon **todos los blobs alguna vez commiteados en la rama**
-(`git rev-list 47f0318..HEAD` → 27 blobs bajo `scripts/phase2/**` y
-`docs/phase2-s0*`) contra patrones de credenciales (GitHub/OpenAI/Google/
-Slack/AWS/JWT/GitLab/Bearer/hex largos/keywords). Resultado: **0 valores de
-credenciales encontrados** — ninguna remediación de secretos requerida. Los
-archivos eliminados en R1 (p. ej. `probe-B-e1.json`) siguen en la historia de
-Git y contienen únicamente la **etiqueta de proveedor no-secreta** `gemini`
-(identidad de proveedor, no un valor). No se reproduce ningún valor en este
-informe.
+Gate 0 (20/20): nous `logged in` y `active_provider=nous` en ambos perfiles;
+copilot sin credenciales y fuentes suprimidas; `HOME`/`HERMES_HOME`/
+`GH_CONFIG_DIR`/XDG independientes por perfil; `gh` del host bloqueado; Hermes
+`0.21.5+8877.g865ba90` sin cambios; MemAvailable >4 GiB. Revisión dirigida del
+cambio R6 (GH_CONFIG_DIR) y de la remediación de credenciales: OK.
+
+**E3 — sesiones ACP autenticadas concurrentes (modelo explícito
+`nous:upstage/solar-mini4:free`; un writer por perfil):**
+- `set_model=ok` y `session/new` en ambos; **dos turnos reales solapados**
+  (A 3.06 s / B 6.18 s; intervalos intersectan); `stop=end_turn`.
+- Canary propio verificado en ambos; el store de cada perfil contiene su nonce
+  y **no** el del otro (sin contaminación cruzada).
+- Sesiones distintas (`e390bf47…` / `db5c5e9f…`); permisos `[]` (default-deny,
+  prompts read-only; no se intentaron ediciones).
+- **Sin fallback**: `session_model_usage` → `billing_provider=nous` +
+  `billing_base_url=…nousresearch.com` en ambos; copilot sigue vacío.
+  (Con tier free, `request_count` no incrementa; la facturación por sesión es
+  la evidencia autoritativa.)
+
+**E4 — persistencia y separación:** `sessions list` por perfil sin
+intersección; el id de A **no** existe en B. Controles negativos: id ajeno
+bajo B y id desconocido → `load_status=ok` (quirk V5) pero `replay=0` y
+`canary=False` ⇒ **L1-only, jamás restauración**.
+
+**L1–L4 (canary impredecible, protocolo *session-only*):**
+- L1 load aceptado = ✅ · L2 sesión en su store = ✅ · L3 replay>0
+  (user/tool/agent chunks) = ✅ · **L4 recall del canary = ✅** en ambos.
+- Controles: fresh sin load = False; id desconocido = False; id de A bajo B =
+  False. Primer intento usó **memoria del perfil** (`memories/MEMORY.md`) y fue
+  detectado/aislado con la instrucción session-only (0 tool calls, canary
+  ausente de MEMORY.md) ⇒ L4 **no confundido** con memoria.
+- `verified=false` **ya no aplica a este caso validado** (modelo/versión
+  específicos); se mantiene como default de producto para modelos no validados
+  y debe re-verificarse por modelo en P2-S4.
+
+**E7 — recursos reales (Hermes; Aeril no participó):** RSS pico/idle por
+proceso ≈ **262 MB**; agregado 2 procesos ≈ **524 MB**; disco por perfil
+**408/407 MB**; warm init ~1.7–2.0 s; cold 26.7 s (previo); turnos 3–7 s;
+host con MemAvailable 4.4–4.5 GiB y presión 0 durante las pruebas.
+Contra los presupuestos provisionales del plan: pico ≤320 MiB **PASS**;
+agregado ≤768 MiB **PASS**; warm ≤10 s **PASS**; cold ≤120 s **PASS**;
+**idle ≤192 MiB EXCEDIDO** (262 MB con sesión autenticada cargada) ⇒
+re-baseline explícito en P2-S4, sin relajar silenciosamente.
+
+**Defectos/limites encontrados (no bloqueantes, para P2-S2/S3):**
+1. Modelos pagos de Nous fallan (`404 insufficient_credits_for_paid_model`) y
+   Hermes cierra el turno con boundary `failed_turn`; **el ACP igual responde
+   `stop=end_turn`** ⇒ un turno fallido podría registrarse como `completed` sin
+   cambios. Superficie honesta de fallos de proveedor = requisito de P2-S2/S3.
+2. La memoria de perfil (`MEMORY.md`) persiste entre sesiones: cualquier claim
+   de restauración debe aislarla (protocolo session-only) — ya documentado.
+3. `request_count` no refleja turnos free; usar `session_model_usage`.
+4. Cancelación/recuperación con Hermes real: fuera de este corte (P2-S3).
+
+**GO/NO-GO para P2-S1: GO (condicional).** Condiciones: (a) superficiar turnos
+fallidos como fallos (no `completed`), (b) re-baseline del presupuesto idle en
+P2-S4, (c) política de selección de modelo (free/créditos) documentada,
+(d) cancelación/recuperación real en P2-S3. Evidencia: `e3-e4-e7-l4-r7.txt` +
+JSONs `e3-*.json`, `e4-*.json`, `l4x-*.json` (redactados; sin valores).
