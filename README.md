@@ -4,14 +4,18 @@ Un terminal donde el agente de IA es un **participante nativo** del entorno: cad
 
 **La promesa:** corre completo en un ThinkPad de 2018 con 16 GB. No necesitás comprar una laptop nueva.
 
-> Estado: **Fase 0 completa y auditada; Fase 1 con gates de producto verdes y
-> aceptación de ingeniería pendiente de re-verificación independiente (S6-R1:
-> tooling del benchmark en remediación).** Registro: [`docs/phase1-status.md`](docs/phase1-status.md).
+> Estado: **Fase 1 COMPLETA para concurrencia mock determinista (N=2)** —
+> auditorías independientes con veredicto final **PASS**. Registro y límites:
+> [`docs/phase1-status.md`](docs/phase1-status.md).
 > Commit certificado Fase 0: [`41ab86cc`](https://github.com/elliotsecops/aeril/commit/41ab86cc28acad3476da3662723fd2411d6db16b) (62/62 tests).
-> S5 (G1–G9) certificado: [`1cfe627`](https://github.com/elliotsecops/aeril/commit/1cfe6279cf9de6260493da937590b63c116c49ac).
-> Concurrencia mock determinista (N=2) validada; sesiones Hermes reales
-> concurrentes y restauración verificada de contexto quedan **fuera del alcance
-> certificado**.
+> S5 (G1–G9) certificado: [`1cfe627`](https://github.com/elliotsecops/aeril/commit/1cfe6279cf9de6260493da937590b63c116c49ac) ·
+> S6-R2 (benchmark seguro) certificado: [`647b539`](https://github.com/elliotsecops/aeril/commit/647b539124d191664947b1952186fd8cfca5dc02).
+> Certificado: dos runs mock concurrentes en una TUI, workspaces/checkpoints
+> durables, reconciliación y cancelación por run, borrado guardado, restauración
+> por OID exacto e integración FF concurrente, con presupuestos release verificados.
+> **Fuera del alcance certificado:** dos sesiones Hermes autenticadas
+> concurrentes, aislamiento de credenciales del host, restauración verificada de
+> contexto conversacional, readiness productivo y sandboxing OS.
 
 **Entregado en Fase 0** (el corte vertical completo, un thread):
 

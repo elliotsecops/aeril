@@ -1,23 +1,23 @@
 # Fase 1 — Estado de aceptación de ingeniería (S6)
 
-> Fecha: 2026-10-15 · Baseline: `main @ 1cfe627` (S5 integrado) · Rama S6:
-> `feat/phase1-s6-final-acceptance` · Este documento es el registro de
-> aceptación auditable de la Fase 1. No reemplaza a `MANIFIESTO.md`.
+> Fecha: 2026-10-15 · Baseline certificado: `main @ 647b539` (S6-R2 integrado) ·
+> Este documento es el registro de aceptación auditable de la Fase 1. No
+> reemplaza a `MANIFIESTO.md`.
 
-> **Estado S6 (actualizado tras la auditoría):** la auditoría independiente de
-> S6 devolvió **FAIL** contra `9ea0e68`, confinado al **tooling del benchmark**
-> (A: limpieza destructiva de `--data-dir`; B: terminación de PIDs sin
-> identidad; C: targets standalone del Makefile; D: validación de mediciones).
-> Los gates de producto quedaron verdes. La remediación vive en
-> `fix/phase1-s6-benchmark-safety` (SHA en el commit de entrega de S6-R1) y
-> **queda pendiente de re-verificación independiente**: S6 **no** está aceptado.
+> **Cierre Fase 1:** la auditoría independiente final dio **PASS** a S6-R2
+> (`647b539`, sin hallazgos bloqueantes). S6-R1 (`bec6372`) y S6-R2
+> (`647b539`) están integrados en `main` por fast-forward. **Fase 1 queda
+> COMPLETA para concurrencia mock determinista (N=2)**, con los límites
+> certificados declarados abajo. El cierre documental vive en la rama
+> `docs/phase1-closeout` (separado del SHA de código auditado).
 
 ## 0. Verdicto de readiness (tres claims separados)
 
-**A. Ingeniería de concurrencia mock de Fase 1 — COMPLETA.**
-Independientemente verificada: G1–G9 en verde (S5, PASS de auditoría), invariantes
-de seguridad preservados (S0/S0-R1, RC2.1, S4-R1), presupuestos de Fase 0
-re-medidos en verde (release). Límite de producto N=2 (por instancia de TUI).
+**A. Ingeniería de concurrencia mock de Fase 1 — COMPLETA (verificada).**
+Independientemente verificada: G1–G9 en verde (S5 `1cfe627`, PASS de auditoría),
+invariantes de seguridad preservados (S0/S0-R1, RC2.1, S4-R1), presupuestos de
+Fase 0 re-medidos en verde (release), tooling de benchmark corregido y aceptado
+(S6-R2 `647b539`, PASS). Límite de producto N=2 (por instancia de TUI).
 
 **B. Operación real con UN Hermes — soportada, con preguntas abiertas.**
 Lo validado con Hermes real (no mock): el backend ACP `hermes` funciona de punta
@@ -32,7 +32,28 @@ No existe evidencia independiente de sesiones ACP autenticadas concurrentes ni
 de aislamiento de credenciales del host. El shim determinista de G8 **no** es un
 Hermes autenticado. No se infiere readiness productivo de tests mock.
 
-**Declaración recomendada (si S6 pasa):**
+### Certificación formal (cierre Fase 1)
+
+**Certificado** (con la evidencia de §3–§5 y las topologías declaradas):
+
+- Dos runs mock concurrentes en una TUI (N=2, uno por thread).
+- Workspaces independientes y checkpoints durables por OID.
+- Reconciliación de crashes y cancelación por run (cooperativa y por plazo).
+- Autorización fail-closed y borrado de workspaces guardado (fence de lease).
+- Restauración de archivos desde el OID exacto del checkpoint.
+- Integración fast-forward concurrente con CAS (un solo ganador; ref autoritativa).
+- Presupuestos de performance release verificados (`make budget*`).
+
+**NO certificado** (fuera del alcance aceptado):
+
+- Dos sesiones Hermes autenticadas concurrentes.
+- Aislamiento independiente de credenciales del host.
+- Restauración verificada de contexto conversacional (`verified=false`).
+- Readiness de deployment productivo.
+- Sandboxing OS de las cargas de agente (worktrees ≠ sandbox).
+
+
+**Declaración formal de cierre:**
 
 > Phase 1 engineering acceptance is complete for deterministic mock-agent
 > concurrency (N=2). Real concurrent authenticated Hermes sessions and verified
@@ -61,7 +82,7 @@ Hermes autenticado. No se infiere readiness productivo de tests mock.
 | **S4** | auditoría detectó D1/D2 | `60921bc`→`48e94af` | `workspace list` read-only, dedupe, estados/elegibilidad, borrado guardado | `tests/phase1_s4.rs` (11) | reemplazado por S4-R1 |
 | **S4-R1** | PASS (auditoría) | `dac8ab2` (rojo) → `ecdbd38` → `880b7c7` (FF) | borrado seguro: guard de supervisor vivo/desconocido (D1) + fence transaccional de lease (D2); `--unsafe-ok` no pisa leases | `tests/phase1_s4_r1.rs` (7) | fences serializan contra adquisiciones de Aeril, no contra procesos externos |
 | **S5** | PASS (auditoría) | `1cfe627` (FF) | G1–G9 end-to-end (matriz §3) | `tests/phase1_concurrency.rs` (11) | mock determinista; Hermes real concurrente NO verificado |
-| **S6** | **FAIL de auditoría (solo tooling de bench) → remediación S6-R1** | `4096b15` (candidato fallido `9ea0e68`); remediación en `fix/phase1-s6-benchmark-safety` | presupuestos release re-medidos, registro de aceptación, límites declarados; S6-R1 corrige ciclo de vida del data dir, limpieza identity-aware (pidfd), targets standalone y validación de mediciones | §4/§5 + `make budget*` + `tests/phase1_s6_bench.rs` + unittest de seguridad | aceptación S6 pendiente de re-verificación independiente |
+| **S6 (+S6-R1, S6-R2)** | **PASS (auditoría final)** | **`647b539`** en main (histórico: candidato fallido `9ea0e68`; S6-R1 `bec6372`; S6-R2 rojo `1bb0e5f` → fix `647b539`) | presupuestos release re-medidos, registro de aceptación, límites declarados; bench seguro: sentinel de propiedad, limpieza identity-aware con pidfd, targets standalone, validación de mediciones, **starttime ausente ⇒ nunca se señaliza (fail-closed)** | §4/§5 + `make budget*` + `tests/phase1_s6_bench.rs` + `scripts/bench/test_two_run_safety.py` | sin features nuevas; sin tag de release |
 
 ## 3. Matriz final G1–G9
 
@@ -130,11 +151,14 @@ app y de un agente mock; no permiten inferir el consumo de Hermes real
 
 ## 5. Regresión final
 
-- `cargo test --locked --offline --jobs 2 --no-fail-fast` → **121/121**, 0 fallos.
+- `cargo test --locked --offline --jobs 2 --no-fail-fast` → **124/124**, 0 fallos
+  (121 baseline + 3 tests cargo de seguridad del bench).
+- `python3 scripts/bench/test_two_run_safety.py` → **17/17** (incluye el caso
+  starttime ausente fail-closed de S6-R2).
 - `cargo fmt --all -- --check` → limpio.
 - `cargo clippy --locked --offline --jobs 2 --all-targets -- -D warnings` → limpio.
 - `make budget` → PASS · `make budget-scale` → PASS · `make budget-two` → PASS
-  (2 corridas reproducibles).
+  (2 corridas reproducibles; cleanup sin incertidumbre).
 - Regresiones de integración/procesos re-ejecutadas además de la suite:
   `phase1_concurrency` (11), `phase1_s4_r1` (7), `phase1_s0`+`safety`, `phase1_s3`
   (9) — todas verdes. Estabilidad: S5 acumuló 30+ corridas; los dos flakes
@@ -196,6 +220,17 @@ app y de un agente mock; no permiten inferir el consumo de Hermes real
 - **Mitigación**: el reintento solo ocurre con `status.code() == None` y repite
   las MISMAS aserciones; errores reales no se reintentan. **Bloquea**: NO.
 
+### 6.7 Benchmark sentinel / identidad de procesos — severidad BAJA (solo tooling)
+- **Consecuencia**: el sentinel `.aeril-bench-two-run` acredita propiedad por
+  archivo marcador (no criptográfico); los rechazos de raíz/home/sistema/
+  symlinks/ancestros son defensa en profundidad, no una frontera de seguridad.
+  La limpieza de procesos exige starttime original válido + cmdline de mock y
+  usa pidfd; sin starttime registrado **nunca** se señaliza (S6-R2).
+- **Mitigación**: fail-closed en todos los caminos dudosos; suites de seguridad
+  propias (17 unittest + 3 tests cargo). **Bloquea**: NO.
+- **Evidencia requerida antes de release amplio**: ninguna adicional para el
+  hito mock; revisar si el bench se expone a usuarios externos.
+
 ## 7. Smoke test manual reproducible
 
 Con el binario release (`make build`) y `AERIL_DATA_DIR` a elección:
@@ -219,11 +254,12 @@ $B                                   # abre la TUI (backend mock: --backend mock
 
 ## 8. Declaración de cierre
 
-Los gates de producto de Fase 1 (121/121 + fmt + Clippy + presupuestos release)
-siguen verdes, pero la **auditoría de S6 devolvió FAIL en el tooling del
-benchmark** (hallazgos A–D) y su remediación (S6-R1) **todavía no fue
-re-verificada de forma independiente**: S6 no se declara aceptado y **no se
-anuncia el cierre formal de Fase 1**. El cierre queda sujeto a la aceptación
-independiente de S6-R1 sobre `fix/phase1-s6-benchmark-safety`, con las
-limitaciones de §6 declaradas y sin claim de readiness productivo general ni de
-Hermes real concurrente.
+**Fase 1 COMPLETA para concurrencia mock determinista (N=2)**. Evidencia:
+gates de producto verdes (**124/124** Rust + **17/17** Python + fmt + Clippy),
+presupuestos release PASS (`make budget` / `budget-scale` / `budget-two`),
+auditorías independientes con veredicto final **PASS** (S0-R1, S2, S3, S4-R1,
+S5, S6-R2) e integración por fast-forward en `main` (`647b539`). No hay blocker
+pendiente para el hito mock. Sin tag de release; sin claim de readiness
+productivo general, de Hermes real concurrente ni de restauración de contexto
+(§0, certificación formal). El cierre documental (esta rama) se mantiene
+separado del SHA de código auditado.

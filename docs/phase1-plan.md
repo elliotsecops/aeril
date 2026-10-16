@@ -1,6 +1,6 @@
 # Fase 1 — Plan de ingeniería (aprobado 2026-10-14)
 
-> Baseline: `main @ 1cfe627` · **S0** integrado y aceptado (PASS S0-R1, `e38a7d4`) · **S1** CONDITIONAL — single-Hermes default (`docs/phase1-s1-hermes-isolation.md`) · **S2** integrado (PASS, `b63f582`) · **S3** integrado (CONDITIONAL PASS, `99d2f7b`) · **S4 + S4-R1** integrados y aceptados (PASS, `880b7c7`) · **S5** integrado (PASS, `1cfe627`) · **S6** implementado (`4096b15`; registro de aceptación en `docs/phase1-status.md`).
+> Baseline: `main @ 647b539` · **S0** integrado y aceptado (PASS S0-R1, `e38a7d4`) · **S1** CONDITIONAL — single-Hermes default (`docs/phase1-s1-hermes-isolation.md`) · **S2** integrado (PASS, `b63f582`) · **S3** integrado (CONDITIONAL PASS, `99d2f7b`) · **S4 + S4-R1** integrados y aceptados (PASS, `880b7c7`) · **S5** integrado (PASS, `1cfe627`) · **S6 + S6-R1 + S6-R2** integrados y aceptados (**auditoría final PASS**, `647b539`). **Fase 1 COMPLETA para concurrencia mock determinista (N=2)** — registro en `docs/phase1-status.md`.
 > Objetivo: **dos agentes concurrentes** (dos threads, mismo repo, un workspace verificado
 > cada uno) con estado durable, revisión independiente y recuperación segura.
 > Toda la validación primaria es **mock determinista**; Hermes real en paralelo queda
@@ -46,7 +46,7 @@ restringe procesos externos. Se documentará en la UI/CLI y en `docs/phase1-*`.
 | S3 | TUI concurrente (2 runs, cancelar por run) | `n` nuevo run en el thread abierto; slots por invocación (N=2, 1/thread, Hermes real 1/vez); `x` cancela solo el thread seleccionado y el slot se libera únicamente con el ack terminal; `q` bloqueado con runs vivos; mismo panel único; harness PTY solo para tests | ✅ **integrado y aceptado** (CONDITIONAL PASS; `99d2f7b` en main; 9 tests T1–T9) |
 | S4 | `workspace list` + ciclo de vida | `workspace list [--thread T] [--limit N]` (solo lectura, dedupe por workspace, estados y elegibilidad de reuso) + guard de `worktree rm` (lease vivo RC2.1; `--unsafe-ok` explícito) + rehidratación verificada | ✅ `60921bc5e01e7ae1c90dbe47336184fcf4473d6a` (11 tests S4; suite 103/103; budget PASS) |
 | S5 | E2E de concurrencia (mock) | `tests/phase1_concurrency.rs`: G1–G9 con topologías explícitas (TUI única / procesos CLI independientes / kill de backend vs SIGKILL del proceso completo) | ✅ **integrado y aceptado** (PASS auditoría; `1cfe627` en main; 11 tests) |
-| S6 | Presupuestos + docs de fase | `docs/phase1-status.md` (registro de aceptación), `make budget-two` (escenario real de 2 runs), límites priorizados y verdicto de readiness A/B/C | ✅ `4096b15` (este corte; suite 121/121; budget + scale + two PASS) |
+| S6 | Presupuestos + docs de fase | `docs/phase1-status.md` (registro de aceptación y certificación), `make budget-two` (escenario real de 2 runs), límites priorizados, verdicto de readiness A/B/C y tooling de bench seguro (S6-R1/R2) | ✅ **integrado y aceptado** (`647b539` en main; auditoría final PASS; 124/124 Rust + 17/17 Python; budget + scale + two PASS) |
 
 ### S4 — Semántica de `workspace list` y borrado seguro
 
@@ -199,3 +199,9 @@ UI de permisos más allá de auto/deny.
 Los gates G1–G9 automatizados en verde con mock, presupuestos re-medidos, y un informe
 de aceptación con los límites declarados (Hermes real condicionado a S1). Sin claims
 de contexto restaurado ni de trabajo no-chequeado recuperado.
+
+**Cumplido (cierre 2026-10-15):** G1–G9 aceptados dentro de sus topologías declaradas,
+presupuestos release PASS (`make budget` / `budget-scale` / `budget-two`), auditorías
+independientes con veredicto final PASS e integración FF en `main` (`647b539`).
+Fase 1 COMPLETA para concurrencia mock determinista (N=2); el cierre documental vive
+en `docs/phase1-closeout` (separado del SHA de código auditado). Sin tag de release.
