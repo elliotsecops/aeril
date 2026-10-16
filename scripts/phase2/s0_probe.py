@@ -204,6 +204,9 @@ class AcpClient:
         - kind debe ser exactamente "edit";
         - al menos una ruta verificable;
         - ninguna ruta absoluta/NUL/vacía;
+        - SIN separadores de display multi-archivo V4A (`", "`) ni de
+          move/rename (`" -> "`): el builder instalado los emite como string
+          de display, no como paths verificables (F1);
         - TODAS deben resolver (realpath, siguiendo symlinks) dentro del repo.
         Devuelve (ok, reason, relative_paths).
         """
@@ -226,6 +229,23 @@ class AcpClient:
         for raw in paths:
             if not raw or "\x00" in raw or os.path.isabs(raw):
                 return False, f"ruta inválida o absoluta: {raw!r}", []
+            # F1 (R3): el builder V4A instalado surfacea multi-archivo como
+            # `", ".join(paths)` (display), sin metadata por archivo ni
+            # `locations`. Ese string NO es verificable: no se hace realpath
+            # sobre él ni se parte en paths "verificados". Se rechaza entero.
+            if ", " in raw:
+                # Motivo sin eco del display crudo (política de evidencia R2).
+                return (
+                    False,
+                    "metadata multi-archivo V4A no verificable (separador de join ', ')",
+                    [],
+                )
+            if " -> " in raw:
+                return (
+                    False,
+                    "display de move/rename no verificable (' -> ')",
+                    [],
+                )
             joined = os.path.realpath(os.path.join(repo_real, raw))
             if not joined.startswith(repo_real + os.sep):
                 return False, f"ruta fuera del repo: {raw!r}", []

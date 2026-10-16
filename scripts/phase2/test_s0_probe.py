@@ -175,6 +175,83 @@ class VerifiedEditScopeTest(unittest.TestCase):
         self.assertFalse(client._default_ask({"kind": "edit", "paths": ["NOTES.md"]}))
 
 
+class V4aMultiFileMetadataTest(unittest.TestCase):
+    """F1 (R3): el builder real de Hermes 0.21.5
+    (`acp_adapter/edit_approval.py::_proposal_for_patch_v4a`) surfacea
+    multi-archivo como un string display `", ".join(paths)` en
+    `content[0].path`, SIN `locations` ni metadata por archivo. Ese string NO
+    es un path verificable: hay que rechazar el pedido completo."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aeril-p2s0-v4a-")
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        with open(os.path.join(self.repo, "NOTES.md"), "w") as f:
+            f.write("base\n")
+        self.outside = os.path.join(self.tmp, "outside")
+        os.makedirs(self.outside)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _payload(self, display_path, req_id):
+        # Réplica EXACTA del payload del builder instalado para multi-archivo.
+        return permission_request(req_id, ALLOW_DENY, diff_paths=[display_path])
+
+    def test_v4a_multifile_traversal_rejected(self):
+        client, stdin = make_client("approve-verified-edits", repo=self.repo)
+        client._handle_incoming(
+            self._payload("inrepo.txt, ../outside/victim.txt", 30)
+        )
+        outcome = sent_messages(stdin)[0]["result"]["outcome"]
+        self.assertEqual(outcome.get("optionId"), "deny", outcome)
+        self.assertIn("multi-archivo", client.permission_log[0]["reason"])
+        self.assertEqual(client.permission_log[0]["paths"], [])
+
+    def test_v4a_multifile_all_inside_still_rejected(self):
+        client, stdin = make_client("approve-verified-edits", repo=self.repo)
+        client._handle_incoming(self._payload("a.txt, b.txt", 31))
+        outcome = sent_messages(stdin)[0]["result"]["outcome"]
+        self.assertEqual(outcome.get("optionId"), "deny", outcome)
+        self.assertIn("multi-archivo", client.permission_log[0]["reason"])
+
+    def test_v4a_multifile_ask_human_never_invokes_callback(self):
+        called = []
+        client, stdin = make_client(
+            "ask-human", repo=self.repo, ask_fn=lambda s: called.append(s) or True
+        )
+        client._handle_incoming(
+            self._payload("inrepo.txt, ../outside/victim.txt", 32)
+        )
+        outcome = sent_messages(stdin)[0]["result"]["outcome"]
+        self.assertEqual(outcome.get("optionId"), "deny", outcome)
+        self.assertEqual(called, [], "un pedido no verificable no llega al humano")
+        self.assertNotIn("inrepo.txt, ../outside", json.dumps(client.permission_log))
+
+    def test_move_display_metadata_rejected(self):
+        client, stdin = make_client("approve-verified-edits", repo=self.repo)
+        client._handle_incoming(self._payload("old.txt -> new.txt", 33))
+        outcome = sent_messages(stdin)[0]["result"]["outcome"]
+        self.assertEqual(outcome.get("optionId"), "deny", outcome)
+        self.assertIn("move/rename", client.permission_log[0]["reason"])
+
+    def test_single_file_write_inside_allowed_preserved(self):
+        # Single-file: el builder usa paths[0] tal cual (p. ej. write_file).
+        client, stdin = make_client("approve-verified-edits", repo=self.repo)
+        client._handle_incoming(permission_request(34, ALLOW_DENY, diff_paths=["NOTES.md"]))
+        outcome = sent_messages(stdin)[0]["result"]["outcome"]
+        self.assertEqual(outcome.get("optionId"), "allow_once", outcome)
+        self.assertEqual(client.permission_log[0]["decision"], "approved-verified-edit")
+
+    def test_single_file_escapes_still_rejected(self):
+        os.symlink(self.outside, os.path.join(self.repo, "link"))
+        for req_id, path in ((35, "/etc/passwd"), (36, "../escape.txt"), (37, "link/evil.txt")):
+            client, stdin = make_client("approve-verified-edits", repo=self.repo)
+            client._handle_incoming(permission_request(req_id, ALLOW_DENY, diff_paths=[path]))
+            outcome = sent_messages(stdin)[0]["result"]["outcome"]
+            self.assertEqual(outcome.get("optionId"), "deny", (path, outcome))
+
+
 class InheritedModeGuardTest(unittest.TestCase):
     def test_default_mode_auth_ops_refused(self):
         with self.assertRaises(SystemExit) as cm:

@@ -1,0 +1,21 @@
+F1 (R3) — evidencia roja/verde del bypass de alcance multi-archivo V4A
+======================================================================
+
+Fixture: payload EXACTO del builder instalado Hermes 0.21.5+8877.g865ba90
+(acp_adapter/edit_approval.py::_proposal_for_patch_v4a):
+  toolCall.kind = "edit"
+  content[0] = {type:"diff", path:"inrepo.txt, ../outside/victim.txt"}  # ", ".join(paths)
+  sin locations
+
+ROJO contra 0d50357 (sin fix) — 4 FAIL:
+  FAIL test_v4a_multifile_traversal_rejected            (el pedido era aprobado allow_once)
+  FAIL test_v4a_multifile_all_inside_still_rejected     (aprobado como "verificado")
+  FAIL test_v4a_multifile_ask_human_never_invokes_callback (callback humano invocado)
+  FAIL test_move_display_metadata_rejected              (aprobado)
+
+GREEN contra el fix:
+  python3 scripts/phase2/test_s0_probe.py → Ran 30 tests ... OK
+  Repro independiente (ambas políticas):
+    approve-verified-edits: outcome=deny · ask_fn llamado=0
+    ask-human:              outcome=deny · ask_fn llamado=0
+    reason: "metadata multi-archivo V4A no verificable (separador de join ', ')"

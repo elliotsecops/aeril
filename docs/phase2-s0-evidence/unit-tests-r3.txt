@@ -1,0 +1,39 @@
+test_cli_refuses_default_mode_auth_ops (__main__.EnvAndHomeTest.test_cli_refuses_default_mode_auth_ops) ... ok
+test_env_allow_only_safe_vars (__main__.EnvAndHomeTest.test_env_allow_only_safe_vars) ... [s0] RECHAZADO: --env-allow solo admite variables no-secretas: ['BROWSER', 'DISPLAY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR']
+ok
+test_san_home_per_profile_distinct (__main__.EnvAndHomeTest.test_san_home_per_profile_distinct) ... ok
+test_sanitized_env_excludes_host_auth_vars (__main__.EnvAndHomeTest.test_sanitized_env_excludes_host_auth_vars) ... ok
+test_setup_creates_independent_0700_homes (__main__.EnvAndHomeTest.test_setup_creates_independent_0700_homes) ... ok
+test_ssh_auth_sock_not_allowlisted (__main__.EnvAndHomeTest.test_ssh_auth_sock_not_allowlisted) ... [s0] RECHAZADO: --env-allow solo admite variables no-secretas: ['BROWSER', 'DISPLAY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR']
+ok
+test_default_mode_auth_ops_refused (__main__.InheritedModeGuardTest.test_default_mode_auth_ops_refused) ... [s0] RECHAZADO: session/new|prompt|load en modo `default` (entorno heredado) están prohibidos: pueden usar credenciales ambientales del host (p. ej. gemini) y NO son evidencia de autenticación por perfil. Usá --env-mode sanitized, o --allow-inherited-auth-ops para un diagnóstico explícito (marcado como no-evidencia).
+ok
+test_default_mode_initialize_only_allowed (__main__.InheritedModeGuardTest.test_default_mode_initialize_only_allowed) ... ok
+test_default_mode_with_explicit_override_allowed (__main__.InheritedModeGuardTest.test_default_mode_with_explicit_override_allowed) ... ok
+test_sanitized_mode_always_allowed (__main__.InheritedModeGuardTest.test_sanitized_mode_always_allowed) ... ok
+test_execute_kind_never_approved_even_with_verified_policy (__main__.PermissionFailClosedTest.test_execute_kind_never_approved_even_with_verified_policy) ... ok
+test_no_deny_option_cancels_not_approves (__main__.PermissionFailClosedTest.test_no_deny_option_cancels_not_approves) ... ok
+test_unsolicited_permission_denied_by_default (__main__.PermissionFailClosedTest.test_unsolicited_permission_denied_by_default) ... ok
+test_move_display_metadata_rejected (__main__.V4aMultiFileMetadataTest.test_move_display_metadata_rejected) ... ok
+test_single_file_escapes_still_rejected (__main__.V4aMultiFileMetadataTest.test_single_file_escapes_still_rejected) ... ok
+test_single_file_write_inside_allowed_preserved (__main__.V4aMultiFileMetadataTest.test_single_file_write_inside_allowed_preserved) ... ok
+test_v4a_multifile_all_inside_still_rejected (__main__.V4aMultiFileMetadataTest.test_v4a_multifile_all_inside_still_rejected) ... ok
+test_v4a_multifile_ask_human_never_invokes_callback (__main__.V4aMultiFileMetadataTest.test_v4a_multifile_ask_human_never_invokes_callback) ... ok
+test_v4a_multifile_traversal_rejected (__main__.V4aMultiFileMetadataTest.test_v4a_multifile_traversal_rejected) ... ok
+test_absolute_path_denied (__main__.VerifiedEditScopeTest.test_absolute_path_denied) ... ok
+test_ask_human_approves_only_with_explicit_yes_and_verification (__main__.VerifiedEditScopeTest.test_ask_human_approves_only_with_explicit_yes_and_verification) ... ok
+test_ask_human_denied_when_user_says_no (__main__.VerifiedEditScopeTest.test_ask_human_denied_when_user_says_no) ... ok
+test_ask_human_unverified_never_reaches_human (__main__.VerifiedEditScopeTest.test_ask_human_unverified_never_reaches_human) ... ok
+test_default_ask_without_tty_fails_closed (__main__.VerifiedEditScopeTest.test_default_ask_without_tty_fails_closed) ... [s0] permiso {'kind': 'edit', 'paths': ['NOTES.md']}: sin TTY para aprobación humana ⇒ DENEGADO
+ok
+test_in_repo_diff_approved (__main__.VerifiedEditScopeTest.test_in_repo_diff_approved) ... ok
+test_locations_in_repo_approved (__main__.VerifiedEditScopeTest.test_locations_in_repo_approved) ... ok
+test_missing_paths_denied (__main__.VerifiedEditScopeTest.test_missing_paths_denied) ... ok
+test_mixed_paths_one_outside_denies_all (__main__.VerifiedEditScopeTest.test_mixed_paths_one_outside_denies_all) ... ok
+test_relative_escape_denied (__main__.VerifiedEditScopeTest.test_relative_escape_denied) ... ok
+test_symlink_escape_denied (__main__.VerifiedEditScopeTest.test_symlink_escape_denied) ... ok
+
+----------------------------------------------------------------------
+Ran 30 tests in 0.170s
+
+OK

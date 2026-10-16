@@ -1,7 +1,7 @@
 # P2-S0 — Gate de factibilidad: Hermes autenticado (spike, Security R1)
 
 > Estado: **CONDITIONAL — bloqueado en E2 (autenticación interactiva del
-> usuario), con harness endurecido (R1 + R2).** Rama
+> usuario), con harness endurecido (R1 + R2 + R3).** Rama
 > `spike/phase2-s0-hermes-auth`. Plan: `docs/phase2-plan @ 367c6ce`.
 > Este documento NO declara Fase 2 habilitada ni GO para P2-S1.
 > Evidencia R1/R2 en `docs/phase2-s0-evidence/` (redactada, sin credenciales).
@@ -9,18 +9,20 @@
 ## 0. Cambios de Security R1 (este corte)
 
 1. **Permisos fail-closed**: el harness **deniega** todo pedido del agente por
-   defecto; nunca elige una opción `allow*`. `--permissions approve-edits`
-   (decisión explícita del usuario) solo aprueba pedidos `kind == "edit"`;
-   execute/shell/desconocido se deniegan. Sin opción de deny ⇒ respuesta
-   `cancelled` (formato válido del protocolo).
+   defecto; nunca elige una opción `allow*`. Sin opción de deny ⇒ respuesta
+   `cancelled` (formato válido del protocolo). **Nota de supersesión**: la
+   política `approve-edits` citada aquí quedó reemplazada por R2
+   (`approve-verified-edits` / `ask-human`) y por R3 (rechazo de metadata
+   multi-archivo no verificable); ver §0bis y §0ter.
 2. **HOME sanitizado por perfil**: `san-home-A` y `san-home-B` (0700, sin
    archivos, sin credenciales), con `XDG_*` apuntando al HOME sanitizado.
 3. **Default sanitizado**: `--env-mode` por defecto es `sanitized`; el modo
    heredado (`default`) está **prohibido** para `session/new`/`prompt`/`load`
    (exit 3) salvo `--allow-inherited-auth-ops` explícito y **nunca cuenta como
-   evidencia de auth**. Variables no-secretas permitidas por lista blanca
-   (`--env-allow`: DISPLAY, WAYLAND_DISPLAY, XDG_RUNTIME_DIR, BROWSER,
-   SSH_AUTH_SOCK); jamás se copia el entorno completo.
+   evidencia de auth**. **Nota de supersesión (R2)**: la allowlist citada aquí
+   incluía `SSH_AUTH_SOCK`; R2 lo eliminó (capacidad de autenticación). La
+   allowlist vigente es DISPLAY, WAYLAND_DISPLAY, XDG_RUNTIME_DIR, BROWSER;
+   jamás se copia el entorno completo.
 4. **Un solo escritor por perfil**: la responsividad tras el kill se verifica
    con un segundo `initialize` **sobre la misma conexión** (`--ping-after`);
    la reutilización de un perfil se prueba **solo después** de terminar el
@@ -59,6 +61,40 @@
    [hermes-setup]`, ping 18.1 ms en el writer original, reuso secuencial
    1.80 s, strace 0 escrituras a `~/.hermes`, sin strays, sin cambios de
    runtime de producto (`git diff main..HEAD` = solo scripts/phase2 + docs).
+
+## 0ter. Cambios de Security R3 (F1 — bypass de alcance multi-archivo V4A)
+
+**F1 (raíz)**: el builder instalado de Hermes 0.21.5+8877.g865ba90
+(`acp_adapter/edit_approval.py::_proposal_for_patch_v4a`) surfacea los edits
+multi-archivo como un **string de display** `", ".join(paths)` en
+`content[0].path`, **sin metadata por archivo y sin `locations[]`**. El harness
+R2 hacía `realpath` sobre ese string unido: `"inrepo.txt, ../outside/victim.txt"`
+resolvía dentro del repo (el `..` cancelaba el componente `"inrepo.txt, "`) y el
+pedido — cuyo objetivo real incluía un archivo FUERA del repo — era aprobado
+con `allow_once`. Bypass de alcance confirmado en rojo (4 FAIL, ver
+`f1-red-green-r3.txt`).
+
+**Corrección (mínima, harness-only)** en `_verify_edit_scope()`:
+- se rechaza cualquier `path` que contenga el separador de join V4A `", "` y
+  cualquier display de move/rename `" -> "`;
+- **nunca** se corre `realpath` sobre un string de display unido ni se lo parte
+  en paths "verificados" sin un contrato autoritativo por archivo;
+- si **cualquier** ruta es no verificable, se rechaza el pedido **completo**,
+  con motivo explícito y sin eco del display crudo;
+- se preservan los chequeos single-file (absolutas, `../`, symlinks).
+
+**Políticas**: para el payload F1, `approve-verified-edits` **deniega** (jamás
+`allow_once`) y `ask-human` **deniega antes de preguntar** (el callback humano
+NO se invoca; el display unido nunca se presenta como lista verificada).
+`deny` (default) y el rechazo de execute/shell quedan intactos.
+
+**Alcance**: esto es **verificación de metadata**, no un sandbox OS: un archivo
+legítimo con esos delimitadores puede rechazarse conservativamente (aceptable
+para el spike). `locations[]` **no** es emitido por el builder V4A observado en
+esta versión; si una versión futura lo emite con paths por archivo, se
+re-evaluará el contrato.
+
+**Reset**: ver §11 — manifiesto mínimo aprobado por auditoría (solo `p-A`/`p-B`).
 
 ## 1. Versión exacta de Hermes
 
@@ -213,16 +249,25 @@ perfiles (environ/lsof). El reset elimina el estado contaminado porque borra el
 directorio completo (`rm -rf`), y `setup()` solo recrea directorios vacíos (no
 copia nada previo).
 
+**Manifiesto MÍNIMO (aprobado por auditoría — R3)**: solo `p-A` y `p-B` pueden
+eliminarse, tras **repetir** los chequeos de ownership/procesos/symlinks/
+mountpoints y **solo con aprobación explícita del usuario**. Se preservan
+`repo-A/B`, `san-home-A/B` y los diagnósticos locales salvo autorización
+separada.
+
 ```bash
 S=/home/elliot/p2s0-spike
-rm -rf "$S/p-A" "$S/p-B"                 # 407 MiB c/u (contaminados: credential_pool)
-rm -rf "$S/repo-A" "$S/repo-B" "$S/san-home-A" "$S/san-home-B"
-rm -rf "$S"                              # total ≈ 822 MiB (incluye logs/evidencia locales)
-
-# Verificación POST-reset (debe fallar/no encontrar nada):
+# Chequeos renovados ANTES de borrar (deben pasar):
+realpath "$S/p-A" "$S/p-B"                       # rutas literales esperadas
+stat -c '%U:%G %a %F' "$S/p-A" "$S/p-B"          # elliot:elliot 700 directory
+test ! -L "$S/p-A" && test ! -L "$S/p-B"         # no symlinks
+findmnt -R "$S" -o TARGET --noheadings | wc -l   # 0 mountpoints internos
+# Ningún proceso con HERMES_HOME apuntando a p-A/p-B (environ/lsof) — ver T3.
+# Solo con aprobación explícita:
+rm -rf "$S/p-A" "$S/p-B"
 test ! -e "$S/p-A/auth.json" && echo "auth.json eliminado ✓"
-grep -rl "credential_pool" "$S" 2>/dev/null | wc -l   # esperado: 0
-# ~/.hermes, repos del usuario y el resto del sistema NO están en el manifest.
+grep -rl "credential_pool" "$S/p-A" "$S/p-B" 2>/dev/null | wc -l   # esperado: 0
+# NO se borran repo-A/B, san-home-A/B ni el resto del scratch (manifest mínimo).
 ```
 
 ## 12. Próximo paso
