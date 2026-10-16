@@ -84,12 +84,18 @@ comprometer por escrito.
   - G1: Aeril nunca lee/copia/imprime credenciales (auditable: sin accesos a
     `auth.json` en el código de producto).
   - G2: los perfiles no comparten `auth.json` ni tokens entre sí.
-  - G3: el spawn minimiza descubrimiento ambiental: `HERMES_HOME` explícito +
-    limpieza de variables de credenciales conocidas (`GH_TOKEN`,
-    `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) + **HOME
-    sanitizado por agente** (validado en P2-S0; ver abajo).
-  - G4: cualquier credencial que el agente use proviene de su perfil o del
-    entorno explícitamente declarado — no por herencia silenciosa.
+  - G3 (**minimización, NO aislamiento**): el spawn reduce el descubrimiento
+    ambiental accidental: `HERMES_HOME` explícito + limpieza de variables de
+    credenciales conocidas (`GH_TOKEN`, `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`,
+    `OPENAI_API_KEY`, etc.) + **HOME sanitizado por agente** (validado en
+    P2-S0; ver abajo). Bajo una identidad Unix compartida esto **no** impide
+    que código con los mismos permisos del usuario lea archivos del host por
+    ruta absoluta (p. ej. `~/.config/gh/hosts.yml`): no existe garantía de
+    secreto del host sin sandbox OS o usuario separado (N1).
+  - G4 (**trazabilidad, NO aislamiento**): lo que Aeril *decide* usar proviene
+    del perfil o de un entorno explícitamente declarado — sin herencia
+    silenciosa *por parte de Aeril*. No dice nada sobre lo que el agente o el
+    contenido del repo pueden leer del host.
 - **NO garantizado (se declara):** N1: un agente deliberadamente malicioso que
   lea archivos del host (p. ej. `~/.config/gh/hosts.yml`) — requiere sandbox OS
   o usuario separado; N2: aislamiento contra otros usuarios del sistema (fuera
@@ -119,7 +125,11 @@ contenido de repo malicioso que intente exfiltrar credenciales, (b) agente
 malicioso/comprometido, (c) error de configuración de Aeril (cruce de
 perfiles), (d) otros procesos del mismo usuario. Frontera = mismo usuario,
 procesos separados con `HERMES_HOME` distinto. Las garantías G1–G4 aplican a
-(a) y (c); (b) y (d) quedan declarados fuera hasta sandbox/usuario separado.
+(a) y (c); (b) y (d) quedan declarados fuera hasta sandbox/usuario separado. En
+particular, **G3/G4 no protegen contra (a)**: contenido de repo malicioso con
+los mismos permisos del usuario puede leer secretos del host por ruta absoluta
+aunque el env esté sanitizado; ninguna redacción de este plan debe sugerir lo
+contrario.
 
 ## 3. Arquitectura propuesta y alternativas
 
@@ -184,16 +194,24 @@ PASS/FAIL · rollback · auditoría independiente.
   interactivamente con el proveedor elegido **dentro del perfil** (ambient
   `gh` NO cuenta como evidencia); (E3) `session/new` + un prompt por perfil con
   edición canary en worktrees distintos; (E4) persistencia (`sessions list`
-  por perfil); (E5) kill aislado entre procesos; (E6) **HOME sanitizado**:
-  ¿arranca `hermes` sin el HOME del host? (decisión G3); (E7) medir frío/warm,
-  RSS y disco por perfil.
+  por perfil); (E5) **coexistencia simultánea**: ambos procesos `hermes acp`
+  autenticados vivos y operativos a la vez (ventanas de solape reales; sin
+  habilitar concurrencia en la TUI), más kill aislado entre procesos;
+  (E6) **HOME sanitizado** — es un **gate de aislamiento**: si `hermes` no
+  arranca/autentica/ejecuta sin el HOME real, E6 **FALLA**; un fallback a
+  sanitización de env únicamente **NO es seguridad equivalente** y no puede
+  reportarse como tal; continuar hacia P2-S2 exige una **decisión de seguridad
+  explícita** (documentada y aprobada), no un fallback silencioso;
+  (E7) medir frío/warm, RSS y disco por perfil.
 - **Evidencia**: informe `docs/phase2-s0-hermes-auth-gate.md` con salidas
   redactadas (sin tokens), timings y decisión E6.
 - **PASS**: dos perfiles completan un turno real cada uno, con sesiones y
   estado separados, sin copia/impresión de credenciales y sin interferencia.
-  **FAIL**: el proveedor no permite grants independientes, o el bootstrap
-  requiere HOME del host (⇒ G3 limitado a env + declaración), o se observa
-  interferencia de procesos/locks.
+  **FAIL**: el proveedor no permite grants independientes; o el bootstrap
+  requiere HOME del host (E6 = fallo del gate de aislamiento ⇒ la
+  minimización por env no cuenta como equivalente y continuar hacia P2-S2
+  requiere decisión de seguridad explícita); o se observa interferencia de
+  procesos/locks.
 - **Rollback**: eliminar perfiles scratch; no toca `main` ni datos del usuario.
 - **Auditoría**: revisión independiente de la evidencia (obligatoria).
 
@@ -332,7 +350,7 @@ aprobación explícita.
 | Riesgo | Mitigación | Rollback |
 |---|---|---|
 | Grants OAuth no independientes por perfil | P2-S0 decide; proveedor alternativo o API keys | conservar single-Hermes |
-| HOME sanitizado rompe bootstrap de hermes | validar en P2-S0 (E6) | sanitización de env + limitación declarada |
+| HOME sanitizado rompe bootstrap de hermes | validar en P2-S0 (E6); el fallo es un **fallo del gate de aislamiento** | detener; env-only NO es equivalente; decisión de seguridad explícita antes de P2-S2 |
 | Interferencia/locks compartidos | un escritor por perfil + locks propios | abortar P2-S2; single-Hermes |
 | Credenciales ambientales visibles | G3 + declaración N1/N3 | documentar; sandbox como estudio |
 | Crecimiento de memoria de Hermes | presupuesto con headroom + medición S4 | límite de sesiones a 1 |
@@ -350,13 +368,16 @@ Niveles observables (solo L4 cuenta como restauración de contexto):
 - **L4 — Contexto disponible**: en un prompt NUEVO tras el load, el agente
   responde correctamente sobre un **canary no sensible**.
 
-**Protocolo canary (determinista, no sensible):** en el turno 1, pedir al
-agente: *"Memorizá este número para mi próxima pregunta: 7391. Respondé OK."*;
-matar el proceso (no la sesión); relanzar; `session/load` con el `sessionId` y
-el `cwd` del run; esperar el replay; prompt nuevo: *"¿Qué número te pedí
-memorizar?"* → PASS si la respuesta contiene `7391`. Variante negativa: el
-mismo prompt sobre una sesión desconocida (V5) debe NO responder 7391 (control
-de falso positivo).
+**Protocolo canary (no sensible, IMPREDECIBLE por trial):** en cada trial se
+genera un canary nuevo aleatorio (p. ej. `CANARY-<8 hex>` desde CSPRNG; nunca
+se reutiliza entre trials ni se publica antes del test). Turno 1: *"Memorizá
+este identificador para mi próxima pregunta: `<canary>`. Respondé OK."*; matar
+el proceso (no la sesión); relanzar; `session/load` con el `sessionId` y el
+`cwd` del run; esperar el replay; prompt nuevo: *"¿Qué identificador te pedí
+memorizar?"* → PASS si la respuesta contiene el canary exacto. **Controles
+negativos**: (a) el mismo prompt sobre una sesión desconocida (V5) debe NO
+responder el canary; (b) un canary de OTRA sesión/perfil no debe aparecer;
+(c) la pregunta sin load previo no debe responder el canary.
 
 **Si L4 falla**: `verified=false` se mantiene; comportamiento de producto
 honesto ("sesión reanudada; contexto no verificado") y **la restauración no
