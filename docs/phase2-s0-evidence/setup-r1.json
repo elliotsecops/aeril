@@ -1,0 +1,15 @@
+{
+  "scratch": "/home/elliot/p2s0-spike",
+  "profiles": {
+    "p-A": "/home/elliot/p2s0-spike/p-A",
+    "p-B": "/home/elliot/p2s0-spike/p-B"
+  },
+  "san_homes": {
+    "p-A": "/home/elliot/p2s0-spike/san-home-A",
+    "p-B": "/home/elliot/p2s0-spike/san-home-B"
+  },
+  "repos": {
+    "repo-A": "/home/elliot/p2s0-spike/repo-A",
+    "repo-B": "/home/elliot/p2s0-spike/repo-B"
+  }
+}

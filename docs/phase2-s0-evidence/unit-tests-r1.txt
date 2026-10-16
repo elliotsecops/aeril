@@ -1,0 +1,21 @@
+test_cli_refuses_default_mode_auth_ops (__main__.EnvAndHomeTest.test_cli_refuses_default_mode_auth_ops) ... ok
+test_env_allow_only_safe_vars (__main__.EnvAndHomeTest.test_env_allow_only_safe_vars) ... [s0] RECHAZADO: --env-allow solo admite variables no-secretas: ['BROWSER', 'DISPLAY', 'SSH_AUTH_SOCK', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR']
+ok
+test_san_home_per_profile_distinct (__main__.EnvAndHomeTest.test_san_home_per_profile_distinct) ... ok
+test_sanitized_env_excludes_host_auth_vars (__main__.EnvAndHomeTest.test_sanitized_env_excludes_host_auth_vars) ... ok
+test_setup_creates_independent_0700_homes (__main__.EnvAndHomeTest.test_setup_creates_independent_0700_homes) ... ok
+test_default_mode_auth_ops_refused (__main__.InheritedModeGuardTest.test_default_mode_auth_ops_refused) ... [s0] RECHAZADO: session/new|prompt|load en modo `default` (entorno heredado) están prohibidos: pueden usar credenciales ambientales del host (p. ej. gemini) y NO son evidencia de autenticación por perfil. Usá --env-mode sanitized, o --allow-inherited-auth-ops para un diagnóstico explícito (marcado como no-evidencia).
+ok
+test_default_mode_initialize_only_allowed (__main__.InheritedModeGuardTest.test_default_mode_initialize_only_allowed) ... ok
+test_default_mode_with_explicit_override_allowed (__main__.InheritedModeGuardTest.test_default_mode_with_explicit_override_allowed) ... ok
+test_sanitized_mode_always_allowed (__main__.InheritedModeGuardTest.test_sanitized_mode_always_allowed) ... ok
+test_edit_kind_approved_only_with_explicit_policy (__main__.PermissionFailClosedTest.test_edit_kind_approved_only_with_explicit_policy) ... ok
+test_execute_kind_never_approved_even_with_approve_edits (__main__.PermissionFailClosedTest.test_execute_kind_never_approved_even_with_approve_edits) ... ok
+test_no_deny_option_cancels_not_approves (__main__.PermissionFailClosedTest.test_no_deny_option_cancels_not_approves) ... ok
+test_unknown_kind_denied_with_approve_edits (__main__.PermissionFailClosedTest.test_unknown_kind_denied_with_approve_edits) ... ok
+test_unsolicited_permission_denied_by_default (__main__.PermissionFailClosedTest.test_unsolicited_permission_denied_by_default) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 0.171s
+
+OK

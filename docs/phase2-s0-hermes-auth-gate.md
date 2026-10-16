@@ -1,172 +1,195 @@
-# P2-S0 — Gate de factibilidad: Hermes autenticado (spike)
+# P2-S0 — Gate de factibilidad: Hermes autenticado (spike, Security R1)
 
 > Estado: **CONDITIONAL — bloqueado en E2 (autenticación interactiva del
-> usuario).** Rama `spike/phase2-s0-hermes-auth` (desde `main @ 47f0318`).
-> Plan: `docs/phase2-plan @ 367c6ce`. Este documento NO declara Fase 2
-> habilitada ni GO para P2-S1. Evidencia en `docs/phase2-s0-evidence/`.
+> usuario), ahora con harness endurecido (R1).** Rama
+> `spike/phase2-s0-hermes-auth`. Plan: `docs/phase2-plan @ 367c6ce`.
+> Este documento NO declara Fase 2 habilitada ni GO para P2-S1.
+> Evidencia R1 en `docs/phase2-s0-evidence/` (redactada, sin credenciales).
+
+## 0. Cambios de Security R1 (este corte)
+
+1. **Permisos fail-closed**: el harness **deniega** todo pedido del agente por
+   defecto; nunca elige una opción `allow*`. `--permissions approve-edits`
+   (decisión explícita del usuario) solo aprueba pedidos `kind == "edit"`;
+   execute/shell/desconocido se deniegan. Sin opción de deny ⇒ respuesta
+   `cancelled` (formato válido del protocolo).
+2. **HOME sanitizado por perfil**: `san-home-A` y `san-home-B` (0700, sin
+   archivos, sin credenciales), con `XDG_*` apuntando al HOME sanitizado.
+3. **Default sanitizado**: `--env-mode` por defecto es `sanitized`; el modo
+   heredado (`default`) está **prohibido** para `session/new`/`prompt`/`load`
+   (exit 3) salvo `--allow-inherited-auth-ops` explícito y **nunca cuenta como
+   evidencia de auth**. Variables no-secretas permitidas por lista blanca
+   (`--env-allow`: DISPLAY, WAYLAND_DISPLAY, XDG_RUNTIME_DIR, BROWSER,
+   SSH_AUTH_SOCK); jamás se copia el entorno completo.
+4. **Un solo escritor por perfil**: la responsividad tras el kill se verifica
+   con un segundo `initialize` **sobre la misma conexión** (`--ping-after`);
+   la reutilización de un perfil se prueba **solo después** de terminar el
+   writer original (secuencial).
+5. **Evidencia redactada**: sin texto de mensajes/razonamiento del agente ni
+   títulos de tool calls; solo tipos de evento, estados, timings, decisiones de
+   permisos y errores truncados. El canary se verifica en memoria y solo se
+   persiste el booleano.
+6. **Tests de seguridad**: `scripts/phase2/test_s0_probe.py` → **14/14**
+   (deny-by-default, execute nunca aprobado, approve-edits solo para edit,
+   cancel sin deny, guard de modo heredado, HOMEs distintos 0700, env sin
+   variables de auth del host, `--env-allow` restringido, CLI rechaza default).
 
 ## 1. Versión exacta de Hermes
 
 - `hermes --version` → `Hermes Agent v0.21.5+8877.g865ba90 (2026.9.24) · upstream 865ba906`
-- `hermes acp --version` → `0.21.5+8877.g865ba90`
-- **Idéntica a S1 y al `acp-hermes-spec`**: V1–V9 del plan siguen aplicando.
-  Confirmadas en vivo durante el spike: V1 (`HERMES_HOME` honrado), V2 (no se
-  usó `hermes profile create`), V4 (locks por perfil observados), V5 (quirks de
-  load/resume documentados en el spec; L1–L4 pendientes de auth).
+- `hermes acp --version` → `0.21.5+8877.g865ba90` — **idéntica a S1/spec**;
+  V1–V9 del plan siguen aplicando (V1/V2/V4 confirmadas en vivo; V5 pendiente).
 
 ## 2. Entorno y seguridad de la ejecución
 
 | Ítem | Valor |
 |---|---|
-| Scratch | `/home/elliot/p2s0-spike` (ext4, `/dev/nvme0n1p5`, `owner=elliot:elliot`, `mode=700`) |
-| Espacio libre | 20 GB (perfiles ≈ 0.8 GB ⇒ margen amplio) |
+| Scratch | `/home/elliot/p2s0-spike` (ext4, `owner=elliot:elliot`, `mode=700`) |
 | Perfiles | `p-A`, `p-B` (descartables; sin `hermes profile create`) |
-| Repos | `repo-A`, `repo-B` (descartables, `git init` propios) |
-| Perfil del usuario | `~/.hermes` **no modificado por el spike** (strace: 0 escrituras de nuestros procesos; 11 303 accesos de solo lectura a código/pycache). Hay un **gateway del usuario corriendo** (PID 2451) cuya actividad propia cambia mtimes; la evidencia autoritativa es el strace por-proceso |
-| Credenciales | Nunca leídas/impresas/copiadas; sin `auth.json` en la evidencia |
+| HOMEs sanitizados | `san-home-A`, `san-home-B` (**0700**, 0 archivos, sin credenciales) |
+| Repos | `repo-A`, `repo-B` (descartables) |
+| Perfil del usuario | `~/.hermes` **no modificado por el spike**: strace R1 = **0 escrituras** de nuestros procesos (11 304 lecturas de código compartido). Hay un gateway del usuario corriendo (PID 2451); su actividad propia no es nuestra |
+| Permisos del agente | **denegados por defecto** (sin prompts en E1/E5/E6: `permissions: []`) |
 
-## 3. E1 — Perfiles independientes
+## 3. E1 — Perfiles independientes (R1)
 
-✅ Dos `HERMES_HOME` separados con estado propio. Evidencia:
-- `state.db` (+`-wal/-shm`), `sessions/`, `logs/`, `cache/`, `installs/`,
-  `auth.json` por perfil; locks por perfil observados **en vivo**:
-  `auth.lock`, `.hermes-update-in-progress.lock`, `state.db.fts_rebuild.lock`,
-  `state.db.quarantine.lock` (`e1-locks-live.txt`).
-- `sessions list` por perfil → "No sessions found." (coherente con V5/§6.7:
-  `session/new` de sesión vacía no persiste).
-- Disco: **407 MiB en disco por perfil** (`du`; tamaño aparente 1.29 GB antes
-  de deduplicar hardlinks) — comparable a los ~392 MB de S1.
-- Procesos: handles disjuntos por perfil; sin strays al final del spike.
+✅ Dos `HERMES_HOME` + dos `HOME` sanitizados independientes. Evidencia R1:
+- `state.db`(+wal/shm), `sessions/`, `logs/`, `cache/`, `installs/`,
+  `auth.json` por perfil; locks por perfil: `auth.lock`,
+  `.hermes-update-in-progress.lock`, `state.db.fts_rebuild.lock`,
+  `state.db.quarantine.lock` (`e1-locks-*-r1.txt`).
+- Handles **disjuntos**: A no abre rutas de p-B y viceversa; ambos solo
+  comparten la lectura del intérprete Python (`~/.hermes/tools/.../python3.14`)
+  — declarado, no un defecto (`e1-handles-*-r1.txt`).
+- `authMethods=[hermes-setup]` en AMBOS (sin credenciales ambientales) —
+  init 1.96 s / 2.05 s; RSS idle 126/128 MB; sin strays.
+- Disco: **407 MiB en disco por perfil** (`du`).
 
 ## 4. E2 — Autenticación interactiva — **PENDIENTE (usuario)**
 
-⚠️ **No ejecutada**: requiere participación humana en el flujo del proveedor.
-**No se usaron** credenciales del host ni `gh`; **no** se copió `auth.json`.
+⚠️ **No ejecutada.** No se usaron credenciales del host ni `gh`; no se copió
+`auth.json`.
 
-**Runbook exacto (a ejecutar por el usuario):**
+⛔ **PASO 0 OBLIGATORIO (con aprobación del usuario): resetear los perfiles
+contaminados** — ver §8: las corridas previas con env heredado persistieron
+metadata de credenciales del host en `p-A/p-B/auth.json`. Antes de E2:
 
 ```bash
-# Preferido: entorno sanitizado (el mismo que usará el runtime)
 S=/home/elliot/p2s0-spike
-env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME=$S/san-home HERMES_HOME=$S/p-A \
-    /home/elliot/.local/bin/hermes auth add     # elegir proveedor y completar
-env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME=$S/san-home HERMES_HOME=$S/p-B \
-    /home/elliot/.local/bin/hermes auth add
-
-# Verificación SIN exponer valores (solo etiquetas/estado):
-env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME=$S/san-home HERMES_HOME=$S/p-A \
-    /home/elliot/.local/bin/hermes auth list
-# idem p-B
-
-# Modelo por perfil si hace falta:
-env -i ... HERMES_HOME=$S/p-A /home/elliot/.local/bin/hermes model
+# REQUIERE APROBACIÓN EXPLÍCITA DEL USUARIO (borra perfiles descartables):
+rm -rf $S/p-A $S/p-B && python3 <repo>/scripts/phase2/s0_probe.py setup --scratch $S
 ```
 
-Si el onboarding sanitizado falla por entorno (p. ej. OAuth de navegador),
-reintentar con el entorno normal **solo para el onboarding** y documentarlo
-como desviación explícita (el runtime seguiría sanitizado). **Nunca** como
-fallback silencioso.
+**Runbook corregido (a ejecutar por el usuario, entorno sanitizado):**
 
-**Criterio**: dos grants **independientes** por perfil; si el proveedor no lo
-permite → **NO-GO documentado** (plan §4, P2-S0).
+```bash
+S=/home/elliot/p2s0-spike
+for P in A B; do
+  H=$S/p-$P; SAN=$S/san-home-$P
+  env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME=$SAN \
+      XDG_CONFIG_HOME=$SAN/.config XDG_CACHE_HOME=$SAN/.cache \
+      XDG_DATA_HOME=$SAN/.local/share XDG_STATE_HOME=$SAN/.local/state \
+      HERMES_HOME=$H /home/elliot/.local/bin/hermes auth add   # interactivo
+  env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME=$SAN HERMES_HOME=$H \
+      /home/elliot/.local/bin/hermes auth list                 # solo etiquetas
+done
+```
 
-## 5. E3–E5 — Operaciones ACP reales
+Si el OAuth necesita variables de navegador, agregar **solo** las no-secretas
+necesarias (DISPLAY/WAYLAND_DISPLAY/XDG_RUNTIME_DIR/BROWSER); nunca el entorno
+completo. Si el proveedor no permite **dos grants independientes** ⇒
+**NO-GO documentado**.
 
-- **E5 ✅ (sin auth, precondición de procesos)**: dos `hermes acp` **coexisten
-  simultáneamente** (PIDs 509310/509311, env sanitizado), `initialize` en ambos;
-  `kill -9` a A ⇒ **B sigue vivo y operativo**, y un **proceso nuevo sobre p-B
-  responde `initialize` en 1.69 s** mientras B sigue en hold. Terminaciones:
-  A `signal 9` (externa), B `signal 15` (limpia). Sin strays.
-- **E3/E4 — PENDIENTES (auth)**: `session/new` real, prompts canary en
-  `repo-A`/`repo-B`, persistencia por perfil. El harness (`--session-new`,
-  `--prompt`, `--load`) está listo.
-- **TUI**: no se habilitó N=2 Hermes (restricción respetada).
+## 5. E5 — Coexistencia y kill aislado (corregido, un writer por perfil)
 
-## 6. E6 — Entorno sanitizado (HOME sanitizado)
+✅ R1 (sin segundo writer):
+- A y B activos simultáneamente en perfiles distintos (PIDs 552900/552899).
+- `kill -9` a A ⇒ **B (writer original) sigue vivo** y responde un segundo
+  `initialize` **en la misma conexión**: `ping_ok=true`, **17.2 ms**.
+- A termina `signal 9` (externa); B termina `signal 15` (limpia); sin strays.
+- Reutilización de `p-B` **después** de terminar el writer original:
+  `initialize` 1.64 s (secuencial, single-writer preservado).
+- Evidencia: `probe-*-e5-r1.json`, `probe-B-post-r1.json`.
 
-✅ **Bootstrap positivo (pre-auth)**:
-- `--env-mode sanitized` (env mínimo + `HOME=$S/san-home` + `HERMES_HOME`
-  explícito): `initialize` **1 754 ms**, `authMethods=[hermes-setup]` (sin
-  descubrimiento ambiental), `session/new` falla **honestamente**
-  (`"Hermes is not connected to any AI provider yet. Run \`hermes model\`…"`).
-- `--env-mode nohome` (sin HOME): idéntico (1 710 ms, `[hermes-setup]`).
-- El launcher de Hermes usa rutas absolutas (no depende del HOME real para
-  arrancar); el HOME sanitizado **corta el descubrimiento de credenciales
-  ambientales** en runtime.
-- **Caveat**: el **onboarding** bajo entorno sanitizado no se probó (es parte
-  de E2). Si falla, aplica la regla del plan corregido: **fallo del gate de
-  aislamiento**, sin fallback silencioso.
+## 6. E6 — Entorno sanitizado (HOME por perfil)
 
-## 7. E7 — Mediciones reales
+✅ Bootstrap pre-auth con `san-home-A` (y sin HOME): `initialize` **1.68–1.81 s**,
+`authMethods=[hermes-setup]`, `session/new` falla honestamente
+(`-32603: "Hermes is not connected to any AI provider yet. Run \`hermes model\`…"`).
+**Sin `gemini` en la evidencia sanitized** (verificado por grep en el JSON).
+Caveat: el **onboarding** sanitizado se prueba en E2; si falla ⇒ fallo del gate
+de aislamiento (sin fallback silencioso).
 
-| Métrica (Hermes; Aeril NO participó en este spike) | p-A | p-B |
-|---|---|---|
-| Cold init (primera materialización) | ~46 s (observado en orquestación; sin JSON) | **26.7 s** |
-| Warm init (sanitizado) | **1.75 s** | **1.68 s** |
-| RSS idle (sanitizado, sin turno) | 124–191 MB* | 129–212 MB* |
-| RSS pico durante un turno real | **PENDIENTE (auth)** | **PENDIENTE (auth)** |
-| Disco por perfil (`du`) | 407 MiB | 407 MiB |
-| Agregado idle (2 procesos) | ≈ 246–253 MB | — |
-| Terminación | SIGTERM limpio ≤5 s; SIGKILL externo aislado | idem |
+## 7. E7 — Mediciones reales (R1)
 
-\* Rango según actividad: mínimo con `initialize` solamente; mayor cuando hubo
-intento de `session/new`. Los números de S1 (~132 MB) quedan **por debajo** de
-lo observado hoy (195/212 MB en env default con sesión gemini; 124–129 MB en
-sanitizado sin sesión): **los presupuestos del plan (192/320 MB) deben
-re-calibrarse en P2-S4 con turnos reales** — no se relajan ahora.
+| Métrica (Hermes; Aeril no participó) | Valor |
+|---|---|
+| Cold init (primera materialización) | **26.7 s** (B, JSON) · ~46 s (A, cota) |
+| Warm init (sanitizado) | **1.64–2.05 s** |
+| RSS idle (sanitizado, sin turno) | **126–133 MB** |
+| RSS pico durante un turno real | **PENDIENTE (auth)** |
+| Disco por perfil (`du`) | **407 MiB** |
+| Agregado idle (2 procesos) | ≈ **250–265 MB** |
+| Terminación | SIGTERM limpia ≤5 s; SIGKILL externo aislado |
 
-**Aeril vs Hermes**: el spike no levanta Aeril; los números de app siguen los
-contratos de Fase 0/1 (`make budget`), medidos aparte.
+Los presupuestos del plan (192/320 MB) deben re-calibrarse en P2-S4 con turnos
+reales; no se relajan ahora. **Mocks ≠ Hermes** y **Aeril ≠ Hermes**.
 
-## 8. Exposición de credenciales del host (hallazgo concreto)
+## 8. Exposición de credenciales del host (hallazgo endurecido)
 
-- Con el **entorno heredado (default)**, AMBOS perfiles desechables
-  descubrieron una credencial **`gemini` del host** (`authMethods=[gemini,
-  hermes-setup]`) y `session/new` **tuvo éxito sin autenticación por perfil**.
-  Es exactamente el crossover que el gate debe excluir: un spawn con env
-  heredado **no** sirve para runs "autenticados por perfil".
-- Fuentes ambientales presentes (solo nombres/existencia, jamás valores):
-  variables `GEMINI_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`;
-  archivos `~/.gemini`, `~/.codex`, `~/.claude`, `~/.config/gh/hosts.yml`.
-- Con **env sanitizado**, `authMethods=[hermes-setup]` y `session/new` falla
-  honestamente: la minimización funciona para descubrimiento **ambiental
-  accidental**; **no** es aislamiento (el plan corregido ya lo declara: código
-  con los mismos permisos puede leer rutas absolutas del host).
+- **Crossover concreto (corridas default-env previas)**: AMBOS perfiles
+  descubrieron credenciales ambientales (`gemini` en `authMethods`) y
+  `session/new` funcionó **sin auth por perfil**.
+- **Contaminación persistida (nuevo, crítico)**: `p-A/p-B/auth.json` contienen
+  un `credential_pool` con entradas de **`gemini`, `qwen-oauth`, `copilot`**
+  (metadata: `label`, `source`, `base_url`, `expires_at_ms`,
+  `secret_fingerprint`; **no se observaron secretos crudos en la estructura**).
+  Mtimes: `p-A` 22:28:48 y `p-B` 22:30:52 — **atribuidas a las corridas con
+  env heredado**, antes de cualquier corrida sanitizada. Implicación: el modo
+  heredado no solo descubre credenciales ambientales: **las materializa en el
+  perfil**. Por eso R1 lo prohíbe para operaciones autenticadas y los perfiles
+  deben **resetearse** antes de E2 (§4).
+- Fuentes ambientales presentes (solo nombres/existencia): `GEMINI_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`; `~/.gemini`, `~/.codex`,
+  `~/.claude`, `~/.config/gh/hosts.yml`.
+- Con env sanitizado, `authMethods=[hermes-setup]` y `session/new` falla
+  honestamente: la minimización funciona para descubrimiento **accidental**;
+  **no** es aislamiento (código con los mismos permisos puede leer rutas
+  absolutas del host; plan corregido §2C).
 
 ## 9. L1–L4 (restauración) — no testeado
 
-Requiere sesiones autenticadas. Protocolo listo en el harness (canary
-impredecible por trial + controles negativos, plan §9). Si L4 no se demuestra:
-`verified=false` se mantiene y no bloquea P2-S1.
+Requiere sesiones autenticadas. Protocolo listo (canary impredecible por trial
++ controles negativos). Si L4 no se demuestra: `verified=false` y no bloquea
+P2-S1.
 
 ## 10. Recomendación y blockers
 
 **Recomendación para P2-S1: CONDITIONAL — PENDIENTE de E2.**
 
-- Lo demostrado hoy: perfiles independientes (E1), coexistencia concurrente y
-  kill aislado de procesos (E5), bootstrap sanitizado sin descubrimiento
-  ambiental (E6, pre-auth), mediciones frío/warm/RSS/disco (E7 parcial).
-- **Blocker único y preciso**: E2 — autenticación interactiva del usuario en
-  ambos perfiles (dos grants independientes). Sin eso **no hay GO** para P2-S1
-  y no se puede completar E3/E4/E7-pico/L1–L4.
-- Si E2 falla (grants no independientes o onboarding incompatible con entorno
-  sanitizado): **NO-GO documentado** para concurrencia real, según el plan.
-- **Auditoría independiente requerida**: revisión de esta evidencia, del
-  harness (`scripts/phase2/s0_probe.py`) y de las salidas de E2 cuando existan.
+- Demostrado: perfiles/HOMEs independientes (E1), coexistencia con **un
+  writer por perfil** y kill aislado (E5 corregido), bootstrap sanitizado sin
+  descubrimiento ambiental (E6), mediciones frío/warm/RSS/disco (E7),
+  permisos fail-closed (14/14 tests).
+- **Blockers**: (1) E2 interactiva del usuario; (2) **reset de perfiles
+  contaminados** (§4/§8) antes de E2; sin eso no hay GO para P2-S1.
+- Si E2 falla (grants no independientes u onboarding incompatible con
+  sanitizado): **NO-GO documentado**.
+- **Auditoría independiente requerida** de esta evidencia, del harness R1 y de
+  los tests de seguridad.
 
 ## 11. Manifest de limpieza (NO ejecutado — requiere aprobación del usuario)
 
 ```bash
-# Perfiles y repos descartables (NO borrar sin aprobación si E2 ya se ejecutó:
-# podrían contener credenciales provisionadas por el usuario):
-rm -rf /home/elliot/p2s0-spike/p-A      # 407 MiB
-rm -rf /home/elliot/p2s0-spike/p-B      # 407 MiB
+rm -rf /home/elliot/p2s0-spike/p-A /home/elliot/p2s0-spike/p-B   # 407 MiB c/u (contaminados)
 rm -rf /home/elliot/p2s0-spike/repo-A /home/elliot/p2s0-spike/repo-B
-rm -rf /home/elliot/p2s0-spike          # total ≈ 822 MiB
-# No hay cambios en ~/.hermes ni en el sistema fuera de este directorio.
+rm -rf /home/elliot/p2s0-spike/san-home-A /home/elliot/p2s0-spike/san-home-B
+rm -rf /home/elliot/p2s0-spike                                    # total ≈ 822 MiB
 ```
 
 ## 12. Próximo paso
 
-Usuario ejecuta E2 (runbook §4) → se reanuda el spike con E3/E4/E7-pico/L1–L4 →
-informe actualizado → decisión GO/NO-GO para P2-S1 con auditoría independiente.
+1. Usuario aprueba el **reset** de `p-A`/`p-B` (paso 0 de §4).
+2. Usuario ejecuta E2 (runbook §4) y reporta etiquetas de `auth list`.
+3. Se reanuda el spike: E3/E4 (prompts canary con `--permissions approve-edits`
+   acotado), E7-pico, L1–L4 → informe final → GO/NO-GO con auditoría.

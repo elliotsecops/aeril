@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 """P2-S0 — Harness de factibilidad de Hermes autenticado (spike, no producto).
 
-Narrow scope:
-- Cliente ACP mínimo (ndjson/JSON-RPC) para `initialize`, `session/new`,
-  `session/prompt`, `session/load`, y respuesta a `session/request_permission`.
-- Modos de entorno: `default` (hereda), `sanitized` (env mínimo + HOME
-  sanitizado), `nohome` (env mínimo sin HOME).
-- Mediciones: timings de initialize/session, RSS por /proc, uso de disco.
-- NUNCA lee/imprime/copia credenciales: no toca auth.json; los únicos campos
-  de auth que puede registrar son etiquetas/estados si se piden por CLI aparte.
+Security R1 (este archivo):
+- Permisos FAIL-CLOSED: por defecto se DENIEGA todo pedido del agente; jamás se
+  elige una opción `allow*` automáticamente. `--permissions approve-edits`
+  (explícito, decidido por el usuario) solo aprueba pedidos con kind == "edit";
+  cualquier otra cosa (execute/shell/desconocido) se deniega.
+- HOME sanitizado POR PERFIL (`san-home-A`, `san-home-B`), 0700, sin
+  credenciales del host; XDG_* apuntan al HOME sanitizado.
+- `--env-mode` default = `sanitized`; el modo heredado (`default`) queda
+  prohibido para `session/new`/`prompt`/`load` salvo autorización explícita
+  (`--allow-inherited-auth-ops`), y nunca cuenta como evidencia de auth.
+- Evidencia redactada: sin texto de mensajes/razonamiento del agente, sin
+  títulos arbitrarios de tool calls; solo tipos de evento, estados, timings,
+  identificadores y errores truncados. El canary se verifica en memoria
+  (`--canary`) y solo se persiste el booleano.
+- Un solo escritor por perfil: la verificación de responsividad se hace con un
+  segundo `initialize` SOBRE LA MISMA conexión (`--ping-after`), nunca con un
+  segundo proceso sobre el mismo HERMES_HOME.
 
 Uso:
   s0_probe.py setup   --scratch DIR
-  s0_probe.py probe   --home DIR --repo DIR [--env-mode default|sanitized|nohome]
-                      [--hold SECS] [--session-new] [--prompt TEXTO]
-                      [--load SESSION_ID] [--json-out FILE]
+  s0_probe.py probe   --home DIR --repo DIR [--env-mode sanitized|nohome|default]
+                      [--permissions deny|approve-edits] [--hold SECS]
+                      [--session-new] [--prompt TEXTO] [--canary VALOR]
+                      [--load SESSION_ID] [--ping-after SECS]
+                      [--env-allow VAR ...] [--json-out FILE]
   s0_probe.py runbook --home DIR
 """
 
@@ -28,15 +39,31 @@ import sys
 import time
 
 HERMES = "/home/elliot/.local/bin/hermes"
-MIN_ENV_KEYS = ("PATH",)
 SANITIZED_PATH = "/usr/bin:/bin"
+# Variables no-secretas permitidas por lista explícita (p. ej. para OAuth con
+# navegador). Nunca se copia el entorno completo como atajo.
+SAFE_ENV_ALLOW = {
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "BROWSER",
+    "SSH_AUTH_SOCK",
+}
 
 
 def log(msg):
     print(f"[s0] {msg}", file=sys.stderr, flush=True)
 
 
-def build_env(mode, home_san, hermes_home):
+def san_home_for(profile_home):
+    """HOME sanitizado por perfil: <parent>/san-home-<sufijo-de-perfil>."""
+    parent = os.path.dirname(os.path.abspath(profile_home))
+    base = os.path.basename(os.path.abspath(profile_home))
+    suffix = base[2:] if base.startswith("p-") else base
+    return os.path.join(parent, f"san-home-{suffix}")
+
+
+def build_env(mode, san_home, hermes_home, env_allow=()):
     if mode == "default":
         env = dict(os.environ)
         env["HERMES_HOME"] = hermes_home
@@ -48,21 +75,67 @@ def build_env(mode, home_san, hermes_home):
         "HERMES_HOME": hermes_home,
     }
     if mode == "sanitized":
-        env["HOME"] = home_san
+        env["HOME"] = san_home
+        env["XDG_CONFIG_HOME"] = os.path.join(san_home, ".config")
+        env["XDG_CACHE_HOME"] = os.path.join(san_home, ".cache")
+        env["XDG_DATA_HOME"] = os.path.join(san_home, ".local", "share")
+        env["XDG_STATE_HOME"] = os.path.join(san_home, ".local", "state")
+    for name in env_allow:
+        if name not in SAFE_ENV_ALLOW:
+            print(
+                f"[s0] RECHAZADO: --env-allow solo admite variables no-secretas: "
+                f"{sorted(SAFE_ENV_ALLOW)}",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        if name in os.environ:
+            env[name] = os.environ[name]
     return env
 
 
+def inherited_auth_guard(mode, auth_ops, allow_inherited):
+    """Modo heredado prohibido para operaciones autenticadas salvo override
+    explícito; nunca cuenta como evidencia de auth por perfil."""
+    if mode == "default" and auth_ops and not allow_inherited:
+        print(
+            "[s0] RECHAZADO: session/new|prompt|load en modo `default` (entorno "
+            "heredado) están prohibidos: pueden usar credenciales ambientales del "
+            "host (p. ej. gemini) y NO son evidencia de autenticación por perfil. "
+            "Usá --env-mode sanitized, o --allow-inherited-auth-ops para un "
+            "diagnóstico explícito (marcado como no-evidencia).",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+
+
+class FakeProc:
+    """Proceso falso para tests unitarios del manejo de permisos."""
+
+    def __init__(self, stdin):
+        self.stdin = stdin
+        self.pid = 0
+        self.returncode = None
+
+    def poll(self):
+        return None
+
+
 class AcpClient:
-    def __init__(self, proc, home, repo):
+    def __init__(self, proc, home, repo, permissions="deny"):
         self.proc = proc
         self.home = home
         self.repo = repo
+        self.permissions_policy = permissions
         self.next_id = 1
         self.buf = b""
-        self.events = []  # resumen acotado
-        self.permissions = 0
+        self.event_kinds = {}
+        self.permission_log = []
+        self._transient_texts = []  # solo en memoria; nunca se persiste
         self.timings = {}
         self.session_id = None
+
+    def _note(self, kind):
+        self.event_kinds[kind] = self.event_kinds.get(kind, 0) + 1
 
     def send(self, obj):
         data = (json.dumps(obj) + "\n").encode()
@@ -105,41 +178,58 @@ class AcpClient:
     def _handle_incoming(self, msg):
         method = msg.get("method")
         if method == "session/request_permission":
-            self.permissions += 1
-            params = msg.get("params", {})
-            options = (params.get("options") or [])
-            allow = next(
-                (o.get("optionId") for o in options if str(o.get("optionId", "")).startswith("allow")),
-                None,
-            )
-            self.send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": msg.get("id"),
-                    "result": {"outcome": {"outcome": "selected", "optionId": allow or "deny"}},
-                }
-            )
-            # Solo metadatos no sensibles del pedido.
-            self.events.append(
-                {
-                    "kind": "permission",
-                    "title": str(params.get("toolCall", {}).get("title", ""))[:120],
-                    "answered": allow or "deny",
-                }
-            )
+            self._handle_permission(msg)
         elif method == "session/update":
             upd = (msg.get("params") or {}).get("update") or {}
-            st = upd.get("sessionUpdate")
+            st = upd.get("sessionUpdate") or "unknown"
+            self._note(st)
             if st in ("agent_message_chunk", "agent_thought_chunk"):
-                text = ""
                 c = upd.get("content")
                 if isinstance(c, dict):
-                    text = str(c.get("text", ""))
-                self.events.append({"kind": st, "text": text[:400]})
-            else:
-                self.events.append({"kind": st or "unknown"})
+                    # Solo en memoria (verificación de canary); no se persiste.
+                    self._transient_texts.append(str(c.get("text", ""))[:2000])
         else:
-            self.events.append({"kind": f"other:{method}"})
+            self._note(f"other:{method}")
+
+    def _handle_permission(self, msg):
+        """FAIL-CLOSED: nunca se elige `allow*` sin política explícita y kind
+        de edición; cualquier otra cosa se deniega/cancela."""
+        params = msg.get("params") or {}
+        options = params.get("options") or []
+        tool = params.get("toolCall") or {}
+        tool_kind = str(tool.get("kind") or "unknown")
+        deny_id = next(
+            (o.get("optionId") for o in options if str(o.get("optionId", "")) == "deny"),
+            None,
+        )
+        allow_id = next(
+            (
+                o.get("optionId")
+                for o in options
+                if str(o.get("optionId", "")).startswith("allow")
+            ),
+            None,
+        )
+        approved = (
+            self.permissions_policy == "approve-edits"
+            and tool_kind == "edit"
+            and allow_id is not None
+        )
+        if approved:
+            outcome = {"outcome": "selected", "optionId": allow_id}
+            decision = "approved-edit"
+        elif deny_id is not None:
+            outcome = {"outcome": "selected", "optionId": deny_id}
+            decision = "denied"
+        else:
+            outcome = {"outcome": "cancelled"}
+            decision = "cancelled-no-deny-option"
+        self.send({"jsonrpc": "2.0", "id": msg.get("id"), "result": {"outcome": outcome}})
+        # Evidencia mínima: tipo de tool y decisión. Sin títulos ni contenido.
+        self.permission_log.append({"tool_kind": tool_kind, "decision": decision})
+
+    def canary_seen(self, canary):
+        return any(canary in t for t in self._transient_texts)
 
 
 def rss_kb(pid):
@@ -167,14 +257,16 @@ def du_kb(path):
 def cmd_setup(args):
     scratch = os.path.abspath(args.scratch)
     os.makedirs(scratch, mode=0o700, exist_ok=True)
-    manifest = {"scratch": scratch, "profiles": {}, "repos": {}, "san_home": None}
+    manifest = {"scratch": scratch, "profiles": {}, "san_homes": {}, "repos": {}}
     for name in ("p-A", "p-B"):
         home = os.path.join(scratch, name)
         os.makedirs(home, mode=0o700, exist_ok=True)
+        os.chmod(home, 0o700)
+        san = san_home_for(home)
+        os.makedirs(san, mode=0o700, exist_ok=True)
+        os.chmod(san, 0o700)
         manifest["profiles"][name] = home
-    san = os.path.join(scratch, "san-home")
-    os.makedirs(san, mode=0o700, exist_ok=True)
-    manifest["san_home"] = san
+        manifest["san_homes"][name] = san
     for name in ("repo-A", "repo-B"):
         repo = os.path.join(scratch, name)
         os.makedirs(repo, exist_ok=True)
@@ -194,21 +286,31 @@ def cmd_setup(args):
 def cmd_probe(args):
     home = os.path.abspath(args.home)
     repo = os.path.abspath(args.repo)
-    san = args.san_home or os.path.join(os.path.dirname(home), "san-home")
-    env = build_env(args.env_mode, san, home)
+    san = args.san_home or san_home_for(home)
+    inherited_auth_guard(
+        args.env_mode,
+        bool(args.session_new or args.prompt or args.load),
+        args.allow_inherited_auth_ops,
+    )
+    env = build_env(args.env_mode, san, home, tuple(args.env_allow))
     report = {
         "env_mode": args.env_mode,
         "hermes_home": home,
+        "san_home": san if args.env_mode == "sanitized" else None,
         "repo": repo,
+        "permissions_policy": args.permissions,
         "pid": None,
         "timings_ms": {},
         "rss_kb": {},
         "session_id": None,
         "session_new_error": None,
         "prompt_error": None,
-        "events": [],
-        "permissions": 0,
+        "event_kinds": {},
+        "permissions": [],
         "terminated": None,
+        "inherited_mode_auth_ops": bool(
+            args.env_mode == "default" and (args.session_new or args.prompt or args.load)
+        ),
     }
     t0 = time.monotonic()
     proc = subprocess.Popen(
@@ -220,7 +322,7 @@ def cmd_probe(args):
         cwd=repo,
     )
     report["pid"] = proc.pid
-    client = AcpClient(proc, home, repo)
+    client = AcpClient(proc, home, repo, permissions=args.permissions)
     try:
         t = time.monotonic()
         resp = client.request(
@@ -228,12 +330,13 @@ def cmd_probe(args):
             {
                 "protocolVersion": 1,
                 "clientCapabilities": {},
-                "clientInfo": {"name": "aeril-p2s0-probe", "version": "0.1"},
+                "clientInfo": {"name": "aeril-p2s0-probe", "version": "0.2"},
             },
             timeout=args.init_timeout,
         )
         report["timings_ms"]["initialize"] = round((time.monotonic() - t) * 1000, 1)
-        report["initialize_result"] = resp.get("result")
+        ir = resp.get("result") or {}
+        report["auth_methods"] = [m.get("id") for m in (ir.get("authMethods") or [])]
         report["timings_ms"]["spawn_to_initialize"] = round((time.monotonic() - t0) * 1000, 1)
         if args.session_new:
             t = time.monotonic()
@@ -243,12 +346,18 @@ def cmd_probe(args):
                 )
                 report["timings_ms"]["session_new"] = round((time.monotonic() - t) * 1000, 1)
                 if "error" in r:
-                    report["session_new_error"] = r["error"]
+                    e = r["error"]
+                    details = str((e.get("data") or {}).get("details", ""))[:200]
+                    report["session_new_error"] = {
+                        "code": e.get("code"),
+                        "message": str(e.get("message"))[:200],
+                        "details": details,
+                    }
                 else:
                     client.session_id = (r.get("result") or {}).get("sessionId")
                     report["session_id"] = client.session_id
             except (TimeoutError, RuntimeError) as e:
-                report["session_new_error"] = str(e)
+                report["session_new_error"] = {"message": str(e)[:200]}
         if args.load:
             try:
                 r = client.request(
@@ -256,11 +365,15 @@ def cmd_probe(args):
                     {"sessionId": args.load, "cwd": repo, "mcpServers": []},
                     timeout=args.req_timeout,
                 )
-                report["load_result"] = r.get("result")
-                report["load_error"] = r.get("error")
+                report["load_status"] = "ok" if "result" in r else "error"
+                if "error" in r:
+                    report["load_error"] = {
+                        "code": r["error"].get("code"),
+                        "message": str(r["error"].get("message"))[:200],
+                    }
                 client.session_id = args.load
             except (TimeoutError, RuntimeError) as e:
-                report["load_error"] = str(e)
+                report["load_error"] = {"message": str(e)[:200]}
         if args.prompt and client.session_id:
             t = time.monotonic()
             try:
@@ -274,23 +387,43 @@ def cmd_probe(args):
                 )
                 report["timings_ms"]["prompt"] = round((time.monotonic() - t) * 1000, 1)
                 if "error" in r:
-                    report["prompt_error"] = r["error"]
+                    report["prompt_error"] = {
+                        "code": r["error"].get("code"),
+                        "message": str(r["error"].get("message"))[:200],
+                    }
                 else:
-                    report["prompt_result"] = r.get("result")
+                    report["prompt_stop_reason"] = (r.get("result") or {}).get("stopReason")
             except (TimeoutError, RuntimeError) as e:
-                report["prompt_error"] = str(e)
-        # Hold: RSS idle estabilizado + responsive check opcional.
+                report["prompt_error"] = {"message": str(e)[:200]}
+        if args.canary:
+            report["canary_found"] = client.canary_seen(args.canary)
         time.sleep(2.0)
         report["rss_kb"]["idle_after_init"] = rss_kb(proc.pid)
+        # Hold con ping opcional SOBRE LA MISMA conexión (un solo escritor).
         remaining = max(0.0, args.hold - (time.monotonic() - t0))
         if remaining > 0:
             log(f"{home}: hold {remaining:.0f}s (pid {proc.pid})")
-            time.sleep(remaining)
+        if args.ping_after:
+            while (time.monotonic() - t0) < args.ping_after:
+                time.sleep(0.2)
+            t = time.monotonic()
+            try:
+                r = client.request(
+                    "initialize",
+                    {"protocolVersion": 1},
+                    timeout=min(60.0, args.req_timeout),
+                )
+                report["ping_ok"] = "result" in r
+                report["ping_ms"] = round((time.monotonic() - t) * 1000, 1)
+            except (TimeoutError, RuntimeError) as e:
+                report["ping_ok"] = False
+                report["ping_error"] = str(e)[:200]
+        if remaining > 0:
+            time.sleep(max(0.0, args.hold - (time.monotonic() - t0)))
         report["rss_kb"]["idle_end_of_hold"] = rss_kb(proc.pid)
     except Exception as e:  # noqa: BLE001
         report["error"] = f"{type(e).__name__}: {e}"
     finally:
-        # Terminación controlada: SIGTERM → espera 5 s → SIGKILL.
         t = time.monotonic()
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
@@ -304,8 +437,8 @@ def cmd_probe(args):
             f"signal {-rc}" if rc is not None and rc < 0 else f"exit {rc}"
         )
         report["timings_ms"]["terminate"] = round((time.monotonic() - t) * 1000, 1)
-        report["events"] = client.events[-40:]
-        report["permissions"] = client.permissions
+        report["event_kinds"] = client.event_kinds
+        report["permissions"] = client.permission_log
         report["disk_kb_home"] = du_kb(home)
     out = json.dumps(report, indent=2)
     if args.json_out:
@@ -317,22 +450,29 @@ def cmd_probe(args):
 
 def cmd_runbook(args):
     home = os.path.abspath(args.home)
+    san = san_home_for(home)
     print(
         f"""Runbook de autenticación INTERACTIVA (usuario) — perfil: {home}
+HOME sanitizado del perfil: {san}
 
-  # 1) Autenticar ESTE perfil (el usuario completa el flujo del proveedor):
-  HERMES_HOME={home} {HERMES} auth add
-  #    (alternativas soportadas: `auth upgrade` para Nous, o `auth add` de API key)
+  # 1) Autenticar ESTE perfil (entorno sanitizado, el mismo del runtime):
+  env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME={san} \\
+      XDG_CONFIG_HOME={san}/.config XDG_CACHE_HOME={san}/.cache \\
+      XDG_DATA_HOME={san}/.local/share XDG_STATE_HOME={san}/.local/state \\
+      HERMES_HOME={home} {HERMES} auth add
 
   # 2) Verificar estado SIN exponer valores (solo etiquetas/estado):
-  HERMES_HOME={home} {HERMES} auth status
-  HERMES_HOME={home} {HERMES} auth list
+  env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME={san} HERMES_HOME={home} \\
+      {HERMES} auth list
 
-  # 3) Modelo por perfil (si hace falta):
-  HERMES_HOME={home} {HERMES} model
+  # 3) Modelo por perfil (si hace falta): ídem con `model`.
 
-Reglas: no copiar auth.json, no imprimir tokens, no reutilizar el perfil del
-host (~/.hermes) ni credenciales ambientales (gh)."""
+Si el OAuth necesita variables de navegador, agregá SOLO las necesarias y
+no-secretas (DISPLAY, WAYLAND_DISPLAY, XDG_RUNTIME_DIR, BROWSER) al `env -i`;
+el harness lo permite con `--env-allow VAR`. NUNCA copies el entorno completo.
+
+Reglas: no copiar auth.json, no imprimir tokens, no usar el perfil del host
+(~/.hermes) ni credenciales ambientales (gh/gemini/codex/claude)."""
     )
     return 0
 
@@ -348,12 +488,19 @@ def main():
     p = sub.add_parser("probe")
     p.add_argument("--home", required=True)
     p.add_argument("--repo", required=True)
-    p.add_argument("--env-mode", choices=["default", "sanitized", "nohome"], default="default")
+    p.add_argument(
+        "--env-mode", choices=["sanitized", "nohome", "default"], default="sanitized"
+    )
     p.add_argument("--san-home", default=None)
+    p.add_argument("--permissions", choices=["deny", "approve-edits"], default="deny")
     p.add_argument("--hold", type=float, default=0.0)
+    p.add_argument("--ping-after", type=float, default=0.0)
     p.add_argument("--session-new", action="store_true")
     p.add_argument("--prompt", default=None)
+    p.add_argument("--canary", default=None)
     p.add_argument("--load", default=None)
+    p.add_argument("--env-allow", action="append", default=[])
+    p.add_argument("--allow-inherited-auth-ops", action="store_true")
     p.add_argument("--json-out", default=None)
     p.add_argument("--init-timeout", type=float, default=300.0)
     p.add_argument("--req-timeout", type=float, default=300.0)

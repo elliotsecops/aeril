@@ -1,0 +1,10 @@
+/home/elliot/.hermes/tools/python-3.14.7+20260901-linux-x64/bin/python3.14
+p2s0-spike/p-B/installs/95d75e3983ec2bca/environments/d56860ebf3c44aa59c0e262c3e500a33/.leases/c43b1f91cdc54fa49b3d9393aafac200
+p2s0-spike/p-B/installs/95d75e3983ec2bca/environments/d56860ebf3c44aa59c0e262c3e500a33/venv/lib/python3.14/site-packages/charset_normalizer/cd.cpython-314-x86_64-linux-gnu.so
+p2s0-spike/p-B/installs/95d75e3983ec2bca/environments/d56860ebf3c44aa59c0e262c3e500a33/venv/lib/python3.14/site-packages/charset_normalizer/md.cpython-314-x86_64-linux-gnu.so
+p2s0-spike/p-B/installs/95d75e3983ec2bca/environments/d56860ebf3c44aa59c0e262c3e500a33/venv/lib/python3.14/site-packages/jiter/jiter.cpython-314-x86_64-linux-gnu.so
+p2s0-spike/p-B/installs/95d75e3983ec2bca/environments/d56860ebf3c44aa59c0e262c3e500a33/venv/lib/python3.14/site-packages/pydantic_core/_pydantic_core.cpython-314-x86_64-linux-gnu.so
+p2s0-spike/p-B/installs/95d75e3983ec2bca/pm-runtime/generations/0fd40605c53e44e188daee5b3fca70e1/.leases/6b033f0b1d89456786071bc20f108c39
+p2s0-spike/p-B/logs/agent.log
+p2s0-spike/p-B/logs/errors.log
+p2s0-spike/repo-B
