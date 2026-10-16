@@ -1,10 +1,10 @@
 # P2-S0 — Gate de factibilidad: Hermes autenticado (spike, Security R1)
 
 > Estado: **CONDITIONAL — bloqueado en E2 (autenticación interactiva del
-> usuario), ahora con harness endurecido (R1).** Rama
+> usuario), con harness endurecido (R1 + R2).** Rama
 > `spike/phase2-s0-hermes-auth`. Plan: `docs/phase2-plan @ 367c6ce`.
 > Este documento NO declara Fase 2 habilitada ni GO para P2-S1.
-> Evidencia R1 en `docs/phase2-s0-evidence/` (redactada, sin credenciales).
+> Evidencia R1/R2 en `docs/phase2-s0-evidence/` (redactada, sin credenciales).
 
 ## 0. Cambios de Security R1 (este corte)
 
@@ -29,10 +29,36 @@
    títulos de tool calls; solo tipos de evento, estados, timings, decisiones de
    permisos y errores truncados. El canary se verifica en memoria y solo se
    persiste el booleano.
-6. **Tests de seguridad**: `scripts/phase2/test_s0_probe.py` → **14/14**
-   (deny-by-default, execute nunca aprobado, approve-edits solo para edit,
-   cancel sin deny, guard de modo heredado, HOMEs distintos 0700, env sin
-   variables de auth del host, `--env-allow` restringido, CLI rechaza default).
+6. **Tests de seguridad**: `scripts/phase2/test_s0_probe.py` → **24/24**
+   (deny-by-default, execute nunca aprobado, cancel sin deny, guard de modo
+   heredado, HOMEs distintos 0700, env sin variables de auth del host,
+   `--env-allow` restringido, CLI rechaza default) + R2 (abajo).
+
+## 0bis. Cambios de Security R2 (este corte)
+
+1. **Permisos con ALCANCE verificado**: `approve-edits` fue reemplazado por
+   `approve-verified-edits` — solo aprueba `kind == "edit"` cuando TODAS las
+   rutas (`content[{type:"diff",path}]` y `locations[{path}]`) resuelven
+   (realpath, siguiendo symlinks) **dentro del repo descartable**. Sin rutas
+   verificables, ruta absoluta, `../`, symlink que escapa, kind distinto o
+   rutas mixtas con una fuera ⇒ **deny**. Nuevo modo **`ask-human`**
+   (preferido para E3): además de la verificación, exige aprobación humana
+   explícita por pedido (`allow` por TTY); sin TTY ⇒ deny.
+2. **SSH_AUTH_SOCK eliminado** de la allowlist de entorno (un socket de agente
+   SSH es una capacidad de autenticación, no una variable inocua). Quedan solo
+   display/browser: `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `BROWSER`.
+   Nota residual: `XDG_RUNTIME_DIR` expone sockets de runtime del usuario y
+   solo se permite por pedido explícito del operador (necesario para Wayland).
+3. **Auditoría de perfiles contaminados** (§8): realpaths literales, owner
+   correcto, sin symlinks, sin procesos activos, sin mountpoints; el reset
+   `rm -rf` elimina el estado (no se recrea encima).
+4. **Revisión de evidencia histórica** (§13): 27 blobs de la rama escaneados
+   contra patrones de credenciales ⇒ **0 valores encontrados**; solo la
+   etiqueta no-secreta `gemini` en archivos históricos.
+5. **Re-validación R2** (sin auth): E1/E5/E6 re-corridos con `authMethods=
+   [hermes-setup]`, ping 18.1 ms en el writer original, reuso secuencial
+   1.80 s, strace 0 escrituras a `~/.hermes`, sin strays, sin cambios de
+   runtime de producto (`git diff main..HEAD` = solo scripts/phase2 + docs).
 
 ## 1. Versión exacta de Hermes
 
@@ -178,18 +204,43 @@ P2-S1.
 - **Auditoría independiente requerida** de esta evidencia, del harness R1 y de
   los tests de seguridad.
 
-## 11. Manifest de limpieza (NO ejecutado — requiere aprobación del usuario)
+## 11. Manifest de limpieza (auditado; NO ejecutado — requiere aprobación)
+
+Auditoría T3 (read-only): `realpath(p-A/p-B)` = rutas literales dentro de
+`/home/elliot/p2s0-spike` (ext4, sin mountpoints internos), owner
+`elliot:elliot`, mode 700, **no symlinks**; **sin procesos activos** con esos
+perfiles (environ/lsof). El reset elimina el estado contaminado porque borra el
+directorio completo (`rm -rf`), y `setup()` solo recrea directorios vacíos (no
+copia nada previo).
 
 ```bash
-rm -rf /home/elliot/p2s0-spike/p-A /home/elliot/p2s0-spike/p-B   # 407 MiB c/u (contaminados)
-rm -rf /home/elliot/p2s0-spike/repo-A /home/elliot/p2s0-spike/repo-B
-rm -rf /home/elliot/p2s0-spike/san-home-A /home/elliot/p2s0-spike/san-home-B
-rm -rf /home/elliot/p2s0-spike                                    # total ≈ 822 MiB
+S=/home/elliot/p2s0-spike
+rm -rf "$S/p-A" "$S/p-B"                 # 407 MiB c/u (contaminados: credential_pool)
+rm -rf "$S/repo-A" "$S/repo-B" "$S/san-home-A" "$S/san-home-B"
+rm -rf "$S"                              # total ≈ 822 MiB (incluye logs/evidencia locales)
+
+# Verificación POST-reset (debe fallar/no encontrar nada):
+test ! -e "$S/p-A/auth.json" && echo "auth.json eliminado ✓"
+grep -rl "credential_pool" "$S" 2>/dev/null | wc -l   # esperado: 0
+# ~/.hermes, repos del usuario y el resto del sistema NO están en el manifest.
 ```
+
+## 13. Revisión de evidencia histórica (T4)
+
+Se escanearon **todos los blobs alguna vez commiteados en la rama**
+(`git rev-list 47f0318..HEAD` → 27 blobs bajo `scripts/phase2/**` y
+`docs/phase2-s0*`) contra patrones de credenciales (GitHub/OpenAI/Google/
+Slack/AWS/JWT/GitLab/Bearer/hex largos/keywords). Resultado: **0 valores de
+credenciales encontrados** — ninguna remediación de secretos requerida. Los
+archivos eliminados en R1 (p. ej. `probe-B-e1.json`) siguen en la historia de
+Git y contienen únicamente la **etiqueta de proveedor no-secreta** `gemini`
+(identidad de proveedor, no un valor). No se reproduce ningún valor en este
+informe.
 
 ## 12. Próximo paso
 
 1. Usuario aprueba el **reset** de `p-A`/`p-B` (paso 0 de §4).
 2. Usuario ejecuta E2 (runbook §4) y reporta etiquetas de `auth list`.
-3. Se reanuda el spike: E3/E4 (prompts canary con `--permissions approve-edits`
-   acotado), E7-pico, L1–L4 → informe final → GO/NO-GO con auditoría.
+3. Se reanuda el spike: E3/E4 (prompts canary con `--permissions ask-human`
+   — aprobación humana por edición — o `approve-verified-edits` acotado al
+   repo), E7-pico, L1–L4 → informe final → GO/NO-GO con auditoría.

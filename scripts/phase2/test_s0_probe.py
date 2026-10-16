@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Tests de seguridad del harness P2-S0 (R1) — stdlib unittest.
+"""Tests de seguridad del harness P2-S0 (R1 + R2) — stdlib unittest.
 
-Cubren: permisos fail-closed (nunca `allow*` automático), guard de modo
-heredado, HOMEs sanitizados por perfil, env sanitizado sin variables de auth
-del host y derivación de rutas. Sin credenciales, sin red, sin procesos reales
-de Hermes.
+Cubren: permisos fail-closed con ALCANCE VERIFICADO (nunca `allow*` automático;
+edits confinados al repo descartable; ask-human explícito), allowlist de entorno
+sin SSH_AUTH_SOCK, guard de modo heredado, HOMEs sanitizados por perfil y
+derivación de rutas. Sin credenciales, sin red, sin procesos reales de Hermes.
 
 Uso: python3 scripts/phase2/test_s0_probe.py
 """
@@ -25,10 +25,10 @@ probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
 
 
-def make_client(policy):
+def make_client(policy, repo="/tmp/x", ask_fn=None):
     stdin = io.BytesIO()
     proc = probe.FakeProc(stdin)
-    client = probe.AcpClient(proc, "/tmp/x", "/tmp/repo", permissions=policy)
+    client = probe.AcpClient(proc, "/tmp/home", repo, permissions=policy, ask_fn=ask_fn)
     return client, stdin
 
 
@@ -37,15 +37,19 @@ def sent_messages(stdin):
     return [json.loads(line) for line in stdin.getvalue().decode().splitlines() if line.strip()]
 
 
-def permission_request(req_id, options, kind="edit"):
+def permission_request(req_id, options, kind="edit", diff_paths=None, locations=None):
+    tool = {"toolCallId": "tc-1", "title": "algo", "kind": kind}
+    if diff_paths is not None:
+        tool["content"] = [
+            {"type": "diff", "path": p, "newText": "contenido-no-persistido"} for p in diff_paths
+        ]
+    if locations is not None:
+        tool["locations"] = [{"path": p} for p in locations]
     return {
         "jsonrpc": "2.0",
         "id": req_id,
         "method": "session/request_permission",
-        "params": {
-            "toolCall": {"toolCallId": "tc-1", "title": "algo", "kind": kind},
-            "options": options,
-        },
+        "params": {"toolCall": tool, "options": options},
     }
 
 
@@ -59,41 +63,116 @@ ONLY_ALLOW = [{"optionId": "allow_once", "kind": "allow_once", "name": "Allow"}]
 class PermissionFailClosedTest(unittest.TestCase):
     def test_unsolicited_permission_denied_by_default(self):
         client, stdin = make_client("deny")
-        client._handle_incoming(permission_request(7, ALLOW_DENY, kind="edit"))
+        client._handle_incoming(permission_request(7, ALLOW_DENY, diff_paths=["NOTES.md"]))
         msgs = sent_messages(stdin)
         self.assertEqual(len(msgs), 1)
         outcome = msgs[0]["result"]["outcome"]
         self.assertEqual(outcome.get("optionId"), "deny")
         self.assertFalse(str(outcome.get("optionId", "")).startswith("allow"))
-        self.assertEqual(client.permission_log, [{"tool_kind": "edit", "decision": "denied"}])
-
-    def test_execute_kind_never_approved_even_with_approve_edits(self):
-        client, stdin = make_client("approve-edits")
-        client._handle_incoming(permission_request(8, ALLOW_DENY, kind="execute"))
-        msgs = sent_messages(stdin)
-        self.assertEqual(msgs[0]["result"]["outcome"].get("optionId"), "deny")
         self.assertEqual(client.permission_log[0]["decision"], "denied")
 
-    def test_edit_kind_approved_only_with_explicit_policy(self):
-        client, stdin = make_client("approve-edits")
-        client._handle_incoming(permission_request(9, ALLOW_DENY, kind="edit"))
-        msgs = sent_messages(stdin)
-        self.assertEqual(msgs[0]["result"]["outcome"].get("optionId"), "allow_once")
-        self.assertEqual(client.permission_log[0]["decision"], "approved-edit")
+    def test_execute_kind_never_approved_even_with_verified_policy(self):
+        client, stdin = make_client("approve-verified-edits")
+        client._handle_incoming(
+            permission_request(8, ALLOW_DENY, kind="execute", diff_paths=["NOTES.md"])
+        )
+        self.assertEqual(sent_messages(stdin)[0]["result"]["outcome"].get("optionId"), "deny")
+        self.assertEqual(client.permission_log[0]["decision"], "denied")
 
     def test_no_deny_option_cancels_not_approves(self):
         client, stdin = make_client("deny")
-        client._handle_incoming(permission_request(10, ONLY_ALLOW, kind="edit"))
-        msgs = sent_messages(stdin)
-        outcome = msgs[0]["result"]["outcome"]
+        client._handle_incoming(permission_request(10, ONLY_ALLOW, diff_paths=["NOTES.md"]))
+        outcome = sent_messages(stdin)[0]["result"]["outcome"]
         self.assertEqual(outcome.get("outcome"), "cancelled")
         self.assertNotIn("optionId", outcome)
         self.assertEqual(client.permission_log[0]["decision"], "cancelled-no-deny-option")
 
-    def test_unknown_kind_denied_with_approve_edits(self):
-        client, stdin = make_client("approve-edits")
-        client._handle_incoming(permission_request(11, ALLOW_DENY, kind="other"))
+
+class VerifiedEditScopeTest(unittest.TestCase):
+    """R2: approve-verified-edits SOLO con destino verificado dentro del repo."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aeril-p2s0-scope-")
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        with open(os.path.join(self.repo, "NOTES.md"), "w") as f:
+            f.write("base\n")
+        self.outside = os.path.join(self.tmp, "outside")
+        os.makedirs(self.outside)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_in_repo_diff_approved(self):
+        client, stdin = make_client("approve-verified-edits", repo=self.repo)
+        client._handle_incoming(permission_request(20, ALLOW_DENY, diff_paths=["NOTES.md"]))
+        self.assertEqual(sent_messages(stdin)[0]["result"]["outcome"].get("optionId"), "allow_once")
+        entry = client.permission_log[0]
+        self.assertEqual(entry["decision"], "approved-verified-edit")
+        self.assertEqual(entry["paths"], ["NOTES.md"])
+        self.assertNotIn("newText", json.dumps(entry), "no se persiste contenido de diffs")
+
+    def test_locations_in_repo_approved(self):
+        client, stdin = make_client("approve-verified-edits", repo=self.repo)
+        client._handle_incoming(
+            permission_request(21, ALLOW_DENY, locations=["sub/dir/file.txt"])
+        )
+        self.assertEqual(sent_messages(stdin)[0]["result"]["outcome"].get("optionId"), "allow_once")
+
+    def test_missing_paths_denied(self):
+        client, stdin = make_client("approve-verified-edits", repo=self.repo)
+        client._handle_incoming(permission_request(22, ALLOW_DENY))
         self.assertEqual(sent_messages(stdin)[0]["result"]["outcome"].get("optionId"), "deny")
+        self.assertIn("sin rutas", client.permission_log[0]["reason"])
+
+    def test_relative_escape_denied(self):
+        client, stdin = make_client("approve-verified-edits", repo=self.repo)
+        client._handle_incoming(permission_request(23, ALLOW_DENY, diff_paths=["../escape.txt"]))
+        self.assertEqual(sent_messages(stdin)[0]["result"]["outcome"].get("optionId"), "deny")
+        self.assertIn("fuera del repo", client.permission_log[0]["reason"])
+
+    def test_absolute_path_denied(self):
+        client, stdin = make_client("approve-verified-edits", repo=self.repo)
+        client._handle_incoming(permission_request(24, ALLOW_DENY, diff_paths=["/etc/passwd"]))
+        self.assertEqual(sent_messages(stdin)[0]["result"]["outcome"].get("optionId"), "deny")
+
+    def test_symlink_escape_denied(self):
+        os.symlink(self.outside, os.path.join(self.repo, "link"))
+        client, stdin = make_client("approve-verified-edits", repo=self.repo)
+        client._handle_incoming(permission_request(25, ALLOW_DENY, diff_paths=["link/evil.txt"]))
+        self.assertEqual(sent_messages(stdin)[0]["result"]["outcome"].get("optionId"), "deny")
+        self.assertIn("fuera del repo", client.permission_log[0]["reason"])
+
+    def test_mixed_paths_one_outside_denies_all(self):
+        client, stdin = make_client("approve-verified-edits", repo=self.repo)
+        client._handle_incoming(
+            permission_request(26, ALLOW_DENY, diff_paths=["NOTES.md", "../escape.txt"])
+        )
+        self.assertEqual(sent_messages(stdin)[0]["result"]["outcome"].get("optionId"), "deny")
+
+    def test_ask_human_approves_only_with_explicit_yes_and_verification(self):
+        client, stdin = make_client("ask-human", repo=self.repo, ask_fn=lambda _s: True)
+        client._handle_incoming(permission_request(27, ALLOW_DENY, diff_paths=["NOTES.md"]))
+        self.assertEqual(sent_messages(stdin)[0]["result"]["outcome"].get("optionId"), "allow_once")
+        self.assertEqual(client.permission_log[0]["decision"], "approved-human")
+
+    def test_ask_human_denied_when_user_says_no(self):
+        client, stdin = make_client("ask-human", repo=self.repo, ask_fn=lambda _s: False)
+        client._handle_incoming(permission_request(28, ALLOW_DENY, diff_paths=["NOTES.md"]))
+        self.assertEqual(sent_messages(stdin)[0]["result"]["outcome"].get("optionId"), "deny")
+
+    def test_ask_human_unverified_never_reaches_human(self):
+        called = []
+        client, stdin = make_client(
+            "ask-human", repo=self.repo, ask_fn=lambda s: called.append(s) or True
+        )
+        client._handle_incoming(permission_request(29, ALLOW_DENY, diff_paths=["../escape.txt"]))
+        self.assertEqual(sent_messages(stdin)[0]["result"]["outcome"].get("optionId"), "deny")
+        self.assertEqual(called, [], "sin verificación no se consulta al humano")
+
+    def test_default_ask_without_tty_fails_closed(self):
+        client, _stdin = make_client("ask-human", repo=self.repo)
+        self.assertFalse(client._default_ask({"kind": "edit", "paths": ["NOTES.md"]}))
 
 
 class InheritedModeGuardTest(unittest.TestCase):
@@ -103,10 +182,10 @@ class InheritedModeGuardTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 3)
 
     def test_default_mode_initialize_only_allowed(self):
-        probe.inherited_auth_guard("default", False, False)  # no lanza
+        probe.inherited_auth_guard("default", False, False)
 
     def test_default_mode_with_explicit_override_allowed(self):
-        probe.inherited_auth_guard("default", True, True)  # diagnóstico explícito
+        probe.inherited_auth_guard("default", True, True)
 
     def test_sanitized_mode_always_allowed(self):
         probe.inherited_auth_guard("sanitized", True, False)
@@ -144,9 +223,16 @@ class EnvAndHomeTest(unittest.TestCase):
     def test_sanitized_env_excludes_host_auth_vars(self):
         os.environ["GEMINI_API_KEY"] = "test-no-real"
         os.environ["ANTHROPIC_AUTH_TOKEN"] = "test-no-real"
+        os.environ["SSH_AUTH_SOCK"] = "/tmp/fake-agent.sock"
         try:
             env = probe.build_env("sanitized", "/tmp/san", "/tmp/hermes")
-            for leaked in ("GEMINI_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            for leaked in (
+                "GEMINI_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "SSH_AUTH_SOCK",
+            ):
                 self.assertNotIn(leaked, env)
             self.assertEqual(env["HOME"], "/tmp/san")
             self.assertEqual(env["HERMES_HOME"], "/tmp/hermes")
@@ -155,6 +241,13 @@ class EnvAndHomeTest(unittest.TestCase):
         finally:
             del os.environ["GEMINI_API_KEY"]
             del os.environ["ANTHROPIC_AUTH_TOKEN"]
+            del os.environ["SSH_AUTH_SOCK"]
+
+    def test_ssh_auth_sock_not_allowlisted(self):
+        self.assertNotIn("SSH_AUTH_SOCK", probe.SAFE_ENV_ALLOW)
+        with self.assertRaises(SystemExit) as cm:
+            probe.build_env("sanitized", "/tmp/san", "/tmp/hermes", ("SSH_AUTH_SOCK",))
+        self.assertEqual(cm.exception.code, 3)
 
     def test_env_allow_only_safe_vars(self):
         os.environ["DISPLAY"] = ":0"

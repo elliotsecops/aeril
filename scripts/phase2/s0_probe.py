@@ -3,9 +3,11 @@
 
 Security R1 (este archivo):
 - Permisos FAIL-CLOSED: por defecto se DENIEGA todo pedido del agente; jamás se
-  elige una opción `allow*` automáticamente. `--permissions approve-edits`
-  (explícito, decidido por el usuario) solo aprueba pedidos con kind == "edit";
-  cualquier otra cosa (execute/shell/desconocido) se deniega.
+  elige una opción `allow*` automáticamente. `--permissions
+  approve-verified-edits` solo aprueba pedidos kind=="edit" cuyas rutas
+  (content.diff/locations) se verifican CONFINADAS al repo descartable;
+  `--permissions ask-human` exige aprobación humana explícita por pedido
+  (además de la verificación). execute/shell/ambiguo/desconocido se deniega.
 - HOME sanitizado POR PERFIL (`san-home-A`, `san-home-B`), 0700, sin
   credenciales del host; XDG_* apuntan al HOME sanitizado.
 - `--env-mode` default = `sanitized`; el modo heredado (`default`) queda
@@ -42,12 +44,14 @@ HERMES = "/home/elliot/.local/bin/hermes"
 SANITIZED_PATH = "/usr/bin:/bin"
 # Variables no-secretas permitidas por lista explícita (p. ej. para OAuth con
 # navegador). Nunca se copia el entorno completo como atajo.
+# Lista blanca mínima para onboarding interactivo (display/browser).
+# SSH_AUTH_SOCK queda FUERA a propósito: un socket de agente SSH otorga una
+# capacidad de autenticación y no es una variable inocua.
 SAFE_ENV_ALLOW = {
     "DISPLAY",
     "WAYLAND_DISPLAY",
     "XDG_RUNTIME_DIR",
     "BROWSER",
-    "SSH_AUTH_SOCK",
 }
 
 
@@ -121,11 +125,12 @@ class FakeProc:
 
 
 class AcpClient:
-    def __init__(self, proc, home, repo, permissions="deny"):
+    def __init__(self, proc, home, repo, permissions="deny", ask_fn=None):
         self.proc = proc
         self.home = home
         self.repo = repo
         self.permissions_policy = permissions
+        self.ask_fn = ask_fn or self._default_ask
         self.next_id = 1
         self.buf = b""
         self.event_kinds = {}
@@ -191,13 +196,65 @@ class AcpClient:
         else:
             self._note(f"other:{method}")
 
+    def _verify_edit_scope(self, msg):
+        """Verifica que un pedido `edit` esté CONFINADO al repo descartable.
+
+        Rutas candidatas: bloques `content` de tipo `diff` (`path`) y
+        `locations` (`path`). Reglas fail-closed:
+        - kind debe ser exactamente "edit";
+        - al menos una ruta verificable;
+        - ninguna ruta absoluta/NUL/vacía;
+        - TODAS deben resolver (realpath, siguiendo symlinks) dentro del repo.
+        Devuelve (ok, reason, relative_paths).
+        """
+        params = msg.get("params") or {}
+        tool = params.get("toolCall") or {}
+        kind = str(tool.get("kind") or "unknown")
+        if kind != "edit":
+            return False, f"kind != edit ({kind})", []
+        paths = []
+        for block in tool.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "diff" and block.get("path"):
+                paths.append(str(block["path"]))
+        for loc in tool.get("locations") or []:
+            if isinstance(loc, dict) and loc.get("path"):
+                paths.append(str(loc["path"]))
+        if not paths:
+            return False, "sin rutas verificables (content.diff/locations ausentes)", []
+        repo_real = os.path.realpath(self.repo)
+        rel = []
+        for raw in paths:
+            if not raw or "\x00" in raw or os.path.isabs(raw):
+                return False, f"ruta inválida o absoluta: {raw!r}", []
+            joined = os.path.realpath(os.path.join(repo_real, raw))
+            if not joined.startswith(repo_real + os.sep):
+                return False, f"ruta fuera del repo: {raw!r}", []
+            rel.append(os.path.relpath(joined, repo_real))
+        return True, "ok", rel
+
+    def _default_ask(self, summary):
+        """Aprobación humana explícita: solo con TTY interactiva; sin TTY,
+        fail-closed (deniega)."""
+        if not sys.stdin.isatty():
+            log(f"permiso {summary}: sin TTY para aprobación humana ⇒ DENEGADO")
+            return False
+        print(f"[s0] pedido de permiso verificado: {summary}")
+        try:
+            answer = input("[s0] escribir 'allow' para aprobar (otra cosa deniega): ")
+        except EOFError:
+            return False
+        return answer.strip() == "allow"
+
     def _handle_permission(self, msg):
-        """FAIL-CLOSED: nunca se elige `allow*` sin política explícita y kind
-        de edición; cualquier otra cosa se deniega/cancela."""
+        """FAIL-CLOSED: `deny` por defecto; nunca `allow*` automático.
+        `approve-verified-edits` solo aprueba edits CONFINADOS al repo;
+        `ask-human` exige aprobación humana explícita por pedido (y también
+        verificación de alcance). Cualquier cosa dudosa se deniega/cancela."""
         params = msg.get("params") or {}
         options = params.get("options") or []
         tool = params.get("toolCall") or {}
         tool_kind = str(tool.get("kind") or "unknown")
+        ok, reason, rel_paths = self._verify_edit_scope(msg)
         deny_id = next(
             (o.get("optionId") for o in options if str(o.get("optionId", "")) == "deny"),
             None,
@@ -210,14 +267,19 @@ class AcpClient:
             ),
             None,
         )
-        approved = (
-            self.permissions_policy == "approve-edits"
-            and tool_kind == "edit"
-            and allow_id is not None
-        )
+        approved = False
+        if ok and allow_id is not None:
+            if self.permissions_policy == "approve-verified-edits":
+                approved = True
+            elif self.permissions_policy == "ask-human":
+                approved = bool(self.ask_fn({"kind": tool_kind, "paths": rel_paths}))
         if approved:
             outcome = {"outcome": "selected", "optionId": allow_id}
-            decision = "approved-edit"
+            decision = (
+                "approved-verified-edit"
+                if self.permissions_policy == "approve-verified-edits"
+                else "approved-human"
+            )
         elif deny_id is not None:
             outcome = {"outcome": "selected", "optionId": deny_id}
             decision = "denied"
@@ -225,8 +287,15 @@ class AcpClient:
             outcome = {"outcome": "cancelled"}
             decision = "cancelled-no-deny-option"
         self.send({"jsonrpc": "2.0", "id": msg.get("id"), "result": {"outcome": outcome}})
-        # Evidencia mínima: tipo de tool y decisión. Sin títulos ni contenido.
-        self.permission_log.append({"tool_kind": tool_kind, "decision": decision})
+        # Evidencia mínima: tipo, decisión, motivo y rutas RELATIVAS verificadas.
+        self.permission_log.append(
+            {
+                "tool_kind": tool_kind,
+                "decision": decision,
+                "reason": reason,
+                "paths": rel_paths,
+            }
+        )
 
     def canary_seen(self, canary):
         return any(canary in t for t in self._transient_texts)
@@ -492,7 +561,11 @@ def main():
         "--env-mode", choices=["sanitized", "nohome", "default"], default="sanitized"
     )
     p.add_argument("--san-home", default=None)
-    p.add_argument("--permissions", choices=["deny", "approve-edits"], default="deny")
+    p.add_argument(
+        "--permissions",
+        choices=["deny", "approve-verified-edits", "ask-human"],
+        default="deny",
+    )
     p.add_argument("--hold", type=float, default=0.0)
     p.add_argument("--ping-after", type=float, default=0.0)
     p.add_argument("--session-new", action="store_true")
