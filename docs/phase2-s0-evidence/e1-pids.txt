@@ -1,0 +1,2 @@
+hermes pid=505027 home=/home/elliot/p2s0-spike/p-A rss_kb=195024
+hermes pid=505028 home=/home/elliot/p2s0-spike/p-B rss_kb=212260

@@ -1,0 +1,4 @@
+auth.lock
+.hermes-update-in-progress.lock
+state.db.fts_rebuild.lock
+state.db.quarantine.lock

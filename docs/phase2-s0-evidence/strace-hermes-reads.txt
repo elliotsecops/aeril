@@ -1,0 +1,2 @@
+11303
+0 escrituras (O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|unlink|rename|mkdir|rmdir) a /home/elliot/.hermes desde procesos del spike

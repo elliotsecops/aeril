@@ -1,0 +1,51 @@
+{
+  "env_mode": "sanitized",
+  "hermes_home": "/home/elliot/p2s0-spike/p-B",
+  "repo": "/home/elliot/p2s0-spike/repo-B",
+  "pid": 510836,
+  "timings_ms": {
+    "initialize": 1682.7,
+    "spawn_to_initialize": 1683.2,
+    "terminate": 15.7
+  },
+  "rss_kb": {
+    "idle_after_init": 128920,
+    "idle_end_of_hold": 128920
+  },
+  "session_id": null,
+  "session_new_error": null,
+  "prompt_error": null,
+  "events": [],
+  "permissions": 0,
+  "terminated": "signal 15",
+  "initialize_result": {
+    "agentCapabilities": {
+      "loadSession": true,
+      "promptCapabilities": {
+        "image": true
+      },
+      "sessionCapabilities": {
+        "fork": {},
+        "list": {},
+        "resume": {}
+      }
+    },
+    "agentInfo": {
+      "name": "hermes-agent",
+      "version": "0.21.5"
+    },
+    "authMethods": [
+      {
+        "args": [
+          "--setup"
+        ],
+        "description": "Open Hermes' interactive model/provider setup in a terminal. Use this when Hermes has not been configured on this machine yet.",
+        "id": "hermes-setup",
+        "name": "Configure Hermes provider",
+        "type": "terminal"
+      }
+    ],
+    "protocolVersion": 1
+  },
+  "disk_kb_home": 1318154
+}
