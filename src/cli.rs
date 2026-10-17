@@ -298,6 +298,19 @@ fn cmd_run(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                 }
             };
             let mut store = open_store(db_path)?;
+            // P2-S1 R1 (P1-4): admisión temprana ANTES de la reconciliación
+            // de crash. Si el perfil gestionado del thread tiene un escritor
+            // sobreviviente, el run se RECHAZA sin tocar al sobreviviente
+            // (la reconciliación certificada termina backends huérfanos
+            // verificados; con perfiles gestionados la decisión debe ser del
+            // operador: matar verificando identidad y reconciliar con
+            // `aeril recover`).
+            if crate::profile::enabled()
+                && crate::profile::is_hermes_backend(&backend)
+                && let Some(agent) = crate::profile::agent_for_thread(data_dir, &thread_id)?
+            {
+                crate::profile::preflight_no_live_writer(data_dir, &agent)?;
+            }
             // S0: reconciliar runs interrumpidos (supervisores muertos) y
             // checkpoints pendientes antes de arrancar un run nuevo.
             crate::recovery::reconcile_interrupted_runs(&mut store)?;
@@ -734,8 +747,10 @@ fn cmd_profile(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
             "registered": v.registered,
             "dir_state": v.dir_state,
             "auth_status": v.auth_status,
+            "auth_checked_ms": v.auth_checked_ms,
             "thread_ids": v.thread_ids,
             "lock_held": v.lock_held,
+            "lock_state": v.lock_state,
             "warmed_ms": v.warmed_ms,
             "disk_kb": v.disk_kb,
         })
@@ -771,26 +786,37 @@ fn cmd_profile(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
         Some("assign") => {
             let agent_id = p.require("agent")?;
             let thread_id = p.require("thread")?;
-            crate::profile::assign(data_dir, &agent_id, &thread_id)?;
+            crate::profile::assign(data_dir, &agent_id, &thread_id, db_path)?;
             print_json(&json!({"assigned": true, "agent_id": agent_id, "thread_id": thread_id}))?;
             Ok(0)
         }
         Some("unassign") => {
             let thread_id = p.require("thread")?;
-            let removed = crate::profile::unassign(data_dir, &thread_id)?;
+            let removed = crate::profile::unassign(data_dir, &thread_id, db_path)?;
             print_json(&json!({"unassigned": removed, "thread_id": thread_id}))?;
+            Ok(0)
+        }
+        Some("recover") => {
+            let agent_id = p.require("agent")?;
+            if !p.yes("confirm") {
+                return Err(Error::invalid(
+                    "profile recover requiere --confirm (reconciliación explícita)",
+                ));
+            }
+            let verdict = crate::profile::recover(data_dir, &agent_id)?;
+            print_json(&json!({"agent_id": agent_id, "recovery": verdict}))?;
             Ok(0)
         }
         Some("remove") => {
             let agent_id = p.require("agent")?;
             let confirm = p.yes("confirm");
             let clear_threads = p.yes("clear-threads");
-            crate::profile::remove(data_dir, &agent_id, confirm, clear_threads, Some(db_path))?;
+            crate::profile::remove(data_dir, &agent_id, confirm, clear_threads, db_path)?;
             print_json(&json!({"removed": true, "agent_id": agent_id}))?;
             Ok(0)
         }
         other => Err(Error::invalid(format!(
-            "profile {other:?} no soportado (create|list|status|warm|assign|unassign|remove)"
+            "profile {other:?} no soportado (create|list|status|warm|assign|unassign|remove|recover)"
         ))),
     }
 }

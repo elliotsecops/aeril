@@ -22,10 +22,14 @@ pub struct RunRow {
     pub state: String,
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
+    /// Perfil gestionado que ejecutó el run (NULL = sin perfil / flag OFF).
+    /// Evidencia durable de propiedad: sobrevive a unassign/reassign.
+    pub profile: Option<String>,
 }
 
 const COLS: &str = "id, thread_id, workspace_id, repo_path, worktree_path, branch, base_oid, \
-                    backend, backend_version, engine_session_id, state, started_ms, ended_ms";
+                    backend, backend_version, engine_session_id, state, started_ms, ended_ms, \
+                    profile";
 
 fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
     Ok(RunRow {
@@ -42,6 +46,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         state: row.get(10)?,
         started_ms: row.get(11)?,
         ended_ms: row.get(12)?,
+        profile: row.get(13)?,
     })
 }
 
@@ -59,6 +64,8 @@ pub struct StartRunSpec<'a> {
     pub branch: &'a str,
     pub base_oid: &'a str,
     pub resumed_session: Option<&'a str>,
+    /// Perfil gestionado (P2-S1 R1): evidencia durable run→perfil.
+    pub profile: Option<&'a str>,
 }
 
 /// Crea el run y su evento `run.started` atómicamente.
@@ -68,8 +75,8 @@ pub fn start(conn: &mut Connection, spec: &StartRunSpec<'_>) -> Result<RunRow> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
         "INSERT INTO runs (id, thread_id, workspace_id, repo_path, worktree_path, branch, base_oid,
-                           backend, backend_version, state, started_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'starting', ?10)",
+                           backend, backend_version, state, started_ms, profile)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'starting', ?10, ?11)",
         params![
             id,
             spec.thread_id,
@@ -80,7 +87,8 @@ pub fn start(conn: &mut Connection, spec: &StartRunSpec<'_>) -> Result<RunRow> {
             spec.base_oid,
             spec.backend,
             spec.backend_version,
-            now
+            now,
+            spec.profile
         ],
     )?;
     let supervisor_pid = std::process::id() as i64;

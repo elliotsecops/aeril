@@ -58,7 +58,14 @@ CREATE INDEX idx_events_run ON events(run_id) WHERE run_id IS NOT NULL;
 CREATE INDEX idx_runs_thread ON runs(thread_id, started_ms);
 "#;
 
-pub const SCHEMA_VERSION: i64 = 3;
+/// v4 (P2-S1 R1): vínculo durable run→perfil gestionado. Sin esta columna,
+/// `unassign`/`--clear-threads` podían borrar la única evidencia de propiedad
+/// de un run no-terminal (P1-1). NULL = run sin perfil gestionado (flag OFF).
+pub const SCHEMA_V4: &str = r#"
+ALTER TABLE runs ADD COLUMN profile TEXT;
+"#;
+
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// v2: lease de workspace activo (exclusión entre procesos de Aeril).
 /// Tabla pequeña y dedicada: el `INSERT ... ON CONFLICT` dentro de una
@@ -95,6 +102,9 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     }
     if current < 3 {
         tx.execute_batch(SCHEMA_V3)?;
+    }
+    if current < 4 {
+        tx.execute_batch(SCHEMA_V4)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;

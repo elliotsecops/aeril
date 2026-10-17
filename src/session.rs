@@ -87,6 +87,13 @@ pub struct RunSummary {
     pub detail: Option<String>,
 }
 
+/// P2-S1 R1 — adjunto de perfil para un run: identidad del agente (evidencia
+/// durable run→perfil) + lock de escritor retenido durante todo el run.
+struct ProfileAttachment {
+    agent: Option<String>,
+    _lock: Option<crate::profile::ProfileLock>,
+}
+
 pub struct Runner {
     pub data_dir: PathBuf,
     pub db_path: PathBuf,
@@ -109,13 +116,12 @@ impl Runner {
     /// intacto). Flag ON + hermes ⇒ exige asignación + auth verificada
     /// (metadata-only) y devuelve el lock de escritor que vive hasta el final
     /// del run.
-    fn attach_profile(
-        &self,
-        thread_id: &str,
-        spec: &mut BackendSpec,
-    ) -> Result<Option<crate::profile::ProfileLock>> {
+    fn attach_profile(&self, thread_id: &str, spec: &mut BackendSpec) -> Result<ProfileAttachment> {
         if !crate::profile::enabled() || !crate::profile::is_hermes_backend(&spec.name) {
-            return Ok(None);
+            return Ok(ProfileAttachment {
+                agent: None,
+                _lock: None,
+            });
         }
         let agent = crate::profile::agent_for_thread(&self.data_dir, thread_id)?.ok_or_else(
             || {
@@ -124,7 +130,22 @@ impl Runner {
                 ))
             },
         )?;
+        // P2-S1 R1 (P1-4): admisión fail-closed —
+        // 1) flock exclusivo (lo retiene el supervisor Y sus children: el fd se
+        //    hereda al backend, así que un supervisor muerto con child vivo
+        //    sigue manteniendo el lock);
+        // 2) verificación de procesos sobrevivientes asociados al perfil;
+        // 3) re-verificación del mapeo thread→perfil tras tomar el lock
+        //    (un reassign concurrente no puede colarse).
         let lock = crate::profile::ProfileLock::acquire(&self.data_dir, &agent)?;
+        lock.make_inheritable()?;
+        crate::profile::verify_no_survivor(&self.data_dir, &agent)?;
+        let still = crate::profile::agent_for_thread(&self.data_dir, thread_id)?;
+        if still.as_deref() != Some(agent.as_str()) {
+            return Err(Error::conflict(format!(
+                "el thread {thread_id} fue reasignado durante el arranque del run — fail-closed"
+            )));
+        }
         let status = crate::profile::auth_status(&self.data_dir, &agent)?;
         if status != "logged_in" {
             return Err(Error::backend(format!(
@@ -135,7 +156,10 @@ impl Runner {
         // la resolución por PATH debe quedar fijada acá.
         spec.program = crate::profile::hermes_bin()?.to_string_lossy().into_owned();
         spec.env = crate::profile::env_for_profile(&self.data_dir, &agent)?;
-        Ok(Some(lock))
+        Ok(ProfileAttachment {
+            agent: Some(agent),
+            _lock: Some(lock),
+        })
     }
 
     fn note(&self, note: UiNote) {
@@ -152,6 +176,17 @@ impl Runner {
     ) -> Result<RunSummary> {
         let thread = threads::get(&store.conn, thread_id)?
             .ok_or_else(|| Error::not_found(format!("thread {thread_id}")))?;
+        // P2-S1 R1 (P1-4): admisión temprana de perfiles gestionados ANTES de
+        // cualquier takeover de lease. Si hay un escritor sobreviviente (p. ej.
+        // backend huérfano tras SIGKILL del supervisor), el run se RECHAZA;
+        // nunca se admite "matando primero" al backend anterior. El operador
+        // termina al sobreviviente (identidad verificada) y reintenta.
+        if crate::profile::enabled()
+            && crate::profile::is_hermes_backend(&opts.backend)
+            && let Some(agent) = crate::profile::agent_for_thread(&self.data_dir, thread_id)?
+        {
+            crate::profile::preflight_no_live_writer(&self.data_dir, &agent)?;
+        }
         let repo = git::open(Path::new(&thread.repo_path))?;
         let latest = runs::latest(&store.conn, thread_id)?;
         let prev_session = latest.as_ref().and_then(|r| r.engine_session_id.clone());
@@ -361,7 +396,7 @@ impl Runner {
         // backend hermes: el thread DEBE tener perfil asignado y autenticado;
         // el lock de escritor se retiene durante todo el run y el spawn usa el
         // entorno sanitizado del perfil. Sin fallback al perfil del host.
-        let _profile_lock = self.attach_profile(thread_id, &mut spec)?;
+        let attachment = self.attach_profile(thread_id, &mut spec)?;
         let run = runs::start(
             &mut store.conn,
             &StartRunSpec {
@@ -380,6 +415,9 @@ impl Runner {
                 } else {
                     None
                 },
+                // P2-S1 R1: vínculo durable run→perfil (sobrevive a
+                // unassign/reassign; base del guard de borrado P1-1).
+                profile: attachment.agent.as_deref(),
             },
         )?;
 

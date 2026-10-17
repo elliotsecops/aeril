@@ -1,5 +1,11 @@
 # P2-S1 — Perfiles Hermes gestionados: implementación y evidencia
 
+> **R1 (post-auditoría):** este documento refleja el diseño P2-S1; la
+> remediación de los 4 P1 + hardening H1–H5 (invariantes endurecidos, tests
+> adversariales, evidencia RED/GREEN) está en
+> [`docs/phase2-s1-r1-remediation.md`](phase2-s1-r1-remediation.md). En caso
+> de discrepancia, R1 prevalece.
+
 **Rama:** `feat/phase2-s1-profiles` (desde `main` certificado `47f0318eaadded7b93c027ba42efe0f9778f0f87`)
 **Feature flag:** `AERIL_HERMES_PROFILES` (default **OFF**)
 **Estado:** implementación completa, pendiente de auditoría independiente
@@ -157,12 +163,21 @@ real pertenece a P2-S0 (VIOLATION registrada) y a su re-baseline en P2-S2.
    comportamiento vuelve al certificado en `main @ 47f0318`: los comandos
    `aeril profile *` se rechazan y el Runner no consulta perfiles (T1, T15).
 2. **Sin migración de datos:** el subsistema es metadata fuera de la DB
-   (`<data_dir>/hermes/`); no hay cambios de esquema. Rollback de código no
-   requiere tocar la DB ni los worktrees.
-3. **Borrar artefactos (opcional):** `rm -rf <AERIL_DATA_DIR>/hermes` con Aeril
-   detenido (o `aeril profile remove --agent <id> --confirm --clear-threads`).
-   Los perfiles creados en P2-S1 son descartables y no contienen credenciales de
-   producción (la autenticación real requiere device-code del operador).
+   (`<data_dir>/hermes/`); no hay cambios de esquema para el rollback. Rollback
+   de código no requiere tocar la DB ni los worktrees.
+3. **Perfiles: NUNCA borrado masivo.** Un perfil contiene estado durable y
+   potencialmente **credenciales de Hermes** (`auth.json` dentro de
+   `HERMES_HOME`). Reglas (R1-H3):
+   - No ejecutar `rm -rf <AERIL_DATA_DIR>/hermes` bajo ninguna circunstancia:
+     destruiría credenciales y evidencia sin validación.
+   - Borrado **por perfil y explícito**, con autorización del usuario:
+     `aeril profile remove --agent <id> --confirm` (requiere flag ON, verifica
+     ownership, runs no-terminales, lock, procesos y symlinks; fail-closed).
+   - Si un perfil quedara en HOLD (run no reconciliado o proceso huérfano):
+     reconciliar (`aeril recover`), terminar el proceso huérfano con identidad
+     verificada y reintentar; o `profile recover --agent <id> --confirm`.
+   - La desactivación del flag **no implica** borrar perfiles: dejarlos en
+     disco es el default seguro.
 4. **Reversión total:** `git revert` del merge del PR (o abandono de la rama).
    `main` no fue modificado por esta rama.
 

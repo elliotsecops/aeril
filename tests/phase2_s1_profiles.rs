@@ -19,103 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-const FAKE_HERMES: &str = r#"#!/usr/bin/python3
-import json, os, sys, time
-
-args = sys.argv[1:]
-home = os.environ.get("HERMES_HOME") or ""
-dump = os.environ.get("FAKE_DUMP") or ""
-if home:
-    dump = os.path.join(home, "fake-env.json")
-
-def mode():
-    p = os.path.join(home, "fake-mode")
-    try:
-        with open(p) as f:
-            return f.read().strip()
-    except OSError:
-        return "full"
-
-if args and args[0] == "--version":
-    print("hermes 0.0.0-fake")
-    sys.exit(0)
-
-if len(args) >= 2 and args[0] == "acp" and args[1] == "--version":
-    print("hermes 0.0.0-fake")
-    sys.exit(0)
-
-if args and args[0] == "auth":
-    provider = args[2] if len(args) > 2 else "nous"
-    marker = os.path.join(home, "fake-auth") if home else ""
-    if marker and os.path.exists(marker):
-        print(provider + ": logged in")
-    else:
-        print(provider + ": not logged in")
-    sys.exit(0)
-
-if args and args[0] == "acp":
-    if dump:
-        keys = ["HERMES_HOME","HOME","XDG_CONFIG_HOME","XDG_CACHE_HOME",
-                "XDG_DATA_HOME","XDG_STATE_HOME","GH_CONFIG_DIR","PATH"]
-        data = {k: os.environ.get(k, "") for k in keys}
-        try:
-            with open(dump, "w") as f:
-                json.dump(data, f)
-        except OSError:
-            pass
-    if home:
-        try:
-            with open(os.path.join(home, "fake-pid"), "w") as f:
-                f.write(str(os.getpid()))
-        except OSError:
-            pass
-    m = mode()
-    if m == "hang":
-        time.sleep(600)
-        sys.exit(0)
-    if m.startswith("slow:"):
-        time.sleep(float(m.split(":", 1)[1]))
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except Exception:
-            continue
-        mid = msg.get("id")
-        method = msg.get("method")
-        if method == "initialize":
-            out = {"jsonrpc":"2.0","id":mid,"result":{
-                "protocolVersion":1,
-                "agentInfo":{"name":"fake-hermes","version":"0.0.0-fake"},
-                "agentCapabilities":{"loadSession":True},
-                "authMethods":[]}}
-            print(json.dumps(out), flush=True)
-        elif method == "session/new":
-            out = {"jsonrpc":"2.0","id":mid,"result":{
-                "sessionId":"fake-sess",
-                "models":{"availableModels":[],"currentModelId":"fake"},
-                "modes":{"currentModeId":"default","availableModes":[]}}}
-            print(json.dumps(out), flush=True)
-        elif method == "session/prompt":
-            if m == "linger":
-                time.sleep(600)
-                continue
-            note = {"jsonrpc":"2.0","method":"session/update","params":{
-                "update":{"sessionUpdate":"agent_message_chunk",
-                          "content":{"type":"text","text":"hecho (fake)"},
-                          "messageId":"m1"}}}
-            print(json.dumps(note), flush=True)
-            out = {"jsonrpc":"2.0","id":mid,"result":{"stopReason":"end_turn"}}
-            print(json.dumps(out), flush=True)
-        elif mid is not None:
-            out = {"jsonrpc":"2.0","id":mid,"result":{}}
-            print(json.dumps(out), flush=True)
-    sys.exit(0)
-
-sys.exit(0)
-"#;
+const FAKE_HERMES: &str = include_str!("common/fake_hermes.py");
 
 struct P2 {
     env: TestEnv,
@@ -539,6 +443,7 @@ fn t8_warm_timeout_bounded() {
 #[test]
 fn t9_writer_lock_contention_and_release() {
     let p2 = P2::new("p2s1-t9");
+    let _ = p2.assigned_thread(); // materializa la DB (R1: remove la exige)
     p2.create("lock-a");
     p2.mark_auth("lock-a");
     p2.set_mode("lock-a", "slow:3");
@@ -646,6 +551,7 @@ fn t10_remove_guards() {
 #[test]
 fn t11_interrupted_ops_reconcile() {
     let p2 = P2::new("p2s1-t11");
+    let _ = p2.assigned_thread(); // materializa la DB (R1: remove la exige)
     p2.create("crash-a");
     // Remove interrumpido: dir borrado, registro intacto.
     std::fs::remove_dir_all(p2.agent_dir("crash-a")).unwrap();
@@ -822,8 +728,23 @@ fn t14_runner_profile_env_and_writer_lock() {
 
     // El lock vive TODO el writer: status lo ve; warm y un segundo run fallan.
     assert_eq!(p2.view("live-a")["lock_held"], true);
+    assert_eq!(p2.view("live-a")["lock_state"], "held");
     let err = p2.err_on(&["profile", "warm", "--agent", "live-a"]);
     assert!(err.contains("escritor"), "mensaje: {err}");
+    // P1-1 R1: remove durante run activo ⇒ HOLD (guard de runs, incluso con
+    // --clear-threads); el lock ya no es la única defensa.
+    let err = p2.err_on(&[
+        "profile",
+        "remove",
+        "--agent",
+        "live-a",
+        "--confirm",
+        "--clear-threads",
+    ]);
+    assert!(
+        err.contains("no-terminal") || err.contains("escritor"),
+        "mensaje: {err}"
+    );
     // Segundo run sobre OTRO thread del mismo perfil (workspace nuevo, sin
     // conflicto de lease): debe fallar por el lock del escritor.
     let t2 = p2.assigned_thread();
@@ -858,7 +779,18 @@ fn t14_runner_profile_env_and_writer_lock() {
     kill_pid(pid, libc::SIGKILL);
     kill_pid(run.id() as i32, libc::SIGTERM);
     reap(run);
-    // Sin proceso vivo ⇒ remove explícito completa.
+    // R1: con el run aún no-terminal, remove DEBE rechazarse (HOLD)…
+    let err = p2.err_on(&[
+        "profile",
+        "remove",
+        "--agent",
+        "live-a",
+        "--confirm",
+        "--clear-threads",
+    ]);
+    assert!(err.contains("no-terminal"), "mensaje: {err}");
+    // …y tras reconciliar (`aeril recover`) completa.
+    p2.ok_on(&["recover"]); // reconciliación explícita de runs interrumpidos
     p2.ok_on(&[
         "profile",
         "remove",

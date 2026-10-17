@@ -1,0 +1,41 @@
+P1-1a: RED — remove --clear-threads ELIMINÓ el perfil con run durable no-terminal
+P1-1b: RED — unassign + remove ELIMINARON el perfil con run durable no-terminal
+P1-1c: RED — DB inaccesible ⇒ remove ELIMINÓ el perfil (chequeo saltado)
+  P1-2[positive]: auth_status=logged_in (esperado logged_in)
+  P1-2[positive-exit1]: auth_status=logged_in (esperado no-positive)
+  P1-2[not-currently]: auth_status=logged_in (esperado no-positive)
+  P1-2[not-signed]: auth_status=unknown (esperado no-positive)
+  P1-2[logged-out]: auth_status=unknown (esperado no-positive)
+  P1-2[no-credentials]: auth_status=absent (esperado no-positive)
+  P1-2[other-provider]: auth_status=logged_in (esperado no-positive)
+  P1-2[contradictory]: auth_status=logged_in (esperado no-positive)
+  P1-2[malformed]: auth_status=unknown (esperado no-positive)
+  P1-2[empty]: auth_status=unknown (esperado no-positive)
+P1-2: RED — clasificación incorrecta en: positive-exit1, not-currently, other-provider, contradictory
+  P1-3[valid]: warm rc=0(PASS) (esperado PASS)
+  P1-3[notif-masquerade]: warm rc=0(PASS) (esperado reject)
+  P1-3[string-result]: warm rc=0(PASS) (esperado reject)
+  P1-3[wrong-id]: warm rc=0(PASS) (esperado reject)
+  P1-3[null-result]: warm rc=0(PASS) (esperado reject)
+  P1-3[error]: warm rc=non-zero (esperado reject)
+  P1-3[bare-result]: warm rc=0(PASS) (esperado reject)
+  P1-3[missing-protocol]: warm rc=0(PASS) (esperado reject)
+  P1-3[oversized]: warm rc=0(PASS) (esperado reject)
+  P1-3[eof-mid-frame]: warm rc=non-zero (esperado reject)
+  P1-3[no-response]: warm rc=non-zero (esperado reject)
+  P1-3[endless-notifications]: warm rc=non-zero (esperado reject)
+  P1-3[notifications-then-valid]: warm rc=0(PASS) (esperado PASS)
+P1-3: RED — initialize aceptado/ rechazado incorrectamente en: notif-masquerade, string-result, wrong-id, null-result, bare-result, missing-protocol, oversized
+P1-4: RED — child sobreviviente (pid 1702738) + segundo warm ACEPTADO (rc=0); run admitido=True, remove rc=1
+  P1-4: sobreviviente terminado (alive=False)
+P1-4-recon: GREEN — recover rc=0; warm post-reconciliación rc=0
+
+=== resumen ===
+P1-1a: RED — remove --clear-threads ELIMINÓ el perfil con run durable no-terminal
+P1-1b: RED — unassign + remove ELIMINARON el perfil con run durable no-terminal
+P1-1c: RED — DB inaccesible ⇒ remove ELIMINÓ el perfil (chequeo saltado)
+P1-2: RED — clasificación incorrecta en: positive-exit1, not-currently, other-provider, contradictory
+P1-3: RED — initialize aceptado/ rechazado incorrectamente en: notif-masquerade, string-result, wrong-id, null-result, bare-result, missing-protocol, oversized
+P1-4: RED — child sobreviviente (pid 1702738) + segundo warm ACEPTADO (rc=0); run admitido=True, remove rc=1
+P1-4-recon: GREEN — recover rc=0; warm post-reconciliación rc=0
+total: 7 escenarios, 6 RED
