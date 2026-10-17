@@ -18,6 +18,9 @@ multi-Hermes en producto, sin credenciales reales.
    `docs/phase2-s1-r1-evidence/red-baseline-39eaf15.txt`
    (6/7 escenarios RED; el restante es la fase de reconciliación que el
    candidato original tampoco podía satisfacer de forma segura).
+   Nota: esa captura RED es la del momento del hallazgo; el GREEN posterior
+   incluye además los casos añadidos durante la remediación (initialize
+   fragmentado, DB ausente) que no representan violaciones nuevas del baseline.
 4. Fixes con invariantes explícitos; tests adversariales nuevos (§5).
 5. **GREEN re-ejecutado con el mismo script** contra el candidato corregido:
    `docs/phase2-s1-r1-evidence/green-candidate.txt` (0 RED).
@@ -175,7 +178,7 @@ demuestra el camino ON completo (crear → asignar → autenticar → run
 
 ## 5. Inventario de tests nuevos
 
-### `tests/phase2_s1_r1.rs` (14 tests)
+### `tests/phase2_s1_r1.rs` (15 tests)
 
 | Test | Cubre |
 |---|---|
@@ -185,6 +188,7 @@ demuestra el camino ON completo (crear → asignar → autenticar → run
 | `r1_p1_1d_active_run_blocks_removal` | Run vivo ⇒ remove denegado (guard de runs/lock) |
 | `r1_p1_1e_terminal_run_allows_explicit_removal` | Run terminal + asociación histórica ⇒ `--clear-threads` explícito permite |
 | `r1_p1_1f_partial_crash_removal_is_idempotent` | Crash entre FS y registro ⇒ limpieza idempotente, registro íntegro |
+| `r1_p1_1g_missing_database_denies_removal` | DB ausente ⇒ HOLD; tras materializarla, removal normal |
 | `r1_p1_2_auth_matrix_never_false_positive` | Matriz 10 modos + recuperación `unknown→logged_in` + timestamps frescos |
 | `r1_p1_2_runner_admission_rejects_exit1_positive_text` | Admisión rechaza `exit 1` con texto positivo; sin lock residual |
 | `r1_p1_3_warm_strict_initialize_matrix` | 13 modos de initialize (válidos/fragmentados/adversariales) |
@@ -198,7 +202,8 @@ demuestra el camino ON completo (crear → asignar → autenticar → run
 
 `auth_classifier_adversarial_matrix` (17 casos), `init_validator_adversarial_matrix`
 (18 casos), `mountinfo_fault_injection`, `proc_scan_fault_injection`,
-`atomic_write_concurrent_unique_tmp`. Total unit del módulo: 8.
+`atomic_write_concurrent_unique_tmp`, `non_terminal_run_guard_covers_starting_and_running`.
+Total unit del módulo: 9 (3 previos + 6 nuevos).
 
 ### Suite P2-S1 original actualizada
 
@@ -254,13 +259,15 @@ Puntos evaluados sin cambio (limitaciones documentadas):
 ## 7. Gates de verificación (revisión final)
 
 ```text
-cargo test (suite completa): EXIT=0 — 162/162, 23 binarios de test
-  · Fase 1 completa (124) + P2-S1 original (15) + R1 (15) + unit nuevos (8→13)
-  · Nota: en una corrida previa, `g9_integracion_concurrente_ff` (Fase 1,
-    concurrencia git de integración) falló por contención del lock de refs
-    (`refs/heads/destino.lock`) bajo carga; en aislamiento y en la corrida
-    final pasa (11/11). Flakiness preexistente ajena a este diff (no se toca
-    código de integración/git).
+cargo test --no-fail-fast (suite completa): EXIT=0 — 163/163, 23 binarios
+  · Fase 1 completa (124) + P2-S1 original (15) + R1 (15) + unit (9 del módulo
+    profile entre los 14 del lib)
+  · Nota de flakiness preexistente: `g9_integracion_concurrente_ff` (Fase 1,
+    concurrencia de integración git) falló en 2 de 5 corridas SOLO bajo carga
+    extrema de la máquina (load ≈12–14): el perdedor recibió el lock de
+    `refs/heads/destino` en vez del mensaje stale "se movió" (el ganador nunca
+    es pisado; el invariante se mantiene). Pasa en aislamiento (11/11) y en la
+    corrida final completa. No se toca código de integración/git en este diff.
 cargo fmt --check: limpio
 cargo clippy --all-targets -- -D warnings: limpio
 

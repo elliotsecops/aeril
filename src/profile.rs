@@ -1541,19 +1541,23 @@ fn count_non_terminal_runs(
     profile: &str,
     threads: &[String],
 ) -> Result<i64> {
-    let mut total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM runs WHERE profile = ?1 AND state IN ('starting','running')",
-        [profile],
-        |r| r.get::<_, i64>(0),
-    )?;
-    for t in threads {
-        total += conn.query_row(
-            "SELECT COUNT(*) FROM runs WHERE thread_id = ?1 AND state IN ('starting','running')",
-            [t],
-            |r| r.get::<_, i64>(0),
-        )?;
+    // Un único COUNT(DISTINCT): las condiciones (perfil durable y threads
+    // legacy) pueden solaparse sobre el mismo run; el número no debe inflarse.
+    let mut sql = String::from(
+        "SELECT COUNT(DISTINCT id) FROM runs WHERE state IN ('starting','running') AND (profile = ?1",
+    );
+    for i in 0..threads.len() {
+        sql.push_str(&format!(" OR thread_id = ?{}", i + 2));
     }
-    Ok(total)
+    sql.push(')');
+    let mut stmt = conn.prepare(&sql)?;
+    let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + threads.len());
+    binds.push(&profile);
+    for t in threads {
+        binds.push(t);
+    }
+    let n: i64 = stmt.query_row(rusqlite::params_from_iter(binds.iter()), |r| r.get(0))?;
+    Ok(n)
 }
 
 /// Abre el store para chequeos de seguridad: cualquier fallo es fail-closed.
@@ -2025,6 +2029,49 @@ mod tests {
         assert_eq!(processes_using_home_in(&home, &proc).unwrap(), vec![5678]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── P1-1: el guard cuenta 'starting' y 'running' (perfil y thread) ─────
+
+    #[test]
+    fn non_terminal_run_guard_covers_starting_and_running() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO threads (id, title, repo_id, repo_path, state, next_seq, created_ms, updated_ms)
+                 VALUES ('t1', 'x', 'r1', '/tmp', 'open', 0, 1, 1)",
+                [],
+            )
+            .unwrap();
+        let insert = |id: &str, state: &str, profile: Option<&str>| {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO runs (id, thread_id, backend, state, started_ms, profile)
+                     VALUES (?1, 't1', 'hermes', ?2, 1, ?3)",
+                    rusqlite::params![id, state, profile],
+                )
+                .unwrap();
+        };
+        // 'starting' con perfil ⇒ cuenta (ruta durable).
+        insert("r-start", "starting", Some("p1"));
+        assert_eq!(count_non_terminal_runs(&store.conn, "p1", &[]).unwrap(), 1);
+        // 'running' por thread (legacy sin profile) ⇒ cuenta.
+        insert("r-run-legacy", "running", None);
+        assert_eq!(
+            count_non_terminal_runs(&store.conn, "p1", &["t1".to_string()]).unwrap(),
+            2
+        );
+        // Terminales no cuentan.
+        insert("r-done", "completed", Some("p1"));
+        insert("r-failed", "failed", Some("p1"));
+        assert_eq!(
+            count_non_terminal_runs(&store.conn, "p1", &["t1".to_string()]).unwrap(),
+            2
+        );
+        // Otro perfil no cuenta.
+        assert_eq!(count_non_terminal_runs(&store.conn, "p2", &[]).unwrap(), 0);
     }
 
     // ── H2: temporales únicos + RMW de metadata ─────────────────────────────

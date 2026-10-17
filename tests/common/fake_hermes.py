@@ -160,6 +160,15 @@ if args and args[0] == "acp":
         if method == "initialize":
             if mode == "no-response":
                 continue
+            if mode == "fragmented":
+                full = json.dumps(respond_init())
+                half = len(full) // 2
+                sys.stdout.write(full[:half])
+                sys.stdout.flush()
+                time.sleep(0.2)
+                sys.stdout.write(full[half:] + "\n")
+                sys.stdout.flush()
+                continue
             print(json.dumps(respond_init()), flush=True)
         elif method == "session/new":
             print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {

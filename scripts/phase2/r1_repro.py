@@ -289,6 +289,7 @@ def scenario_p1_3(bin_path, only):
         return
     cases = [
         ("valid", True),
+        ("fragmented", True),
         ("notif-masquerade", False),
         ("string-result", False),
         ("wrong-id", False),
@@ -331,7 +332,7 @@ def scenario_p1_3(bin_path, only):
         if bad:
             report("P1-3", "RED", f"initialize aceptado/ rechazado incorrectamente en: {', '.join(bad)}")
         else:
-            report("P1-3", "GREEN", "validación estricta completa (12/12)")
+            report("P1-3", "GREEN", f"validación estricta completa ({len(cases)}/{len(cases)})")
     finally:
         fx.cleanup()
 

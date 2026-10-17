@@ -478,6 +478,7 @@ fn r1_p1_3_warm_strict_initialize_matrix() {
     r1.mark_auth("p13");
     let cases = [
         ("valid", true),
+        ("fragmented", true),
         ("notif-masquerade", false),
         ("string-result", false),
         ("wrong-id", false),
