@@ -319,7 +319,20 @@ Variante no-cooperativa: `r1_p1_3_noncooperative_child_is_terminated`
 
 ## 9. Entrega
 
-<!-- DELIVERY_BLOCK -->
+- **Baseline auditado (RED):** `39eaf15bf8fb1db662c21d244d6dbfaf8814ed21`
+- **Commit de remediación:** `2238d7730b0e3c8456ddb5dcd2e158eaa47acb01`
+  (`fix(p2s1-r1): remediación de los 4 P1 + hardening (auditoría independiente)`)
+- **Rama:** `feat/phase2-s1-profiles` — PR #1 (draft, sin merge). El tip de la
+  rama al cierre (incluye este registro docs-only) se reporta en el PR.
+- **Diff acotado:** `src/profile.rs`, `src/cli.rs`, `src/session.rs`,
+  `src/recovery.rs`, `src/store/{schema,runs,mod}.rs` (schema v4 justificado en
+  P1-1), `tests/phase2_s1_profiles.rs`, nuevos `tests/phase2_s1_r1.rs`,
+  `tests/common/fake_hermes.py`, `scripts/phase2/r1_repro.py`, `docs/…`.
+  Sin cambios de dependencias (`Cargo.toml`/`Cargo.lock` intactos) ni de
+  `main`/tags.
+- **Rollback:** ver §5 del doc de implementación (sin `rm -rf`; flag OFF
+  restaura el comportamiento certificado; perfiles se dejan en disco salvo
+  borrado explícito validado).
 
 ---
 
