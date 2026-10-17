@@ -501,3 +501,26 @@ se diseña en P2-S2.
 - Recomendación del spike: **PASS condicional** — el hito de factibilidad se
   cumple; quedan dos condiciones de revisión (re-baseline de idle y test de
   aceptación de P2-S2) que no bloquean la planificación de P2-S1.
+
+## 17. Cierre P2-S0 — aceptación independiente (CONDITIONAL PASS)
+
+- **SHA aceptado**: `4b5cb0fcabe887a063bf4ff38517b950a6b232e4` (rama
+  `spike/phase2-s0-hermes-auth`). **Veredicto: CONDITIONAL PASS.**
+- El cierre **no modifica** las conclusiones técnicas de §15/§16; las preserva:
+  1. **Factibilidad autenticada N=2: PASS.**
+  2. **Aislamiento de sesiones: PASS** (E4 + controles L1-only).
+  3. **L4: verificado SOLO para la versión de Hermes probada y el modelo free
+     probado**; para modelos no validados rige `verified=false`.
+  4. **Budget idle RSS: VIOLATION** (213.7/258.8 MiB > 192) — **no se waivea**;
+     re-baseline propuesto (≤288 MiB) queda para revisión separada (P2-S4).
+  5. **Clasificación de turnos fallidos: OPEN** (`failed_turn` con
+     `stop=end_turn`); test de aceptación definido para P2-S2.
+  6. **Aislamiento de secretos del host: NO certificado** (G3/G4 son
+     minimización; ver §2C y la revisión de exposición).
+  7. **Multi-Hermes producción: NO certificado.**
+- **Exposición de credenciales**: revisión y contención en
+  `docs/phase2-s0-credential-exposure-review.md` (transcript local con valores
+  de token; syncthing con HOME completa sincronizada; revocación provider-side
+  pendiente del usuario).
+- **Integración**: la rama spike **no se mergea** a `main` sin una decisión de
+  integración separada. `main` permanece en `47f0318`.
