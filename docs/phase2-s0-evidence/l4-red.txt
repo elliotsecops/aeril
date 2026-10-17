@@ -1,0 +1,3 @@
+escenario: SOLO replay (sin prompt nuevo)
+canary_seen (harness actual) = True
+ROJO CONFIRMADO: el replay por sí solo produce canary_found=true (falso positivo de L4)

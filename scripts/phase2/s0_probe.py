@@ -42,6 +42,14 @@ import threading
 import time
 
 HERMES = "/home/elliot/.local/bin/hermes"
+# Copy pública del boundary de turno fallido (agent/turn_failure_copy.py).
+FAILED_TURN_NOTICE = (
+    "Your request was not processed. Send it again if you still want me to carry it out."
+)
+PARTIAL_FAILED_TURN_NOTICE = (
+    "This turn did not complete. Some actions may already have run; verify their effects "
+    "before resending."
+)
 SANITIZED_PATH = "/usr/bin:/bin"
 # Variables no-secretas permitidas por lista explícita (p. ej. para OAuth con
 # navegador). Nunca se copia el entorno completo como atajo.
@@ -140,7 +148,15 @@ class AcpClient:
         self.buf = b""
         self.event_kinds = {}
         self.permission_log = []
-        self._transient_texts = []  # solo en memoria; nunca se persiste
+        # F1/R7-R1: separación por FASE. `phase` ∈ init|load|prompt. El texto
+        # solo se acumula en el bucket de la fase activa; L4 se evalúa
+        # EXCLUSIVAMENTE sobre `prompt_agent_texts` (mensajes del agente del
+        # prompt NUEVO). Replay, thoughts y mensajes de usuario NUNCA son
+        # evidencia de recall.
+        self.phase = "init"
+        self.replay_agent_texts = []
+        self.prompt_agent_texts = []
+        self.prompt_thought_texts = []
         self.timings = {}
         self.session_id = None
 
@@ -195,9 +211,14 @@ class AcpClient:
             self._note(st)
             if st in ("agent_message_chunk", "agent_thought_chunk"):
                 c = upd.get("content")
-                if isinstance(c, dict):
-                    # Solo en memoria (verificación de canary); no se persiste.
-                    self._transient_texts.append(str(c.get("text", ""))[:2000])
+                text = str(c.get("text", ""))[:2000] if isinstance(c, dict) else ""
+                if self.phase == "load" and st == "agent_message_chunk":
+                    self.replay_agent_texts.append(text)
+                elif self.phase == "prompt":
+                    if st == "agent_message_chunk":
+                        self.prompt_agent_texts.append(text)
+                    else:
+                        self.prompt_thought_texts.append(text)
         else:
             self._note(f"other:{method}")
 
@@ -322,13 +343,18 @@ class AcpClient:
             }
         )
 
-    def canary_seen(self, canary):
-        # Los updates llegan como DELTAS: el canary puede partirse entre
-        # chunks, así que se busca en la concatenación (y por chunk, por si el
-        # backend envía el mensaje completo).
-        if canary in "".join(self._transient_texts):
-            return True
-        return any(canary in t for t in self._transient_texts)
+    def l4_canary_in_new_response(self, canary):
+        """L4 (F1/R7-R1): SOLO mensajes del agente del prompt NUEVO.
+
+        Los deltas se concatenan (el canary puede partirse entre chunks). Los
+        chunks de replay, los thoughts y los mensajes del usuario no cuentan.
+        """
+        return canary in "".join(self.prompt_agent_texts)
+
+    def failed_turn_boundary_seen(self):
+        """¿La respuesta nueva es el boundary de turno fallido de Hermes?"""
+        joined = "".join(self.prompt_agent_texts).strip()
+        return joined in (FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE)
 
 
 def rss_kb(pid):
@@ -479,6 +505,7 @@ def cmd_probe(args):
                 }
         if args.load:
             before_kinds = dict(client.event_kinds)
+            client.phase = "load"
             try:
                 r = client.request(
                     "session/load",
@@ -494,6 +521,8 @@ def cmd_probe(args):
                 client.session_id = args.load
             except (TimeoutError, RuntimeError) as e:
                 report["load_error"] = {"message": str(e)[:200]}
+            finally:
+                client.phase = "init"
             delta = {}
             for k in set(before_kinds) | set(client.event_kinds):
                 d = client.event_kinds.get(k, 0) - before_kinds.get(k, 0)
@@ -516,6 +545,7 @@ def cmd_probe(args):
             sampler.start()
             t = time.monotonic()
             report["wall"]["prompt_start_unix_ms"] = round(time.time() * 1000)
+            client.phase = "prompt"
             try:
                 r = client.request(
                     "session/prompt",
@@ -538,10 +568,18 @@ def cmd_probe(args):
             finally:
                 stop.set()
                 sampler.join(timeout=2)
+                client.phase = "init"
                 report["wall"]["prompt_end_unix_ms"] = round(time.time() * 1000)
                 report["rss_kb"]["prompt_peak"] = peak["rss"] or None
         if args.canary:
-            report["canary_found"] = client.canary_seen(args.canary)
+            report["l4"] = {
+                "canary_in_new_response": client.l4_canary_in_new_response(args.canary),
+                "new_response_chunks": len(client.prompt_agent_texts),
+                "new_thought_chunks": len(client.prompt_thought_texts),
+                "replay_agent_chunks": len(client.replay_agent_texts),
+                "failed_turn_boundary": client.failed_turn_boundary_seen(),
+                "stop_reason": report.get("prompt_stop_reason"),
+            }
         time.sleep(2.0)
         report["rss_kb"]["idle_after_init"] = rss_kb(proc.pid)
         # Hold con ping opcional SOBRE LA MISMA conexión (un solo escritor).

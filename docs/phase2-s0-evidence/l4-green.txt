@@ -1,0 +1,3 @@
+replay-only (sin prompt): l4 = False · replay_chunks = 1
+replay + respuesta nueva con canary: l4 = True
+VERDE: replay-only=False · respuesta nueva con recall=True

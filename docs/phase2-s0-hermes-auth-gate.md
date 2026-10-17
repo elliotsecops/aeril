@@ -379,6 +379,9 @@ bajo B y id desconocido → `load_status=ok` (quirk V5) pero `replay=0` y
 **L1–L4 (canary impredecible, protocolo *session-only*):**
 - L1 load aceptado = ✅ · L2 sesión en su store = ✅ · L3 replay>0
   (user/tool/agent chunks) = ✅ · **L4 recall del canary = ✅** en ambos.
+  **(R7-R1)**: la medición de L4 de este apartado se re-midió con separación
+  de fases (F1); la conclusión se mantiene y ahora se apoya SOLO en la
+  respuesta nueva — ver §16.
 - Controles: fresh sin load = False; id desconocido = False; id de A bajo B =
   False. Primer intento usó **memoria del perfil** (`memories/MEMORY.md`) y fue
   detectado/aislado con la instrucción session-only (0 tool calls, canary
@@ -391,6 +394,8 @@ bajo B y id desconocido → `load_status=ok` (quirk V5) pero `replay=0` y
 proceso ≈ **262 MB**; agregado 2 procesos ≈ **524 MB**; disco por perfil
 **408/407 MB**; warm init ~1.7–2.0 s; cold 26.7 s (previo); turnos 3–7 s;
 host con MemAvailable 4.4–4.5 GiB y presión 0 durante las pruebas.
+**(R7-R1)**: estas mediciones se separaron por estado en §16 (F2); la
+clasificación del idle se corrige a **VIOLATION** (no PASS).
 Contra los presupuestos provisionales del plan: pico ≤320 MiB **PASS**;
 agregado ≤768 MiB **PASS**; warm ≤10 s **PASS**; cold ≤120 s **PASS**;
 **idle ≤192 MiB EXCEDIDO** (262 MB con sesión autenticada cargada) ⇒
@@ -401,6 +406,7 @@ re-baseline explícito en P2-S4, sin relajar silenciosamente.
    Hermes cierra el turno con boundary `failed_turn`; **el ACP igual responde
    `stop=end_turn`** ⇒ un turno fallido podría registrarse como `completed` sin
    cambios. Superficie honesta de fallos de proveedor = requisito de P2-S2/S3.
+   **(R7-R1)**: verificado desde evidencia durable + fuente — ver §16 (F3).
 2. La memoria de perfil (`MEMORY.md`) persiste entre sesiones: cualquier claim
    de restauración debe aislarla (protocolo session-only) — ya documentado.
 3. `request_count` no refleja turnos free; usar `session_model_usage`.
@@ -411,3 +417,87 @@ fallidos como fallos (no `completed`), (b) re-baseline del presupuesto idle en
 P2-S4, (c) política de selección de modelo (free/créditos) documentada,
 (d) cancelación/recuperación real en P2-S3. Evidencia: `e3-e4-e7-l4-r7.txt` +
 JSONs `e3-*.json`, `e4-*.json`, `l4x-*.json` (redactados; sin valores).
+
+## 16. R7-R1 — Integridad de L4, precisión de recursos y clasificación de turnos fallidos
+
+### F1 — L4 ya no puede incluir contenido replayed (corregido)
+
+**Bug**: `_transient_texts` acumulaba texto de `agent_message_chunk`/
+`agent_thought_chunk` durante `session/load` **y** `session/prompt`, y
+`canary_seen()` buscaba en todo ⇒ un canary presente solo en el **replay**
+producía `canary_found=true` (falso positivo). Rojo reproducido contra
+`9a0f46a` (`l4-red.txt`: "replay-only ⇒ True").
+
+**Corrección (harness-only)**: separación por fases (`init|load|prompt`);
+buckets `replay_agent_texts`, `prompt_agent_texts`, `prompt_thought_texts`;
+**L4 = canary en `prompt_agent_texts` (solo mensajes del agente del prompt
+NUEVO)**; thoughts, replay y mensajes de usuario **nunca** son evidencia;
+detección del boundary de turno fallido; el reporte persiste solo el objeto
+`l4` con booleanos/contadores (`canary_in_new_response`, `new_response_chunks`,
+`replay_agent_chunks`, `failed_turn_boundary`, `stop_reason`).
+
+**Regresión (9 tests nuevos; 41/41 total)**: replay-solo ⇒ False ·
+replay+respuesta sin canary ⇒ False · respuesta nueva con canary ⇒ True ·
+fresh sin load ⇒ False · id desconocido ⇒ False · id cross-profile ⇒ False ·
+thought con canary ⇒ False · boundary detectado ⇒ L4 False · respuesta real no
+se confunde con boundary. Verde (`l4-green.txt`).
+
+**L4 real re-medido (canary session-only fresco, harness corregido):**
+p-A y p-B → `canary_in_new_response=True` con `replay_agent_chunks=1` (separado),
+`new_response_chunks=12/11`, `failed_turn_boundary=False`, controles fresh=False,
+`MEMORY.md` sin canary, 0 tool calls. `verified=false` se mantiene para modelos
+no validados; para este caso validado (free model, esta versión) L4 queda
+establecido **desde la respuesta nueva**.
+
+### F2 — Mediciones separadas (unidades MiB; budget idle 192 / pico 320 / agregado 768)
+
+| Estado | Medido | Veredicto |
+|---|---|---|
+| Idle **antes** de crear sesión | **124.5 MiB** | PASS |
+| Idle **con sesión autenticada** cargada | **213.7 MiB** | **VIOLATION** |
+| Idle **tras turno completado** | **258.8 MiB** | **VIOLATION** |
+| Pico durante el turno | **258.8 MiB** | PASS |
+| Backend principal / procesos hijos | 213.6 MiB / **0** (sin hijos) | — |
+| Agregado 2 backends (pico) | **517.6 MiB** | PASS |
+| Disco p-A/p-B | **físico 407 MiB** · aparente 366/365 MiB | — |
+
+**No se cambian los límites aprobados.** Re-baseline **propuesto para revisión
+separada** (P2-S4): idle-con-sesión ≤ **288 MiB** (≈11% sobre el máximo
+observado 258.8) manteniendo pico 320 y agregado 768.
+
+### F3 — Turno fallido con `stopReason=end_turn` (verificado sin gastar créditos)
+
+Evidencia durable: sesiones fallidas (`7fee200d` en p-A, `ddc3a317` en p-B)
+tienen fila assistant con `display_kind='failed_turn'` y
+`display_metadata.error="HTTP 404 … requires available credits"`, y
+**`session_model_usage` = 0 filas** (ninguna llamada exitosa). Fuente:
+`acp_adapter/server.py:1006` devuelve `stop_reason="end_turn"` para el resultado
+terminal del turno (solo `cancelled` se distingue) — el veredicto de fallo
+queda dentro del store de Hermes, invisible para el cliente ACP.
+
+**Consecuencia para Aeril**: el Runner de Fase 1 mapea `end_turn → completed`;
+un fallo de proveedor se registraría como run **completado** (sin checkpoint
+por no haber cambios, pero con éxito falso).
+
+**Test de aceptación para P2-S2 (definido, no implementado)**: *dado* un fallo
+de proveedor real determinista (modelo que exige créditos en un perfil
+descartable, o stub ACP que emita el boundary `failed_turn` con
+`stopReason=end_turn`), *cuando* el run pasa por el Runner, *entonces* el run
+termina `failed` con razón explícita de proveedor, **nunca `completed`**; sin
+checkpoint; `run list` muestra `failed`; y la superficie (TUI/CLI) muestra el
+error. La detección (boundary/display_kind/ausencia de usage/señal de Hermes)
+se diseña en P2-S2.
+
+### Criterios PASS/FAIL recomendados para la aceptación independiente de P2-S0
+
+- **PASS** si: Gate 0 íntegro; E3 con `billing_provider=nous` y sin fallback;
+  E4 con separación estricta y controles L1-only; **L4=True desde la respuesta
+  nueva** con controles negativos limpios; pico/agregado/warm/cold en budget;
+  y **las dos excepciones documentadas** (idle >192 MiB con sesión; mismatch
+  failed_turn/end_turn) declaradas con re-baseline propuesto y test de P2-S2.
+- **FAIL** si: cualquier crossover de credenciales; L4 verdadero solo por
+  replay/memoria; violaciones de budget ocultas o “clasificadas” como PASS; o
+  el mismatch de turnos fallidos sin documentar.
+- Recomendación del spike: **PASS condicional** — el hito de factibilidad se
+  cumple; quedan dos condiciones de revisión (re-baseline de idle y test de
+  aceptación de P2-S2) que no bloquean la planificación de P2-S1.

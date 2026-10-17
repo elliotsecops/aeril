@@ -252,6 +252,108 @@ class V4aMultiFileMetadataTest(unittest.TestCase):
             self.assertEqual(outcome.get("optionId"), "deny", (path, outcome))
 
 
+def update_msg(kind, text):
+    return {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {"update": {"sessionUpdate": kind, "content": {"type": "text", "text": text}}},
+    }
+
+
+class L4MeasurementTest(unittest.TestCase):
+    """F1 (R7-R1): L4 SOLO cuenta mensajes del agente del prompt NUEVO.
+
+    Replay, thoughts y mensajes de usuario nunca son evidencia de recall."""
+
+    CANARY = "CANARY-L4-abc12345"
+
+    def setUp(self):
+        self.client, _stdin = make_client("deny")
+
+    def test_replay_only_never_counts(self):
+        c = self.client
+        c.phase = "load"
+        c._handle_incoming(update_msg("agent_message_chunk", f"Memorizado: {self.CANARY}"))
+        c.phase = "init"
+        self.assertFalse(c.l4_canary_in_new_response(self.CANARY))
+        self.assertEqual(len(c.replay_agent_texts), 1)
+
+    def test_replay_plus_response_without_canary_false(self):
+        c = self.client
+        c.phase = "load"
+        c._handle_incoming(update_msg("agent_message_chunk", f"Memorizado: {self.CANARY}"))
+        c.phase = "prompt"
+        c._handle_incoming(update_msg("agent_message_chunk", "No lo sé."))
+        c.phase = "init"
+        self.assertFalse(c.l4_canary_in_new_response(self.CANARY))
+
+    def test_new_response_recall_true(self):
+        c = self.client
+        c.phase = "load"
+        c._handle_incoming(update_msg("agent_message_chunk", "OK"))
+        c.phase = "prompt"
+        c._handle_incoming(update_msg("agent_message_chunk", "El identificador es "))
+        c._handle_incoming(update_msg("agent_message_chunk", self.CANARY))
+        c.phase = "init"
+        self.assertTrue(c.l4_canary_in_new_response(self.CANARY))
+
+    def test_fresh_no_load_false(self):
+        c = self.client
+        c.phase = "prompt"
+        c._handle_incoming(update_msg("agent_message_chunk", "No tengo ese dato."))
+        c.phase = "init"
+        self.assertFalse(c.l4_canary_in_new_response(self.CANARY))
+
+    def test_unknown_session_false(self):
+        # load de id desconocido ⇒ replay vacío; respuesta sin canary ⇒ False
+        c = self.client
+        c.phase = "load"
+        c.phase = "prompt"
+        c._handle_incoming(update_msg("agent_message_chunk", "No dispongo del identificador."))
+        c.phase = "init"
+        self.assertFalse(c.l4_canary_in_new_response(self.CANARY))
+        self.assertEqual(len(c.replay_agent_texts), 0)
+
+    def test_cross_profile_false(self):
+        # id de A bajo B: replay vacío; y un canary de A no aparece en la respuesta de B
+        c = self.client
+        c.phase = "prompt"
+        c._handle_incoming(update_msg("agent_message_chunk", "No sé a qué te referís."))
+        c.phase = "init"
+        self.assertFalse(c.l4_canary_in_new_response("CANARY-DE-A-99999999"))
+
+    def test_thought_chunk_never_counts(self):
+        c = self.client
+        c.phase = "load"
+        c._handle_incoming(update_msg("agent_message_chunk", self.CANARY))
+        c.phase = "prompt"
+        c._handle_incoming(update_msg("agent_thought_chunk", f"¿Será {self.CANARY}?"))
+        c._handle_incoming(update_msg("agent_message_chunk", "No lo sé."))
+        c.phase = "init"
+        self.assertFalse(c.l4_canary_in_new_response(self.CANARY))
+        self.assertEqual(len(c.prompt_thought_texts), 1)
+
+    def test_failed_turn_boundary_detected_and_l4_false(self):
+        c = self.client
+        c.phase = "prompt"
+        c._handle_incoming(
+            update_msg(
+                "agent_message_chunk",
+                "Your request was not processed. Send it again if you still want me to carry it out.",
+            )
+        )
+        c.phase = "init"
+        self.assertTrue(c.failed_turn_boundary_seen())
+        self.assertFalse(c.l4_canary_in_new_response(self.CANARY))
+
+    def test_real_response_not_flagged_as_failed_turn(self):
+        c = self.client
+        c.phase = "prompt"
+        c._handle_incoming(update_msg("agent_message_chunk", "El identificador es CANARY-OK."))
+        c.phase = "init"
+        self.assertFalse(c.failed_turn_boundary_seen())
+
+
 class InheritedModeGuardTest(unittest.TestCase):
     def test_default_mode_auth_ops_refused(self):
         with self.assertRaises(SystemExit) as cm:
