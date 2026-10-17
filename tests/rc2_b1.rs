@@ -55,6 +55,7 @@ fn flood_spec(env: &TestEnv, frames: u64, frame_bytes: usize) -> aeril::agent::B
             "--script".into(),
             script.display().to_string(),
         ],
+        env: Vec::new(),
     }
 }
 

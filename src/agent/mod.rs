@@ -12,6 +12,8 @@ pub struct BackendSpec {
     pub version: String,
     pub program: String,
     pub args: Vec<String>,
+    /// Overrides de entorno (P2-S1: perfiles gestionados). Vacío = heredar.
+    pub env: Vec<(String, String)>,
 }
 
 /// Resuelve un nombre de backend a un comando concreto.
@@ -27,6 +29,7 @@ pub fn resolve_backend(name: &str) -> Result<BackendSpec> {
             version: env!("CARGO_PKG_VERSION").into(),
             program: exe.to_string_lossy().into_owned(),
             args: vec!["__mock-agent".into(), "--script".into(), script.to_string()],
+            env: Vec::new(),
         });
     }
     match name {
@@ -38,6 +41,7 @@ pub fn resolve_backend(name: &str) -> Result<BackendSpec> {
                 version,
                 program: "hermes".into(),
                 args: vec!["acp".into()],
+                env: Vec::new(),
             })
         }
         other => Err(Error::invalid(format!(

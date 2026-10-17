@@ -394,6 +394,12 @@ impl AcpClient {
         limits: AcpLimits,
     ) -> Result<AcpClient> {
         let mut cmd = Command::new(&spec.program);
+        if !spec.env.is_empty() {
+            // P2-S1: entorno sanitizado del perfil gestionado (nunca heredado
+            // para operaciones autenticadas con perfiles).
+            cmd.env_clear();
+            cmd.envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        }
         cmd.args(&spec.args)
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())

@@ -46,8 +46,9 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    /// Migración v2→v3: un store de la era RC2 (sin `pid_start`) se actualiza
-    /// sin perder datos y la columna queda disponible.
+    /// Migración v2→vN: un store de la era RC2 (sin `pid_start`, sin
+    /// `runs.profile`) se actualiza sin perder datos y las columnas quedan
+    /// disponibles (R1: v4 agrega el vínculo durable run→perfil).
     #[test]
     fn migracion_v2_a_v3_conserva_datos() {
         let dir = std::env::temp_dir().join(format!("aeril-mig-{}", crate::ids::new_id()));
@@ -70,13 +71,19 @@ mod tests {
                 [],
             )
             .unwrap();
+            conn.execute(
+                "INSERT INTO runs (id, thread_id, backend, state, started_ms)
+                 VALUES ('r-old', 't1', 'mock', 'completed', 1)",
+                [],
+            )
+            .unwrap();
         }
         let store = Store::open(&path).unwrap();
         let v: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, super::schema::SCHEMA_VERSION);
         let title: String = store
             .conn
             .query_row("SELECT title FROM threads WHERE id = 't1'", [], |r| {
@@ -93,6 +100,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pid_start, 0, "fila legacy queda en 0 (liveness por PID)");
+        // v4: la columna profile existe y las filas legacy quedan NULL.
+        let legacy_profile: Option<String> = store
+            .conn
+            .query_row("SELECT profile FROM runs WHERE id = 'r-old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(legacy_profile, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
