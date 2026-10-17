@@ -210,7 +210,9 @@ real pertenece a P2-S0 (VIOLATION registrada) y a su re-baseline en P2-S2.
 
 ## 8. Commits de la rama
 
-<!-- COMMITS_BLOCK -->
+- `b5eba7176f4a403ab6efb89f98913c51d1a65896` — implementación + tests + doc
+  (`feat(p2s1): perfiles Hermes gestionados (feature flag OFF por default)`)
+- `c3a887f6a23d7a18597933da8d649d85596dd65b` — este registro (docs-only)
 
 Base: `main @ 47f0318eaadded7b93c027ba42efe0f9778f0f87` (no modificado).
 
