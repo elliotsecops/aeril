@@ -103,6 +103,41 @@ struct WorkTarget {
 }
 
 impl Runner {
+    /// P2-S1 — perfil gestionado para este run (gated por feature flag).
+    ///
+    /// Flag OFF o backend no-hermes ⇒ `None` (comportamiento certificado
+    /// intacto). Flag ON + hermes ⇒ exige asignación + auth verificada
+    /// (metadata-only) y devuelve el lock de escritor que vive hasta el final
+    /// del run.
+    fn attach_profile(
+        &self,
+        thread_id: &str,
+        spec: &mut BackendSpec,
+    ) -> Result<Option<crate::profile::ProfileLock>> {
+        if !crate::profile::enabled() || !crate::profile::is_hermes_backend(&spec.name) {
+            return Ok(None);
+        }
+        let agent = crate::profile::agent_for_thread(&self.data_dir, thread_id)?.ok_or_else(
+            || {
+                Error::invalid(format!(
+                    "perfiles gestionados activos: el thread {thread_id} no tiene perfil asignado;                      asigná uno con `aeril profile assign <agent> --thread {thread_id}` (sin fallback al perfil del host)"
+                ))
+            },
+        )?;
+        let lock = crate::profile::ProfileLock::acquire(&self.data_dir, &agent)?;
+        let status = crate::profile::auth_status(&self.data_dir, &agent)?;
+        if status != "logged_in" {
+            return Err(Error::backend(format!(
+                "perfil `{agent}` sin autenticación verificada (auth_status={status});                  autenticá el perfil y reintentá (fail-closed, sin fallback)"
+            )));
+        }
+        // Binario absoluto: el spawn usa env_clear + PATH sanitizado, así que
+        // la resolución por PATH debe quedar fijada acá.
+        spec.program = crate::profile::hermes_bin()?.to_string_lossy().into_owned();
+        spec.env = crate::profile::env_for_profile(&self.data_dir, &agent)?;
+        Ok(Some(lock))
+    }
+
     fn note(&self, note: UiNote) {
         if let Some(tx) = &self.ui {
             let _ = tx.send(note);
@@ -321,7 +356,12 @@ impl Runner {
         }
 
         // ── backend y run ────────────────────────────────────────────────────
-        let spec = resolve_backend(&opts.backend)?;
+        let mut spec = resolve_backend(&opts.backend)?;
+        // P2-S1: perfiles gestionados (detrás de flag). Con el flag activo y
+        // backend hermes: el thread DEBE tener perfil asignado y autenticado;
+        // el lock de escritor se retiene durante todo el run y el spawn usa el
+        // entorno sanitizado del perfil. Sin fallback al perfil del host.
+        let _profile_lock = self.attach_profile(thread_id, &mut spec)?;
         let run = runs::start(
             &mut store.conn,
             &StartRunSpec {
