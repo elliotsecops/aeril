@@ -273,31 +273,34 @@ cargo clippy --all-targets -- -D warnings: limpio
 
 Presupuestos (binario RELEASE reconstruido explícitamente del SHA final;
 `cargo build --release` ANTES de medir — el target `make budget` reutiliza un
-binario existente si no se fuerza el rebuild):
-  budget-size : 5,783,728 bytes (5.8 MB) ≤ 30 MB                    → PASS
+binario existente si no se fuerza el rebuild), máquina EN REPOSO:
+  budget-size : 5,788,336 bytes (5.8 MB) ≤ 30 MB                    → PASS
   budget-deps : PASS (solo ABI base del OS + zlib del sistema)
-  budget-mem  : idle 6.8 MB · thread abierto 7.7 MB · delta 0.91 MiB
+  budget-mem  : idle 6.6 MB · thread abierto 7.5 MB · delta 0.90 MiB
                 (límites 50 MB / 10 MiB)                            → PASS
-  budget-start: p95 55.9–61.9 ms ≤ 300 ms                           → PASS
-  budget-two  : TUI 8.6 MB · mocks 4.3 MB c/u · combinado 17.2 MB
-                arranque con 2 activos 32.7–56.3 ms
-                consultas avg 20.3 ms / max 27.5–33.5 ms
-  budget-scale: app 9.8 MB (gate 500 MB) · agentes 21.0 MB · total 30.9 MB
+  budget-start: p95 12.5 ms ≤ 300 ms                                → PASS
+  budget-two  : TUI 8.8 MB · mocks 4.2 MB c/u · combinado 17.3 MB
+                arranque con 2 activos 50.8 ms
+                consultas avg 3.1 ms / max 4.0 ms                   → sin regresión
+  budget-scale: app 9.9 MB (gate 500 MB) · agentes 20.9 MB · total 30.8 MB
                                                                      → PASS
 ```
 
-**A/B de atribución (misma carga, mismo harness):** base `39eaf15`
-(release reconstruido) p50 52–57 ms / p95 88–90 ms vs candidato R1
-p50 54–56 ms / p95 75–98 ms ⇒ **sin regresión atribuible**; la diferencia
-frente a la medición en reposo (~12 ms) es ambiental, no del diff.
+Estos valores en reposo coinciden con el baseline pre-R1 (p95 ~11.7 ms,
+consultas ~3.1 ms, delta ~0.86–0.91 MiB): **sin regresión atribuible**.
 
-**Contexto ambiental (honestidad de medición):** durante estas mediciones la
-máquina presentaba `load average ≈ 12` y procesos fake Hermes huérfanos de la
-propia auditoría independiente (`/tmp/opencode/p2s1-audit-scratch4/5`, no
-tocados por este trabajo). Los valores absolutos de latencia quedan inflados
-respecto de corridas previas en reposo (p95 ~12 ms); **todos los gates pasan
-con margen amplio** y no se relajó ningún umbral. No se reclama una mejora ni
-una regresión de latencia sin A/B en reposo (fuera del alcance de R1).
+**Higiene del harness (hallazgo durante R1):** las primeras mediciones de R1
+salieron infladas (p95 56–62 ms, consultas ~20 ms, load ≈10–14). Causa raíz
+encontrada: **8 TUIs de test huérfanas** (`aeril --backend mock:/tmp/aeril-test-s3-t{1..8}`,
+de los tests PTY de `tests/phase1_s3.rs`) en busy-loop a ~80% CPU cada una
+(~6.5 núcleos), reparentadas a systemd tras morir/interrumpirse su harness.
+Limpieza: SIGTERM→SIGKILL a esos 8 procesos (load 10.4 → 4.6 y bajando).
+Los procesos fake de la auditoría (`p2s1-audit-scratch4/5`) estaban dormidos
+(0% CPU) y no fueron la causa; no se tocaron. Un A/B base vs R1 bajo la misma
+carga ya había mostrado ausencia de regresión (p95 88–90 vs 75–98 ms).
+Recomendación (fuera del alcance de R1): endurecer el harness PTY para
+garantizar reaping de la TUI ante fallo/interrupción y un barrido de
+huérfanos.
 
 ---
 
