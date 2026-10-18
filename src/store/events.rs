@@ -68,6 +68,9 @@ pub mod payload {
         pub worktree_path: String,
         pub branch: String,
         pub base_oid: String,
+        /// Perfil gestionado durable (R2-H6). NULL/ausente = run sin perfil.
+        #[serde(default)]
+        pub profile: Option<String>,
         #[serde(default)]
         pub resumed_session: Option<String>,
         /// Evidencia del SUPERVISOR (proceso de Aeril que lanza el run):

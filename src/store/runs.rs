@@ -100,6 +100,7 @@ pub fn start(conn: &mut Connection, spec: &StartRunSpec<'_>) -> Result<RunRow> {
         worktree_path: spec.worktree_path.to_string(),
         branch: spec.branch.to_string(),
         base_oid: spec.base_oid.to_string(),
+        profile: spec.profile.map(str::to_string),
         resumed_session: spec.resumed_session.map(str::to_string),
         supervisor_pid: Some(supervisor_pid),
         supervisor_pid_start: crate::store::leases::process_start_time(supervisor_pid),

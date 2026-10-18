@@ -332,6 +332,9 @@ impl std::fmt::Display for RpcError {
 fn classify(line: &str) -> Result<ServerMsg> {
     let v: Value = serde_json::from_str(line)
         .map_err(|e| Error::backend(format!("línea ACP no parseable: {e}")))?;
+    if v.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(Error::backend("mensaje ACP sin jsonrpc \"2.0\""));
+    }
     let has_method = v.get("method").is_some();
     match (has_method, v.get("id").cloned()) {
         (true, Some(id)) => Ok(ServerMsg::Request {
@@ -659,7 +662,12 @@ impl AcpClient {
     }
 
     /// Inicializa la conexión. Devuelve el `result` del agente.
-    pub async fn initialize(&mut self, client_name: &str, client_version: &str) -> Result<Value> {
+    pub async fn initialize(
+        &mut self,
+        client_name: &str,
+        client_version: &str,
+        strict: bool,
+    ) -> Result<Value> {
         let params = json!({
             "protocolVersion": 1,
             "clientCapabilities": {
@@ -669,7 +677,11 @@ impl AcpClient {
             "clientInfo": {"name": client_name, "version": client_version}
         });
         let mut obs = NoopObserver;
-        self.request("initialize", params, &mut obs).await
+        let result = self.request("initialize", params, &mut obs).await?;
+        if strict {
+            crate::profile::validate_initialize_result(&result)?;
+        }
+        Ok(result)
     }
 
     /// Abre sesión nueva en `cwd`. Devuelve el `sessionId`.

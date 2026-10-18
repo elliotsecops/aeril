@@ -252,6 +252,7 @@ fn run_view(store: &Store, run: &runs::RunRow) -> Result<Value> {
         "thread_id": run.thread_id,
         "workspace_id": run.workspace_id,
         "backend": run.backend,
+        "profile": run.profile,
         "state": run.state,
         "supervisor": {"status": sup_status, "detail": supervisor.detail},
         "lease": lease_json,
@@ -360,6 +361,7 @@ fn print_run_summary(summary: &session::RunSummary) -> Result<()> {
         "state": summary.state,
         "stop_reason": summary.stop_reason,
         "engine_session_id": summary.engine_session_id,
+        "profile": summary.profile,
         "detail": summary.detail,
         "snapshot": snapshot,
     }))?;
@@ -753,6 +755,7 @@ fn cmd_profile(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
             "lock_state": v.lock_state,
             "warmed_ms": v.warmed_ms,
             "disk_kb": v.disk_kb,
+            "removing": v.removing,
         })
     };
     match p.pos.get(1).map(String::as_str) {

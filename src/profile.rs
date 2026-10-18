@@ -97,10 +97,6 @@ fn meta_path(data_dir: &Path, agent_id: &str) -> PathBuf {
     agent_dir(data_dir, agent_id).join("profile.json")
 }
 
-fn lock_path(data_dir: &Path, agent_id: &str) -> PathBuf {
-    agent_dir(data_dir, agent_id).join("aeril.lock")
-}
-
 fn meta_lock_path(data_dir: &Path, agent_id: &str) -> PathBuf {
     agent_dir(data_dir, agent_id).join(".meta.lock")
 }
@@ -109,12 +105,195 @@ fn owner_path(data_dir: &Path, agent_id: &str) -> PathBuf {
     agent_dir(data_dir, agent_id).join("owner.json")
 }
 
-fn registry_path(data_dir: &Path) -> PathBuf {
-    root(data_dir).join("agents.json")
+/// Abre un archivo sin seguir el componente final. `O_NOFOLLOW` protege el
+/// último componente; los llamadores validan el directorio padre.
+fn open_nofollow(path: &Path, create: bool, write: bool) -> Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    if write {
+        opts.write(true);
+    }
+    if create {
+        opts.create(true).truncate(false).mode(0o600);
+    }
+    opts.custom_flags(libc::O_NOFOLLOW).open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::NotFound(format!("{} no existe", path.display()))
+        } else {
+            Error::conflict(format!(
+                "no se pudo abrir {} sin seguir symlinks ({e}) — fail-closed",
+                path.display()
+            ))
+        }
+    })
 }
 
-fn registry_lock_path(data_dir: &Path) -> PathBuf {
-    root(data_dir).join(".registry.lock")
+fn read_file_nofollow(path: &Path) -> Result<Vec<u8>> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::not_found(path.display().to_string()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(Error::conflict(format!(
+            "{} es un symlink — fail-closed",
+            path.display()
+        )));
+    }
+    if !meta.is_file() {
+        return Err(Error::conflict(format!(
+            "{} no es un archivo regular — fail-closed",
+            path.display()
+        )));
+    }
+    let mut f = open_nofollow(path, false, false)?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn require_real_dir(path: &Path, label: &str) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| {
+        Error::conflict(format!(
+            "{label} {} no inspeccionable ({e}) — fail-closed",
+            path.display()
+        ))
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(Error::conflict(format!(
+            "{label} {} es un symlink — fail-closed",
+            path.display()
+        )));
+    }
+    if !meta.is_dir() {
+        return Err(Error::conflict(format!(
+            "{label} {} no es un directorio — fail-closed",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Root canónico del store de perfiles. En modo creación exige que `hermes/`
+/// sea un directorio real; jamás atraviesa un symlink de root.
+fn safe_root(data_dir: &Path, create: bool) -> Result<PathBuf> {
+    let data = std::fs::canonicalize(data_dir).map_err(|e| {
+        Error::conflict(format!(
+            "data dir {} no inspeccionable ({e}) — fail-closed",
+            data_dir.display()
+        ))
+    })?;
+    let candidate = data.join("hermes");
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Error::conflict(format!(
+                "el root de perfiles {} es un symlink — fail-closed",
+                candidate.display()
+            )));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(Error::conflict(format!(
+                "el root de perfiles {} no es un directorio — fail-closed",
+                candidate.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
+            let mut b = std::fs::DirBuilder::new();
+            b.mode(0o700);
+            b.create(&candidate).map_err(|e| {
+                Error::conflict(format!(
+                    "no se pudo crear el root de perfiles {} ({e}) — fail-closed",
+                    candidate.display()
+                ))
+            })?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+        Err(e) => return Err(e.into()),
+    }
+    let real = std::fs::canonicalize(&candidate)?;
+    if real.parent() != Some(data.as_path()) {
+        return Err(Error::conflict(format!(
+            "el root de perfiles {} resuelve fuera del data dir — fail-closed",
+            candidate.display()
+        )));
+    }
+    Ok(real)
+}
+
+/// Crea un directorio real (no symlink) exigiendo un padre ya verificado.
+fn ensure_real_dir(path: &Path, label: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Error::conflict(format!(
+                "{label} {} es un symlink — fail-closed",
+                path.display()
+            )));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(Error::conflict(format!(
+                "{label} {} no es un directorio — fail-closed",
+                path.display()
+            )));
+        }
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::integrity(format!("{} sin padre", path.display())))?;
+    require_real_dir(parent, "directorio padre")?;
+    let mut b = std::fs::DirBuilder::new();
+    b.mode(0o700);
+    b.create(path)?;
+    require_real_dir(path, label)
+}
+
+fn assert_profile_components_safe(dir: &Path) -> Result<()> {
+    for (name, want_dir) in [("home", true), ("san-home", true)] {
+        let p = dir.join(name);
+        match std::fs::symlink_metadata(&p) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Error::conflict(format!(
+                    "{} es un symlink — fail-closed",
+                    p.display()
+                )));
+            }
+            Ok(meta) if want_dir && !meta.is_dir() => {
+                return Err(Error::conflict(format!(
+                    "{} no es un directorio — fail-closed",
+                    p.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    for name in ["profile.json", "owner.json", "aeril.lock", ".meta.lock"] {
+        let p = dir.join(name);
+        match std::fs::symlink_metadata(&p) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Error::conflict(format!(
+                    "{} es un symlink — fail-closed",
+                    p.display()
+                )));
+            }
+            Ok(meta) if !meta.is_file() => {
+                return Err(Error::conflict(format!(
+                    "{} no es un archivo regular — fail-closed",
+                    p.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 /// `agent_id` seguro: minúsculas/dígitos/`_`/`-`, 1..=32, sin empezar con `-`.
@@ -137,9 +316,8 @@ pub fn validate_agent_id(agent_id: &str) -> Result<()> {
 /// puede leerse, la operación se rechaza en vez de asumir "sin mounts").
 fn assert_safe_agent_path(data_dir: &Path, agent_id: &str) -> Result<PathBuf> {
     validate_agent_id(agent_id)?;
-    let root_real =
-        std::fs::canonicalize(root(data_dir)).unwrap_or_else(|_| root(data_dir).to_path_buf());
-    let dir = agent_dir(data_dir, agent_id);
+    let root_real = safe_root(data_dir, false)?;
+    let dir = root_real.join(agent_id);
     if dir.exists() || std::fs::symlink_metadata(&dir).is_ok() {
         let sym = std::fs::symlink_metadata(&dir)?;
         if sym.file_type().is_symlink() {
@@ -168,6 +346,7 @@ fn assert_safe_agent_path(data_dir: &Path, agent_id: &str) -> Result<PathBuf> {
                 real.display()
             )));
         }
+        assert_profile_components_safe(&real)?;
         Ok(real)
     } else {
         Ok(dir)
@@ -382,7 +561,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| Error::integrity(format!("sin directorio padre: {}", path.display())))?;
-    std::fs::create_dir_all(dir)?;
+    require_real_dir(dir, "directorio destino")?;
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(Error::conflict(format!(
+            "{} es un symlink — fail-closed",
+            path.display()
+        )));
+    }
     let base = path.file_name().and_then(|s| s.to_str()).unwrap_or("meta");
     let mut last_err: Option<std::io::Error> = None;
     for _ in 0..8 {
@@ -423,39 +610,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     )))
 }
 
-/// Lee hasta `cap` bytes; `true` si hubo truncamiento. Drena con cota dura
-/// (`cap * 4`) para no bloquearse ante un emisor hostil.
-fn read_capped<R: Read>(mut r: R, cap: usize) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let mut truncated = false;
-    let mut drained = 0usize;
-    loop {
-        let n = r.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        if buf.len() >= cap {
-            truncated = true;
-            drained += n;
-            if drained > cap * 4 {
-                break;
-            }
-            continue;
-        }
-        let take = n.min(cap - buf.len());
-        buf.extend_from_slice(&chunk[..take]);
-        if take < n {
-            truncated = true;
-            drained += n - take;
-            if drained > cap * 4 {
-                break;
-            }
-        }
-    }
-    Ok((buf, truncated))
-}
-
 // ── metadata + meta lock (H2) ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -474,12 +628,13 @@ pub struct ProfileMeta {
 }
 
 fn read_meta(data_dir: &Path, agent_id: &str) -> Result<Option<ProfileMeta>> {
-    match std::fs::read(meta_path(data_dir, agent_id)) {
+    let _ = assert_safe_agent_path(data_dir, agent_id)?;
+    match read_file_nofollow(&meta_path(data_dir, agent_id)) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
             Error::integrity(format!("profile.json ilegible ({agent_id}): {e}"))
         })?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(Error::NotFound(_)) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -487,20 +642,18 @@ fn read_meta(data_dir: &Path, agent_id: &str) -> Result<Option<ProfileMeta>> {
 /// Bloqueante: flock se libera al morir el proceso (sin locks stale).
 fn lock_meta(data_dir: &Path, agent_id: &str) -> Result<File> {
     let path = meta_lock_path(data_dir, agent_id);
-    if !path.parent().map(|p| p.exists()).unwrap_or(false) {
+    let Some(parent) = path.parent() else {
+        return Err(Error::not_found(format!("perfil `{agent_id}` no existe")));
+    };
+    if !parent.exists() {
         return Err(Error::not_found(format!("perfil `{agent_id}` no existe")));
     }
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| {
-            Error::conflict(format!(
-                "no se pudo abrir el meta-lock del perfil `{agent_id}` ({e}) — fail-closed"
-            ))
-        })?;
+    require_real_dir(parent, "directorio del perfil")?;
+    let f = open_nofollow(&path, true, true).map_err(|e| {
+        Error::conflict(format!(
+            "no se pudo abrir el meta-lock del perfil `{agent_id}` ({e}) — fail-closed"
+        ))
+    })?;
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
         return Err(Error::conflict(format!(
@@ -537,6 +690,10 @@ fn update_meta<F: FnOnce(&mut ProfileMeta)>(
 pub struct RegistryEntry {
     pub thread_ids: Vec<String>,
     pub created_ms: i64,
+    /// Tombstone durable de un borrado iniciado. Un perfil con este bit no se
+    /// adopta/reasigna; solo puede completarse con `profile remove`.
+    #[serde(default)]
+    pub removing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -556,35 +713,97 @@ impl Default for Registry {
     }
 }
 
-fn load_registry(data_dir: &Path) -> Result<Registry> {
-    let path = registry_path(data_dir);
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|e| Error::integrity(format!("agents.json ilegible: {e}"))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Registry::default()),
+#[derive(Debug)]
+enum RegistryState {
+    Present(Registry),
+    MissingEmpty,
+    MissingUnknown,
+}
+
+/// Distingue un store nuevo/vacío de una pérdida de evidencia.
+fn load_registry_state(data_dir: &Path) -> Result<RegistryState> {
+    let root_real = match safe_root(data_dir, false) {
+        Ok(r) => r,
+        Err(e) => {
+            // A completely new data dir has no `hermes/` root. `safe_root`
+            // canonicalizes the data dir; a missing root is only a problem
+            // when the data dir itself is unavailable.
+            return Err(e);
+        }
+    };
+    let root_exists = std::fs::symlink_metadata(&root_real).is_ok();
+    if !root_exists {
+        return Ok(RegistryState::MissingEmpty);
+    }
+    let path = root_real.join("agents.json");
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(Error::conflict(format!(
+            "{} es un symlink — fail-closed",
+            path.display()
+        ))),
+        Ok(_) => {
+            let bytes = read_file_nofollow(&path)?;
+            let reg = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::integrity(format!("agents.json ilegible: {e}")))?;
+            Ok(RegistryState::Present(reg))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut has_state = false;
+            for entry in std::fs::read_dir(&root_real)? {
+                let entry = entry?;
+                if entry.file_name() == ".registry.lock" {
+                    continue;
+                }
+                has_state = true;
+                break;
+            }
+            if has_state {
+                Ok(RegistryState::MissingUnknown)
+            } else {
+                Ok(RegistryState::MissingEmpty)
+            }
+        }
         Err(e) => Err(e.into()),
     }
 }
 
+/// Lectura para diagnóstico/listado: nunca inventa entradas, pero permite
+/// enumerar directorios huérfanos cuando falta el registro.
+fn load_registry(data_dir: &Path) -> Result<Registry> {
+    match load_registry_state(data_dir)? {
+        RegistryState::Present(reg) => Ok(reg),
+        RegistryState::MissingEmpty | RegistryState::MissingUnknown => Ok(Registry::default()),
+    }
+}
+
+/// Lectura para decisiones de ownership: un registro ausente en un store con
+/// estado previo es evidencia incompleta, no un registro vacío.
+fn load_registry_strict(data_dir: &Path) -> Result<Registry> {
+    match load_registry_state(data_dir)? {
+        RegistryState::Present(reg) => Ok(reg),
+        RegistryState::MissingEmpty => Ok(Registry::default()),
+        RegistryState::MissingUnknown => Err(Error::conflict(
+            "el registro agents.json falta pero el store de perfiles contiene estado: \
+             ownership no demostrable — fail-closed; restaurá el registro desde evidencia \
+             durable (runs.profile/backup) antes de borrar o reasignar",
+        )),
+    }
+}
+
 fn save_registry(data_dir: &Path, reg: &Registry) -> Result<()> {
+    let root_real = safe_root(data_dir, true)?;
+    require_real_dir(&root_real, "root de perfiles")?;
     let mut reg = reg.clone();
     reg.updated_ms = now_ms();
     let bytes = serde_json::to_vec_pretty(&reg)?;
-    write_atomic(&registry_path(data_dir), &bytes)
+    write_atomic(&root_real.join("agents.json"), &bytes)
 }
 
 /// Toma el flock del registro (bloqueante; se libera al morir el proceso).
-fn lock_registry(data_dir: &Path) -> Result<File> {
-    let path = registry_lock_path(data_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(&path)?;
+pub(crate) fn lock_registry(data_dir: &Path) -> Result<File> {
+    let root_real = safe_root(data_dir, true)?;
+    let path = root_real.join(".registry.lock");
+    let f = open_nofollow(&path, true, true)?;
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
         return Err(Error::conflict(format!(
@@ -618,16 +837,13 @@ impl ProfileLock {
     /// (evita recrear un perfil borrado durante una carrera de admisión).
     pub fn acquire(data_dir: &Path, agent_id: &str) -> Result<ProfileLock> {
         validate_agent_id(agent_id)?;
-        let path = lock_path(data_dir, agent_id);
-        let f = match OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(&path)
-        {
+        let root_real = safe_root(data_dir, false)?;
+        let dir = root_real.join(agent_id);
+        require_real_dir(&dir, "directorio del perfil")?;
+        let path = dir.join("aeril.lock");
+        let f = match open_nofollow(&path, true, true) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::NotFound(_)) => {
                 return Err(Error::not_found(format!(
                     "perfil `{agent_id}` no existe (dir ausente) — fail-closed"
                 )));
@@ -671,8 +887,17 @@ impl ProfileLock {
     /// Estado del lock sin efectos colaterales: si el archivo no existe es
     /// definitivamente libre; errores de apertura/flock ⇒ Unknown.
     pub fn lock_state(data_dir: &Path, agent_id: &str) -> LockState {
-        let path = lock_path(data_dir, agent_id);
-        let f = match OpenOptions::new().read(true).write(true).open(&path) {
+        let root_real = match safe_root(data_dir, false) {
+            Ok(r) => r,
+            Err(e) => return LockState::Unknown(e.to_string()),
+        };
+        let path = root_real.join(agent_id).join("aeril.lock");
+        let f = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LockState::Free,
             Err(e) => return LockState::Unknown(e.to_string()),
@@ -709,22 +934,38 @@ struct OwnerRecord {
 }
 
 fn write_owner(data_dir: &Path, agent_id: &str, rec: &OwnerRecord) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var("AERIL_TEST_FAIL_OWNER_WRITE").ok().as_deref() == Some("1") {
+        return Err(Error::integrity(
+            "fallo de escritura de owner.json inyectado por test",
+        ));
+    }
     let bytes = serde_json::to_vec_pretty(rec)?;
     write_atomic(&owner_path(data_dir, agent_id), &bytes)
 }
 
 fn read_owner(data_dir: &Path, agent_id: &str) -> Result<Option<OwnerRecord>> {
-    match std::fs::read(owner_path(data_dir, agent_id)) {
+    let _ = assert_safe_agent_path(data_dir, agent_id)?;
+    match read_file_nofollow(&owner_path(data_dir, agent_id)) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
             Error::integrity(format!("owner.json ilegible ({agent_id}): {e}"))
         })?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(Error::NotFound(_)) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
 fn clear_owner(data_dir: &Path, agent_id: &str) -> Result<()> {
-    match std::fs::remove_file(owner_path(data_dir, agent_id)) {
+    let path = owner_path(data_dir, agent_id);
+    if let Ok(meta) = std::fs::symlink_metadata(&path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(Error::conflict(format!(
+            "{} es un symlink — fail-closed",
+            path.display()
+        )));
+    }
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
@@ -740,11 +981,20 @@ fn clear_owner(data_dir: &Path, agent_id: &str) -> Result<()> {
 /// - Escaneo `/proc` por `HERMES_HOME` del perfil (mismo euid), fail-closed
 ///   ante incertidumbre.
 pub fn verify_no_survivor(data_dir: &Path, agent_id: &str) -> Result<()> {
-    if let Some(owner) = read_owner(data_dir, agent_id)? {
+    let real = assert_safe_agent_path(data_dir, agent_id)?;
+    let home = real.join("home");
+    let owner = read_owner(data_dir, agent_id)?;
+    if let Some(owner) = &owner {
         for (pid, start, which) in [
             (owner.supervisor_pid, owner.supervisor_start, "supervisor"),
             (owner.backend_pid, owner.backend_start, "backend"),
         ] {
+            // The caller of warm/recovery may be the same supervisor that
+            // wrote owner.json. It is not a surviving writer; the caller
+            // already holds the exclusive lock.
+            if which == "supervisor" && pid == std::process::id() as i64 {
+                continue;
+            }
             match pid_identity(pid, start) {
                 PidId::Absent | PidId::Reused => {}
                 PidId::Ours { zombie: true } => {}
@@ -761,14 +1011,49 @@ pub fn verify_no_survivor(data_dir: &Path, agent_id: &str) -> Result<()> {
                 }
             }
         }
-        // Evidencia stale (nadie vivo): limpiar bajo el lock retenido.
-        clear_owner(data_dir, agent_id)?;
     }
-    let pids = processes_using_home(&home_dir(data_dir, agent_id))?;
+    let pids = processes_using_home(&home)?;
     if !pids.is_empty() {
         return Err(Error::conflict(format!(
             "perfil `{agent_id}`: procesos vivos con HERMES_HOME del perfil (pids {pids:?}) — HOLD fail-closed"
         )));
+    }
+    // Only after both owner evidence and the process scan are clean may stale
+    // owner evidence be removed. If a scan finds a survivor, owner.json is
+    // retained for the operator.
+    if owner.is_some() {
+        clear_owner(data_dir, agent_id)?;
+    }
+    Ok(())
+}
+
+/// Read-only owner-evidence check for early admission. Never clears evidence
+/// and never acquires the profile lock; the definitive admission re-checks
+/// under the lock.
+pub fn check_owner_evidence(data_dir: &Path, agent_id: &str) -> Result<()> {
+    let Some(owner) = read_owner(data_dir, agent_id)? else {
+        return Ok(());
+    };
+    for (pid, start, which) in [
+        (owner.supervisor_pid, owner.supervisor_start, "supervisor"),
+        (owner.backend_pid, owner.backend_start, "backend"),
+    ] {
+        if which == "supervisor" && pid == std::process::id() as i64 {
+            continue;
+        }
+        match pid_identity(pid, start) {
+            PidId::Absent | PidId::Reused | PidId::Ours { zombie: true } => {}
+            PidId::Ours { zombie: false } => {
+                return Err(Error::conflict(format!(
+                    "perfil `{agent_id}`: {which} registrado sigue VIVO (pid {pid}) — HOLD fail-closed"
+                )));
+            }
+            PidId::Unknown => {
+                return Err(Error::conflict(format!(
+                    "perfil `{agent_id}`: identidad del {which} registrado (pid {pid}) no verificable — HOLD fail-closed"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -779,6 +1064,8 @@ pub fn verify_no_survivor(data_dir: &Path, agent_id: &str) -> Result<()> {
 /// backend anterior (takeover de lease) para que la decisión sea explícita:
 /// jamás se admite un run "matando primero" a un escritor vivo.
 pub fn preflight_no_live_writer(data_dir: &Path, agent_id: &str) -> Result<()> {
+    let real = assert_safe_agent_path(data_dir, agent_id)?;
+    let home = real.join("home");
     match ProfileLock::lock_state(data_dir, agent_id) {
         LockState::Held => {
             return Err(Error::conflict(format!(
@@ -792,7 +1079,8 @@ pub fn preflight_no_live_writer(data_dir: &Path, agent_id: &str) -> Result<()> {
         }
         LockState::Free => {}
     }
-    let pids = processes_using_home(&home_dir(data_dir, agent_id))?;
+    check_owner_evidence(data_dir, agent_id)?;
+    let pids = processes_using_home(&home)?;
     if !pids.is_empty() {
         return Err(Error::conflict(format!(
             "perfil `{agent_id}`: procesos vivos con HERMES_HOME del perfil (pids {pids:?}) —              run rechazado; terminá el escritor huérfano y reconciliá con `aeril recover`"
@@ -816,12 +1104,35 @@ pub fn hermes_bin() -> Result<PathBuf> {
     if let Ok(p) = std::env::var(HERMES_BIN_ENV)
         && !p.is_empty()
     {
-        return Ok(PathBuf::from(p));
+        let raw = PathBuf::from(p);
+        let absolute = if raw.is_absolute() {
+            raw
+        } else {
+            std::env::current_dir()
+                .map_err(|e| Error::not_found(format!("cwd no disponible: {e}")))?
+                .join(raw)
+        };
+        let real = std::fs::canonicalize(&absolute).map_err(|e| {
+            Error::not_found(format!(
+                "AERIL_HERMES_BIN {} no resuelve a un archivo ({e})",
+                absolute.display()
+            ))
+        })?;
+        if !real.is_file() {
+            return Err(Error::not_found(format!(
+                "AERIL_HERMES_BIN {} no es un archivo regular",
+                real.display()
+            )));
+        }
+        return Ok(real);
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path) {
         let cand = dir.join("hermes");
         if cand.is_file() {
+            if let Ok(real) = std::fs::canonicalize(&cand) {
+                return Ok(real);
+            }
             return Ok(cand);
         }
     }
@@ -834,8 +1145,10 @@ pub fn hermes_bin() -> Result<PathBuf> {
 /// propios, HERMES_HOME explícito, PATH mínimo + dir del binario hermes.
 /// Jamás el entorno heredado.
 pub fn env_for_profile(data_dir: &Path, agent_id: &str) -> Result<Vec<(String, String)>> {
-    let san = san_home_dir(data_dir, agent_id);
-    let home = home_dir(data_dir, agent_id);
+    let dir = assert_safe_agent_path(data_dir, agent_id)?;
+    require_real_dir(&dir, "directorio del perfil")?;
+    let san = dir.join("san-home");
+    let home = dir.join("home");
     let mut path = String::from("/usr/bin:/bin");
     if let Ok(bin) = hermes_bin()
         && let Some(dir) = bin.parent()
@@ -941,6 +1254,7 @@ fn classify_auth_output(stdout: &str, provider: &str) -> String {
 /// salida inequívoca. Timeout/exit≠0/salida ambigua ⇒ `unknown` FRESCO
 /// persistido (nunca se deja un `logged_in` stale como si fuera actual).
 pub fn auth_status(data_dir: &Path, agent_id: &str) -> Result<String> {
+    let _ = assert_safe_agent_path(data_dir, agent_id)?;
     let meta = read_meta(data_dir, agent_id)?
         .ok_or_else(|| Error::not_found(format!("perfil `{agent_id}` sin metadata")))?;
     let provider = if meta.provider.is_empty() {
@@ -973,45 +1287,173 @@ fn probe_auth(data_dir: &Path, agent_id: &str, provider: &str) -> String {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .process_group(0)
         .spawn()
     {
         Ok(c) => c,
         Err(_) => return "unknown".into(),
     };
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() >= deadline => {
-                timed_out = true;
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => return "unknown".into(),
-        }
-    }
-    // Salida acotada (se lee SIEMPRE para drenar; nunca se persiste).
-    let mut out = Vec::new();
-    if let Some(mut so) = child.stdout.take()
-        && let Ok((buf, _)) = read_capped(&mut so, AUTH_OUTPUT_MAX_BYTES)
-    {
-        out = buf;
-    }
-    if let Some(mut se) = child.stderr.take() {
-        let _ = read_capped(&mut se, AUTH_OUTPUT_MAX_BYTES);
-    }
-    if timed_out {
+    let capture = capture_auth_output(&mut child, timeout);
+    if capture.truncated || capture.timed_out {
+        kill_auth_group(&mut child);
         return "unknown".into();
     }
-    match child.try_wait() {
-        Ok(Some(st)) if st.success() => {}
-        _ => return "unknown".into(), // exit≠0 (o estado no verificable)
+    if !capture.status.as_ref().is_some_and(|st| st.success()) {
+        kill_auth_group(&mut child);
+        return "unknown".into();
     }
-    let text = String::from_utf8_lossy(&out);
-    classify_auth_output(&text, provider)
+    let stdout = String::from_utf8_lossy(&capture.stdout);
+    let stderr = String::from_utf8_lossy(&capture.stderr);
+    if stderr_contradicts(&stderr, provider) {
+        return "unknown".into();
+    }
+    classify_auth_output(&stdout, provider)
+}
+
+struct AuthCapture {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+    timed_out: bool,
+    status: Option<std::process::ExitStatus>,
+}
+
+fn stderr_contradicts(stderr: &str, provider: &str) -> bool {
+    let expected = provider.to_lowercase();
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with(&format!("{expected}:"))
+            || lower.contains("logged in")
+            || lower.contains("logged out")
+            || lower.contains("not signed in")
+            || lower.contains("no credentials")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn kill_auth_group(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.wait();
+}
+
+fn capture_auth_output(child: &mut std::process::Child, timeout: Duration) -> AuthCapture {
+    let deadline = Instant::now() + timeout;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let out_fd = stdout.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
+    let err_fd = stderr.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut out_closed = out_fd < 0;
+    let mut err_closed = err_fd < 0;
+    let mut truncated = false;
+    let mut timed_out = false;
+    let mut status = None;
+
+    while !(out_closed && err_closed) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        let mut fds = [
+            libc::pollfd {
+                fd: if out_closed { -1 } else { out_fd },
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if err_closed { -1 } else { err_fd },
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            },
+        ];
+        let ms = remaining.as_millis().clamp(1, 50) as i32;
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                timed_out = true;
+                break;
+            }
+            continue;
+        }
+        if rc == 0 {
+            continue;
+        }
+        for (idx, slot) in fds.iter().enumerate() {
+            if slot.revents == 0 {
+                continue;
+            }
+            let fd = slot.fd;
+            if fd < 0 {
+                continue;
+            }
+            let mut chunk = [0u8; 8192];
+            let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINTR) || e.raw_os_error() == Some(libc::EAGAIN) {
+                    continue;
+                }
+                timed_out = true;
+                break;
+            }
+            if n == 0 {
+                if idx == 0 {
+                    out_closed = true;
+                } else {
+                    err_closed = true;
+                }
+                continue;
+            }
+            let data = &chunk[..n as usize];
+            let target = if idx == 0 { &mut out } else { &mut err };
+            if target.len() + data.len() > AUTH_OUTPUT_MAX_BYTES {
+                truncated = true;
+                break;
+            }
+            target.extend_from_slice(data);
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    if !truncated && !timed_out {
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    status = Some(st);
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+    }
+    drop(stdout.take());
+    drop(stderr.take());
+    AuthCapture {
+        stdout: out,
+        stderr: err,
+        truncated,
+        timed_out,
+        status,
+    }
 }
 
 // ── ciclo de vida ────────────────────────────────────────────────────────────
@@ -1028,6 +1470,7 @@ pub struct ProfileView {
     pub lock_state: String, // free | held | unknown
     pub warmed_ms: Option<i64>,
     pub disk_kb: u64,
+    pub removing: bool,
 }
 
 fn dir_state(data_dir: &Path, agent_id: &str, registered: bool) -> String {
@@ -1047,28 +1490,35 @@ fn disk_kb(path: &Path) -> u64 {
         return 0;
     };
     for e in entries.flatten() {
-        if let Ok(m) = e.metadata() {
-            if m.is_dir() {
-                total += disk_kb(&e.path());
-            } else {
-                total += m.len() / 1024;
-            }
+        let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+            continue;
+        };
+        if m.file_type().is_symlink() {
+            continue;
+        }
+        if m.is_dir() {
+            total += disk_kb(&e.path());
+        } else {
+            total += m.len() / 1024;
         }
     }
     total
 }
 
 fn ensure_dirs(data_dir: &Path, agent_id: &str) -> Result<()> {
-    for p in [
-        root(data_dir),
-        agent_dir(data_dir, agent_id),
-        home_dir(data_dir, agent_id),
-        san_home_dir(data_dir, agent_id),
-    ] {
-        let mut b = std::fs::DirBuilder::new();
-        b.recursive(true).mode(0o700);
-        b.create(&p)?;
-        let _ = std::fs::set_permissions(&p, PermissionsExt::from_mode(0o700));
+    let root_real = safe_root(data_dir, true)?;
+    let dirs = [
+        (root_real.join(agent_id), "directorio del perfil"),
+        (root_real.join(agent_id).join("home"), "home del perfil"),
+        (
+            root_real.join(agent_id).join("san-home"),
+            "san-home del perfil",
+        ),
+    ];
+    for (p, label) in dirs {
+        ensure_real_dir(&p, label)?;
+        require_real_dir(&p, label)?;
+        std::fs::set_permissions(&p, PermissionsExt::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -1085,12 +1535,30 @@ pub fn create(
 ) -> Result<ProfileView> {
     validate_agent_id(agent_id)?;
     let _reg_lock = lock_registry(data_dir)?;
-    let mut reg = load_registry(data_dir)?;
+    let mut reg = load_registry_strict(data_dir)?;
     let registered = reg.agents.contains_key(agent_id);
+    if reg.agents.get(agent_id).is_some_and(|e| e.removing) {
+        return Err(Error::conflict(format!(
+            "el perfil `{agent_id}` tiene un borrado incompleto registrado; \
+             completá `profile remove --agent {agent_id} --confirm` antes de recrearlo"
+        )));
+    }
     let dir = agent_dir(data_dir, agent_id);
     if dir.exists() {
         // Fail-closed: nunca operar a través de symlinks ni fuera del root.
         let _ = assert_safe_agent_path(data_dir, agent_id)?;
+        if !registered {
+            let empty = std::fs::read_dir(&dir)
+                .map(|mut it| it.next().is_none())
+                .unwrap_or(false);
+            if !empty {
+                return Err(Error::conflict(format!(
+                    "directorio existente no reconocido: el perfil `{agent_id}` existe y no está registrado: \
+                     ownership no demostrable — no se adopta; restaurá el registro o eliminá \
+                     el directorio con una operación explícita autorizada"
+                )));
+            }
+        }
         let meta = read_meta(data_dir, agent_id)?;
         match meta {
             Some(m) if m.agent_id == agent_id => {
@@ -1149,6 +1617,7 @@ pub fn create(
         .or_insert_with(|| RegistryEntry {
             thread_ids: Vec::new(),
             created_ms: now_ms(),
+            removing: false,
         });
     save_registry(data_dir, &reg)?;
     drop(_reg_lock);
@@ -1187,16 +1656,26 @@ pub fn list(data_dir: &Path) -> Result<Vec<ProfileView>> {
 
 fn status_view(data_dir: &Path, agent_id: &str, registered: bool) -> Result<ProfileView> {
     let meta = read_meta(data_dir, agent_id)?;
+    let registry = load_registry(data_dir)?;
     let auth_status = meta
         .as_ref()
         .map(|m| m.auth_status.clone())
         .unwrap_or_else(|| "unknown".into());
     let auth_checked_ms = meta.as_ref().and_then(|m| m.last_auth_check_ms);
-    let thread_ids = load_registry(data_dir)?
+    let thread_ids = registry
         .agents
         .get(agent_id)
         .map(|e| e.thread_ids.clone())
         .unwrap_or_default();
+    let removing = registry
+        .agents
+        .get(agent_id)
+        .map(|e| e.removing)
+        .unwrap_or(false);
+    let mut state = dir_state(data_dir, agent_id, registered);
+    if removing {
+        state = "removing".into();
+    }
     let lock_state = match ProfileLock::lock_state(data_dir, agent_id) {
         LockState::Free => "free",
         LockState::Held => "held",
@@ -1205,7 +1684,7 @@ fn status_view(data_dir: &Path, agent_id: &str, registered: bool) -> Result<Prof
     Ok(ProfileView {
         agent_id: agent_id.to_string(),
         registered,
-        dir_state: dir_state(data_dir, agent_id, registered),
+        dir_state: state,
         auth_status,
         auth_checked_ms,
         thread_ids,
@@ -1213,6 +1692,7 @@ fn status_view(data_dir: &Path, agent_id: &str, registered: bool) -> Result<Prof
         lock_state: lock_state.to_string(),
         warmed_ms: meta.and_then(|m| m.warmed_ms),
         disk_kb: disk_kb(&agent_dir(data_dir, agent_id)),
+        removing,
     })
 }
 
@@ -1277,45 +1757,57 @@ fn validate_initialize_frame(line: &[u8]) -> Frame {
     let Some(result) = obj.get("result") else {
         return Frame::Reject("respuesta sin result".into());
     };
+    match validate_initialize_result(result) {
+        Ok(()) => Frame::Accept,
+        Err(e) => Frame::Reject(e.to_string()),
+    }
+}
+
+/// Shared ACP initialize-result contract for profile warm and real managed
+/// runs. The Hermes/ACP v1 result must carry a supported protocol version,
+/// an `agentCapabilities` object and a non-empty `authMethods` array.
+pub(crate) fn validate_initialize_result(result: &serde_json::Value) -> Result<()> {
     let Some(ro) = result.as_object() else {
-        return Frame::Reject("result no es objeto".into());
+        return Err(Error::backend("result de initialize no es objeto"));
     };
     match ro.get("protocolVersion").and_then(|p| p.as_i64()) {
         Some(1) => {}
         Some(other) => {
-            return Frame::Reject(format!("protocolVersion {other} no soportado (esperado 1)"));
+            return Err(Error::backend(format!(
+                "protocolVersion {other} no soportado (esperado 1)"
+            )));
         }
-        None => return Frame::Reject("sin protocolVersion entero".into()),
+        None => return Err(Error::backend("sin protocolVersion entero")),
     }
-    if let Some(c) = ro.get("agentCapabilities")
-        && !c.is_object()
-    {
-        return Frame::Reject("agentCapabilities no es objeto".into());
+    match ro.get("agentCapabilities") {
+        Some(c) if c.is_object() => {}
+        Some(_) => return Err(Error::backend("agentCapabilities no es objeto")),
+        None => return Err(Error::backend("sin agentCapabilities")),
     }
     if let Some(i) = ro.get("agentInfo")
         && !i.is_object()
     {
-        return Frame::Reject("agentInfo no es objeto".into());
+        return Err(Error::backend("agentInfo no es objeto"));
     }
     match ro.get("authMethods") {
         Some(m) => {
             let Some(arr) = m.as_array() else {
-                return Frame::Reject("authMethods no es array".into());
+                return Err(Error::backend("authMethods no es array"));
             };
             if arr.is_empty() {
-                return Frame::Reject(
-                    "authMethods vacío (el Hermes soportado siempre anuncia ≥1 método)".into(),
-                );
+                return Err(Error::backend(
+                    "authMethods vacío (el Hermes soportado siempre anuncia ≥1 método)",
+                ));
             }
             for e in arr {
                 if e.get("id").and_then(|i| i.as_str()).is_none() {
-                    return Frame::Reject("authMethod sin id string".into());
+                    return Err(Error::backend("authMethod sin id string"));
                 }
             }
         }
-        None => return Frame::Reject("sin authMethods".into()),
+        None => return Err(Error::backend("sin authMethods")),
     }
-    Frame::Accept
+    Ok(())
 }
 
 /// Termina el grupo de procesos `pgid` con escalada acotada y verificación
@@ -1359,6 +1851,7 @@ fn terminate_group(pgid: i64, grace: Duration) -> Result<()> {
 /// cotas de frame/stream y terminación verificada del grupo antes de liberar
 /// el lock de escritor. Retiene el lock (heredable) durante el handshake.
 pub fn warm_profile(data_dir: &Path, agent_id: &str) -> Result<i64> {
+    let _ = assert_safe_agent_path(data_dir, agent_id)?;
     let lock = ProfileLock::acquire(data_dir, agent_id)?;
     lock.make_inheritable()?;
     verify_no_survivor(data_dir, agent_id)?;
@@ -1387,7 +1880,16 @@ pub fn warm_profile(data_dir: &Path, agent_id: &str) -> Result<i64> {
         pgid: pid,
         started_ms: now_ms(),
     };
-    let owner_ok = write_owner(data_dir, agent_id, &owner).is_ok();
+    if let Err(e) = write_owner(data_dir, agent_id, &owner) {
+        let _ = terminate_group(pid, Duration::from_secs(2));
+        let _ = child.wait();
+        let home = home_dir(data_dir, agent_id);
+        let survivors = processes_using_home(&home).unwrap_or_default();
+        return Err(Error::backend(format!(
+            "no se pudo persistir owner.json ({e}); backend terminado/verificado, \
+             sobrevivientes={survivors:?} — warm falla fail-closed"
+        )));
+    }
     let init = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "aeril-profile-warm", "version": env!("CARGO_PKG_VERSION")}}
@@ -1416,9 +1918,10 @@ pub fn warm_profile(data_dir: &Path, agent_id: &str) -> Result<i64> {
     let _ = child.wait();
     match terminated {
         Ok(()) => {
-            if owner_ok {
-                let _ = clear_owner(data_dir, agent_id);
-            }
+            // A descendant may have escaped the original PGID (setsid). The
+            // profile-wide process scan is the authority; only a clean scan
+            // permits clearing owner.json.
+            verify_no_survivor(data_dir, agent_id)?;
         }
         Err(e) => {
             // Evidencia retenida: un próximo admission verá al sobreviviente.
@@ -1525,7 +2028,7 @@ fn read_initialize_response(child: &mut std::process::Child, timeout: Duration) 
 
 /// Mapeo thread→perfil (asignación explícita; única por thread).
 pub fn agent_for_thread(data_dir: &Path, thread_id: &str) -> Result<Option<String>> {
-    let reg = load_registry(data_dir)?;
+    let reg = load_registry_strict(data_dir)?;
     Ok(reg
         .agents
         .iter()
@@ -1560,6 +2063,18 @@ fn count_non_terminal_runs(
     Ok(n)
 }
 
+/// A run with `runs.profile = NULL` predates durable profile ownership. If it
+/// is non-terminal, no profile deletion can prove it is unrelated to that
+/// run; refuse until it is reconciled.
+fn count_legacy_non_terminal_runs(conn: &rusqlite::Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM runs
+         WHERE state IN ('starting','running') AND profile IS NULL",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 /// Abre el store para chequeos de seguridad: cualquier fallo es fail-closed.
 fn open_store_for_guard(db_path: &Path) -> Result<crate::store::Store> {
     crate::store::Store::open(db_path).map_err(|e| {
@@ -1588,10 +2103,21 @@ fn deny_if_thread_active(conn: &rusqlite::Connection, thread_id: &str, action: &
 pub fn assign(data_dir: &Path, agent_id: &str, thread_id: &str, db_path: &Path) -> Result<()> {
     validate_agent_id(agent_id)?;
     let _reg_lock = lock_registry(data_dir)?;
-    let mut reg = load_registry(data_dir)?;
+    let mut reg = load_registry_strict(data_dir)?;
     if !reg.agents.contains_key(agent_id) {
         return Err(Error::not_found(format!(
             "perfil `{agent_id}` no registrado (creálo con `aeril profile create`)"
+        )));
+    }
+    if reg.agents.get(agent_id).is_some_and(|e| e.removing)
+        || reg
+            .agents
+            .values()
+            .any(|e| e.removing && e.thread_ids.iter().any(|t| t == thread_id))
+    {
+        return Err(Error::conflict(format!(
+            "hay un borrado de perfil incompleto que afecta a `{agent_id}` o al thread {thread_id}; \
+             completá el remove antes de reasignar"
         )));
     }
     if !meta_path(data_dir, agent_id).exists() {
@@ -1616,7 +2142,17 @@ pub fn assign(data_dir: &Path, agent_id: &str, thread_id: &str, db_path: &Path) 
 
 pub fn unassign(data_dir: &Path, thread_id: &str, db_path: &Path) -> Result<bool> {
     let _reg_lock = lock_registry(data_dir)?;
-    let mut reg = load_registry(data_dir)?;
+    let mut reg = load_registry_strict(data_dir)?;
+    if reg
+        .agents
+        .values()
+        .any(|e| e.removing && e.thread_ids.iter().any(|t| t == thread_id))
+    {
+        return Err(Error::conflict(format!(
+            "el thread {thread_id} pertenece a un perfil con borrado incompleto; \
+             completá el remove antes de desasignar"
+        )));
+    }
     let assigned = reg
         .agents
         .values()
@@ -1665,30 +2201,53 @@ pub fn remove(
         ));
     }
     validate_agent_id(agent_id)?;
+    let raw_dir = agent_dir(data_dir, agent_id);
+    let dir_exists = match std::fs::symlink_metadata(&raw_dir) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+
+    // Lock order: profile writer → registry → SQLite. The profile lock is
+    // taken first so an in-flight admission cannot lose its profile, and so
+    // the writer exclusion is already held when the registry is inspected.
+    let _profile_lock = if dir_exists {
+        let _ = assert_safe_agent_path(data_dir, agent_id)?;
+        Some(ProfileLock::acquire(data_dir, agent_id)?)
+    } else {
+        None
+    };
     let _reg_lock = lock_registry(data_dir)?;
-    let mut reg = load_registry(data_dir)?;
+    let mut reg = load_registry_strict(data_dir)?;
     let entry = reg.agents.get(agent_id).cloned();
-    let dir = agent_dir(data_dir, agent_id);
     let threads = entry
         .as_ref()
         .map(|e| e.thread_ids.clone())
         .unwrap_or_default();
+    let removing = entry.as_ref().is_some_and(|e| e.removing);
 
     // (1) Ownership y seguridad de path ANTES de cualquier mutación.
-    if dir.exists() {
-        let _ = assert_safe_agent_path(data_dir, agent_id)?;
-        match read_meta(data_dir, agent_id)? {
-            Some(m) if m.agent_id == agent_id => {}
-            Some(m) => {
-                return Err(Error::conflict(format!(
-                    "el perfil declara agent_id={} — fail-closed",
-                    m.agent_id
-                )));
-            }
-            None => {
-                return Err(Error::conflict(format!(
-                    "perfil `{agent_id}` sin profile.json (incompleto) — repará con `profile create`"
-                )));
+    if dir_exists {
+        if entry.is_none() {
+            return Err(Error::conflict(format!(
+                "el directorio del perfil `{agent_id}` existe pero no está registrado: \
+                 ownership no demostrable — fail-closed (no se adopta ni se borra)"
+            )));
+        }
+        if !removing {
+            match read_meta(data_dir, agent_id)? {
+                Some(m) if m.agent_id == agent_id => {}
+                Some(m) => {
+                    return Err(Error::conflict(format!(
+                        "el perfil declara agent_id={} — fail-closed",
+                        m.agent_id
+                    )));
+                }
+                None => {
+                    return Err(Error::conflict(format!(
+                        "perfil `{agent_id}` sin profile.json (incompleto) — repará con `profile create`"
+                    )));
+                }
             }
         }
     }
@@ -1715,9 +2274,21 @@ pub fn remove(
              reconciliá con `aeril recover` o esperá a que terminen"
         )));
     }
+    let legacy = count_legacy_non_terminal_runs(&store.conn).map_err(|e| {
+        Error::conflict(format!(
+            "no se pudo verificar runs legacy sin perfil ({e}) — fail-closed"
+        ))
+    })?;
+    if legacy > 0 {
+        return Err(Error::conflict(format!(
+            "hay {legacy} run(s) no-terminal(es) con runs.profile=NULL: \
+             ownership legacy no demostrable — no se borra ningún perfil; \
+             reconciliá esos runs y reintentá"
+        )));
+    }
 
     // (3) Asociaciones históricas del registro (override explícito).
-    if !threads.is_empty() && !clear_threads {
+    if !removing && !threads.is_empty() && !clear_threads {
         return Err(Error::conflict(format!(
             "el perfil tiene {} thread(s) asignados; desasigná (`profile unassign --thread T`) o usá --clear-threads",
             threads.len()
@@ -1726,7 +2297,7 @@ pub fn remove(
 
     // Idempotente: registro sin directorio ⇒ solo limpiar registro (ya
     // verificado que no hay runs no-terminales asociados).
-    if !dir.exists() {
+    if !dir_exists {
         if entry.is_some() {
             reg.agents.remove(agent_id);
             save_registry(data_dir, &reg)?;
@@ -1735,16 +2306,8 @@ pub fn remove(
         return Err(Error::not_found(format!("perfil `{agent_id}` no existe")));
     }
 
-    // (4) Lock de escritor: se ADQUIERE (no solo se chequea) y se retiene.
-    let _lock = ProfileLock::acquire(data_dir, agent_id)?;
-
-    // (5) Procesos sobrevivientes (fail-closed) + re-chequeo de path/inodo.
-    let pids = processes_using_home(&home_dir(data_dir, agent_id))?;
-    if !pids.is_empty() {
-        return Err(Error::conflict(format!(
-            "hay procesos vivos con HERMES_HOME del perfil (pids {pids:?}) — fail-closed"
-        )));
-    }
+    // (4) Owner/procesos y path, todavía bajo profile lock + registry lock.
+    verify_no_survivor(data_dir, agent_id)?;
     let real = assert_safe_agent_path(data_dir, agent_id)?;
     let before = std::fs::symlink_metadata(&real)?;
     if before.file_type().is_symlink() {
@@ -1760,7 +2323,16 @@ pub fn remove(
         ));
     }
 
-    // (6) Borrado + registro atómico.
+    // (5) Tombstone durable antes de tocar el filesystem. Un crash a partir
+    // de aquí deja un estado reanudable; `create`/assign rechazan el perfil.
+    if !removing {
+        let mut entry = entry.expect("dir exists and entry checked");
+        entry.removing = true;
+        reg.agents.insert(agent_id.to_string(), entry);
+        save_registry(data_dir, &reg)?;
+    }
+
+    // (6) Borrado + registro atómico (idempotente si falla a mitad).
     std::fs::remove_dir_all(&real)?;
     reg.agents.remove(agent_id);
     save_registry(data_dir, &reg)?;
@@ -1802,6 +2374,7 @@ mod tests {
                 RegistryEntry {
                     thread_ids: vec!["t1".into()],
                     created_ms: 7,
+                    removing: false,
                 },
             )]
             .into_iter()
@@ -1912,6 +2485,8 @@ mod tests {
             r#"{"jsonrpc":"1.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"t"}],"agentCapabilities":{}}}"#.into(),
             // sin protocolVersion
             r#"{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"t"}],"agentCapabilities":{}}}"#.into(),
+            // sin agentCapabilities
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"t"}]}}"#.into(),
             // protocolVersion distinto
             r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":2,"authMethods":[{"id":"t"}],"agentCapabilities":{}}}"#.into(),
             // authMethods vacío

@@ -89,11 +89,31 @@ ALTER TABLE leases ADD COLUMN pid_start INTEGER NOT NULL DEFAULT 0;
 "#;
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // Fast path: never take a write lock merely to re-check an already
+    // current database. This matters under concurrent readers/writers.
+    let observed: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if observed >= SCHEMA_VERSION {
+        if column_exists(conn, "runs", "profile")? {
+            return Ok(());
+        }
+        return Err(crate::error::Error::integrity(
+            "user_version declara v4 pero falta runs.profile — DB inconsistente",
+        ));
+    }
+    // Serialize version determination and DDL in one IMMEDIATE transaction.
+    // A deferred transaction can observe v3, lose the race to another opener,
+    // and then apply ALTER TABLE against an already-v4 database.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if current >= SCHEMA_VERSION {
+        if !column_exists(&tx, "runs", "profile")? {
+            return Err(crate::error::Error::integrity(
+                "user_version declara v4 pero falta runs.profile — DB inconsistente",
+            ));
+        }
+        tx.commit()?;
         return Ok(());
     }
-    let tx = conn.transaction()?;
     if current < 1 {
         tx.execute_batch(SCHEMA_V1)?;
     }
@@ -103,10 +123,25 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 3 {
         tx.execute_batch(SCHEMA_V3)?;
     }
-    if current < 4 {
+    // An interrupted/manual migration may have created the column without
+    // updating user_version. Treat that state as v4 DDL complete, then
+    // advance the version atomically.
+    if current < 4 && !column_exists(&tx, "runs", "profile")? {
         tx.execute_batch(SCHEMA_V4)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

@@ -334,7 +334,7 @@ fn backend_state(store: &Store, run: &RunRow) -> Result<Backend> {
             // rechaza hasta que el OPERADOR termine el proceso (identidad
             // verificada) y reintente. Con el flag OFF el comportamiento
             // certificado de Fase 1 queda intacto.
-            if crate::profile::enabled() && run.profile.is_some() {
+            if run.profile.is_some() {
                 return Ok(Backend::Unsafe(format!(
                     "perfil gestionado `{}`: terminación automática deshabilitada (P1-4);                      terminá el proceso huérfano verificando identidad y reconciliá",
                     run.profile.as_deref().unwrap_or("?")

@@ -56,6 +56,7 @@ fn flood_spec(env: &TestEnv, frames: u64, frame_bytes: usize) -> aeril::agent::B
             script.display().to_string(),
         ],
         env: Vec::new(),
+        strict_initialize: false,
     }
 }
 
@@ -98,7 +99,7 @@ fn run_flood(
                 .await
                 .map_err(|e| e.to_string())?;
             client
-                .initialize("rc2", "0")
+                .initialize("rc2", "0", false)
                 .await
                 .map_err(|e| e.to_string())?;
             let mut obs = SlowObserver {

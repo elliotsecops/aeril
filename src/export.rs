@@ -34,6 +34,7 @@ pub fn jsonl(store: &Store, thread_id: &str, out: &mut impl Write) -> Result<()>
                 "id": run.id,
                 "backend": run.backend,
                 "backend_version": run.backend_version,
+                "profile": run.profile,
                 "workspace_id": run.workspace_id,
                 "base_oid": run.base_oid,
                 "engine_session_id": run.engine_session_id,
@@ -273,10 +274,11 @@ pub fn markdown(store: &Store, thread_id: &str) -> Result<String> {
 
 fn run_section(run: &RunRow) -> String {
     format!(
-        "## Run `{}`\n\n- backend: {} ({})\n- base OID: {}\n- workspace: {}\n- estado: {}\n- sesión del motor: {}\n\n",
+        "## Run `{}`\n\n- backend: {} ({})\n- profile: {}\n- base OID: {}\n- workspace: {}\n- estado: {}\n- sesión del motor: {}\n\n",
         &run.id[..8.min(run.id.len())],
         run.backend,
         run.backend_version,
+        run.profile.clone().unwrap_or_else(|| "unmanaged".into()),
         run.base_oid.clone().unwrap_or_default(),
         run.workspace_id.clone().unwrap_or_default(),
         run.state,

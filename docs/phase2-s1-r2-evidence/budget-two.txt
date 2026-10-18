@@ -1,0 +1,67 @@
+{
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu": "Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz",
+    "ram_gb": 15.4,
+    "storage": "/dev/nvme0n1p5",
+    "storage_fstype": "ext4"
+  },
+  "method": "pty real + beacons + sqlite; limpieza identity-aware (pidfd)",
+  "bin_path": "/home/elliot/aeril-phase0/target/release/aeril",
+  "bin_sha256": "49bf4785ad01e6aaba79ffa1740705f61d48fc9df5755feab7d05b5f98e12433",
+  "ok": true,
+  "runs_active": 2,
+  "run_ids": [
+    "1098c810e4884d30b167ef5cd38074c1",
+    "14e716d427274db39cb3b0822c34beaf"
+  ],
+  "workspaces": [
+    "5e94ce7b5a6748d980fcfde5018f99de",
+    "4c21596cd8334f9cb2eabe110b829186"
+  ],
+  "backend_pids": [
+    3883204,
+    3883378
+  ],
+  "backend_identity": {
+    "3883204": {
+      "pid": 3883204,
+      "starttime": 34226602,
+      "cmdline": "/home/elliot/aeril-phase0/target/release/aeril __mock-agent --script /home/elliot/aeril-phase0/bench-data/two-run/mock.json",
+      "exe": "/home/elliot/aeril-phase0/target/release/aeril"
+    },
+    "3883378": {
+      "pid": 3883378,
+      "starttime": 34226695,
+      "cmdline": "/home/elliot/aeril-phase0/target/release/aeril __mock-agent --script /home/elliot/aeril-phase0/bench-data/two-run/mock.json",
+      "exe": "/home/elliot/aeril-phase0/target/release/aeril"
+    }
+  },
+  "tui_rss_kb": 8552,
+  "mock_rss_kb": {
+    "3883204": 4180,
+    "3883378": 4256
+  },
+  "combined_rss_kb": 16988,
+  "startup_two_active_ms": 50.6,
+  "query_latency_ms": {
+    "max": 5.59,
+    "avg": 3.48,
+    "samples": 10
+  },
+  "cleanup": {
+    "killed": [],
+    "already_dead": [
+      {
+        "pid": 3883204,
+        "result": "already_dead"
+      },
+      {
+        "pid": 3883378,
+        "result": "already_dead"
+      }
+    ],
+    "uncertain": []
+  }
+}

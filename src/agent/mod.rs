@@ -14,6 +14,10 @@ pub struct BackendSpec {
     pub args: Vec<String>,
     /// Overrides de entorno (P2-S1: perfiles gestionados). Vacío = heredar.
     pub env: Vec<(String, String)>,
+    /// R2: exigir el contrato ACP initialize completo antes de abrir la
+    /// sesión del run. Los perfiles gestionados lo activan; flag OFF conserva
+    /// el comportamiento certificado de Fase 1.
+    pub strict_initialize: bool,
 }
 
 /// Resuelve un nombre de backend a un comando concreto.
@@ -30,6 +34,7 @@ pub fn resolve_backend(name: &str) -> Result<BackendSpec> {
             program: exe.to_string_lossy().into_owned(),
             args: vec!["__mock-agent".into(), "--script".into(), script.to_string()],
             env: Vec::new(),
+            strict_initialize: false,
         });
     }
     match name {
@@ -42,6 +47,7 @@ pub fn resolve_backend(name: &str) -> Result<BackendSpec> {
                 program: "hermes".into(),
                 args: vec!["acp".into()],
                 env: Vec::new(),
+                strict_initialize: false,
             })
         }
         other => Err(Error::invalid(format!(

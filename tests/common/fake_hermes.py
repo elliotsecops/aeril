@@ -17,6 +17,15 @@ args = sys.argv[1:]
 home = os.environ.get("HERMES_HOME") or ""
 
 
+def proc_start(pid):
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            tail = f.read().rsplit(b")", 1)[1].split()
+        return int(tail[19])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
 def read_opt(name, default=""):
     if not home:
         return default
@@ -37,10 +46,69 @@ if len(args) >= 2 and args[0] == "acp" and args[1] == "--version":
 
 if args and args[0] == "auth":
     mode = read_opt("fake-auth-mode", "")
+    if mode.startswith("slow:"):
+        try:
+            with open(os.path.join(home, "fake-auth-started"), "w") as f:
+                f.write("1")
+        except OSError:
+            pass
+        time.sleep(float(mode.split(":", 1)[1]))
+        mode = "positive"
     if not mode:
         mode = "positive" if os.path.exists(os.path.join(home, "fake-auth")) else "logged-out"
     if mode == "positive":
         print("nous: logged in")
+        sys.exit(0)
+    if mode == "truncated-positive":
+        # The positive status is inside the retained prefix; the later
+        # contradiction must still make the probe fail closed.
+        sys.stdout.write("nous: logged in\n")
+        sys.stdout.write("x" * 70000 + "\n")
+        sys.stdout.write("nous: logged out\n")
+        sys.stdout.flush()
+        sys.exit(0)
+    if mode == "positive-flood":
+        sys.stdout.write("nous: logged in\n")
+        sys.stdout.write("x" * 200000 + "\n")
+        sys.stdout.flush()
+        sys.exit(0)
+    if mode == "stderr-contradictory":
+        print("nous: logged in")
+        sys.stderr.write("nous: logged out\n")
+        sys.stderr.flush()
+        sys.exit(0)
+    if mode == "stderr-flood":
+        print("nous: logged in")
+        sys.stderr.write("x" * 200000 + "\n")
+        sys.stderr.flush()
+        sys.exit(0)
+    if mode == "descendant-stdout":
+        print("nous: logged in")
+        sys.stdout.flush()
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(600)
+            os._exit(0)
+        try:
+            with open(os.path.join(home, "fake-descendant-pid"), "w") as f:
+                f.write(f"{pid} {proc_start(pid)}\n")
+        except OSError:
+            pass
+        sys.exit(0)
+    if mode == "timeout-descendants":
+        pids = []
+        for _ in range(2):
+            pid = os.fork()
+            if pid == 0:
+                time.sleep(600)
+                os._exit(0)
+            pids.append(pid)
+        try:
+            with open(os.path.join(home, "fake-descendant-pid"), "w") as f:
+                f.write(" ".join(f"{p} {proc_start(p)}" for p in pids) + "\n")
+        except OSError:
+            pass
+        time.sleep(600)
         sys.exit(0)
     if mode == "positive-exit1":
         print("nous: logged in")
@@ -89,6 +157,8 @@ if args and args[0] == "acp":
         try:
             with open(os.path.join(home, "fake-pid"), "w") as f:
                 f.write(str(os.getpid()))
+            with open(os.path.join(home, "fake-pid-start"), "w") as f:
+                f.write(str(proc_start(os.getpid())))
         except OSError:
             pass
 
@@ -142,6 +212,11 @@ if args and args[0] == "acp":
         if mode == "missing-protocol":
             return {"jsonrpc": "2.0", "id": 1, "result": {"agentCapabilities": {},
                     "authMethods": [{"id": "terminal", "name": "setup"}]}}
+        if mode == "missing-capabilities":
+            return {"jsonrpc": "2.0", "id": 1, "result": {
+                "protocolVersion": 1,
+                "agentInfo": {"name": "fake-hermes", "version": "0.0.0-fake"},
+                "authMethods": [{"id": "terminal", "name": "setup"}]}}
         return {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1,
                 "agentInfo": {"name": "fake-hermes", "version": "0.0.0-fake"},
                 "agentCapabilities": {"loadSession": True},
@@ -169,6 +244,26 @@ if args and args[0] == "acp":
                 sys.stdout.write(full[half:] + "\n")
                 sys.stdout.flush()
                 continue
+            if mode == "escape-grandchild":
+                read_fd, write_fd = os.pipe()
+                pid = os.fork()
+                if pid == 0:
+                    os.close(read_fd)
+                    os.setsid()
+                    os.write(write_fd, b"1")
+                    os.close(write_fd)
+                    time.sleep(600)
+                    os._exit(0)
+                os.close(write_fd)
+                try:
+                    os.read(read_fd, 1)
+                finally:
+                    os.close(read_fd)
+                try:
+                    with open(os.path.join(home, "fake-escaped-pid"), "w") as f:
+                        f.write(f"{pid} {proc_start(pid)}\n")
+                except OSError:
+                    pass
             print(json.dumps(respond_init()), flush=True)
         elif method == "session/new":
             print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {

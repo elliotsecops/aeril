@@ -41,6 +41,40 @@ import tempfile
 import time
 from pathlib import Path
 
+
+def read_starttime(pid):
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as f:
+            tail = f.read().rsplit(b")", 1)[1].split()
+        return int(tail[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def process_cmdline(pid):
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def kill_verified(pid, start=None):
+    if not pid:
+        return False
+    if start is None:
+        start = read_starttime(pid)
+    if start is None or read_starttime(pid) != start:
+        return False
+    if "hermes" not in process_cmdline(pid):
+        return False
+    try:
+        os.kill(int(pid), signal.SIGKILL)
+        return True
+    except OSError:
+        return False
+
+
 def _load_fake() -> str:
     here = Path(__file__).resolve()
     for base in [here.parent.parent.parent]:
@@ -127,7 +161,21 @@ class Fixture:
         for pidfile in self.data.rglob("fake-pid"):
             try:
                 pid = int(pidfile.read_text().strip())
-                os.kill(pid, signal.SIGKILL)
+                start_file = pidfile.with_name("fake-pid-start")
+                start = None
+                if start_file.exists():
+                    try:
+                        start = int(start_file.read_text().strip())
+                    except ValueError:
+                        start = None
+                kill_verified(pid, start)
+            except (OSError, ValueError):
+                pass
+        for pidfile in self.data.rglob("fake-descendant-pid"):
+            try:
+                nums = [int(x) for x in pidfile.read_text().split()]
+                for pid, start in zip(nums[0::2], nums[1::2]):
+                    kill_verified(pid, start)
             except (OSError, ValueError):
                 pass
         shutil.rmtree(self.root, ignore_errors=True)
@@ -178,9 +226,10 @@ def scenario_p1_1(bin_path, only):
             assert wait_file(fx.home("p11") / "fake-pid", 15), "backend no arrancó"
             assert wait_file(fx.home("p11") / "fake-lingering", 15), "el backend no llegó al turno"
             fake = read_pid(fx.home("p11") / "fake-pid")
+            fake_start = read_starttime(fake)
             os.kill(run.pid, signal.SIGKILL)      # supervisor muere
             run.wait()
-            os.kill(fake, signal.SIGKILL)          # backend también muere (run durable)
+            kill_verified(fake, fake_start)        # backend también muere (run durable)
             time.sleep(0.5)
             out = fx.aeril(["profile", "remove", "--agent", "p11", "--confirm", "--clear-threads"])
             deleted = not fx.profile_dir("p11").exists()
@@ -207,9 +256,10 @@ def scenario_p1_1(bin_path, only):
             assert wait_file(fx.home("p11") / "fake-pid", 15), "backend no arrancó"
             assert wait_file(fx.home("p11") / "fake-lingering", 15), "el backend no llegó al turno"
             fake = read_pid(fx.home("p11") / "fake-pid")
+            fake_start = read_starttime(fake)
             os.kill(run.pid, signal.SIGKILL)
             run.wait()
-            os.kill(fake, signal.SIGKILL)
+            kill_verified(fake, fake_start)
             time.sleep(0.5)
             un = fx.aeril(["profile", "unassign", "--thread", t])
             out = fx.aeril(["profile", "remove", "--agent", "p11", "--confirm"])
@@ -324,10 +374,7 @@ def scenario_p1_3(bin_path, only):
             # limpiar procesos del fake que hayan quedado
             pid = read_pid(fx.home("p13") / "fake-pid")
             if pid:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                kill_verified(pid)
                 time.sleep(0.1)
         if bad:
             report("P1-3", "RED", f"initialize aceptado/ rechazado incorrectamente en: {', '.join(bad)}")
@@ -350,6 +397,7 @@ def scenario_p1_4(bin_path, only):
         assert wait_file(fx.home("p14") / "fake-pid", 15), "backend no arrancó"
         assert wait_file(fx.home("p14") / "fake-lingering", 15), "el backend no llegó al turno"
         fake = read_pid(fx.home("p14") / "fake-pid")
+        fake_start = read_starttime(fake)
         os.kill(run.pid, signal.SIGKILL)   # supervisor muere; child sobrevive
         run.wait()
         time.sleep(0.3)
@@ -370,17 +418,14 @@ def scenario_p1_4(bin_path, only):
             warm2.wait()
         rm = fx.aeril(["profile", "remove", "--agent", "p14", "--confirm", "--clear-threads"])
         second_ok = warm.returncode == 0
-        if survivor and second_ok:
+        if survivor and (second_ok or run2_admitted):
             report("P1-4", "RED",
-                   f"child sobreviviente (pid {fake}) + segundo warm ACEPTADO (rc=0); run admitido={run2_admitted}, remove rc={rm.returncode}")
+                   f"child sobreviviente (pid {fake}): warm aceptado={second_ok}, run admitido={run2_admitted}, remove rc={rm.returncode}")
         else:
             report("P1-4", "GREEN",
                    f"survivor={survivor}, warm rc={warm.returncode}, run admitido={run2_admitted}, remove rc={rm.returncode}")
         # limpieza: matar al sobreviviente y verificar terminación
-        try:
-            os.kill(fake, signal.SIGKILL)
-        except OSError:
-            pass
+        kill_verified(fake, fake_start)
         time.sleep(0.3)
         print(f"  P1-4: sobreviviente terminado (alive={alive(fake)})", flush=True)
         # Reconciliación + writer nuevo legítimo
