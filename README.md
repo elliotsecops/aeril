@@ -88,7 +88,7 @@ Lo que **todavía no** estamos anunciando como listo:
 - Restauración automática de la memoria conversacional de un agente.
 - Compatibilidad certificada con Raspberry Pi, Termux o todos los proveedores de VPS.
 
-Podés seguir los avances y límites conocidos en [HANDOFF.md](HANDOFF.md) y [el estado de Fase 1](docs/phase1-status.md).
+Podés seguir los avances y límites conocidos en [el estado actual](docs/status.md).
 
 ## Nerd stuff 🤓
 
@@ -117,7 +117,8 @@ Son mediciones en un entorno específico, **no mínimos garantizados para cualqu
 - [Implementación de perfiles Hermes P2-S1](docs/phase2-s1-implementation.md)
 - [Remediación y evidencias de auditoría R3](docs/phase2-s1-r3-remediation.md)
 - [Contrato ACP de Hermes](docs/acp-hermes-spec.md)
-- [Estado actual y siguientes pasos](HANDOFF.md)
+- [Estado actual](docs/status.md)
+- [Handoff histórico de Fase 0/1](HANDOFF.md)
 
 ---
 
