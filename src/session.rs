@@ -91,9 +91,31 @@ pub struct RunSummary {
 /// P2-S1 R1 — adjunto de perfil para un run: identidad del agente (evidencia
 /// durable run→perfil) + lock de escritor retenido durante todo el run.
 struct ProfileAttachment {
+    data_dir: PathBuf,
     agent: Option<String>,
     _lock: Option<crate::profile::ProfileLock>,
     registry_lock: Option<std::fs::File>,
+    owner_recorded: bool,
+    owner_cleared: bool,
+}
+
+impl ProfileAttachment {
+    fn profile_lock(&self) -> Option<&crate::profile::ProfileLock> {
+        self._lock.as_ref()
+    }
+
+    /// Called while the profile lock is still held. A clean survivor scan
+    /// clears admission owner evidence; any uncertainty leaves it durable.
+    fn finish_owner(&mut self) -> Result<()> {
+        if !self.owner_recorded || self.owner_cleared {
+            return Ok(());
+        }
+        if let Some(agent) = self.agent.as_deref() {
+            crate::profile::finish_writer(&self.data_dir, agent)?;
+            self.owner_cleared = true;
+        }
+        Ok(())
+    }
 }
 
 impl ProfileAttachment {
@@ -101,6 +123,14 @@ impl ProfileAttachment {
         // The profile writer lock stays held for the whole run. The registry
         // lock is only needed through the durable run insert.
         let _ = self.registry_lock.take();
+    }
+}
+
+impl Drop for ProfileAttachment {
+    fn drop(&mut self) {
+        // Backstop for every early return/unwind after admission. Best effort:
+        // a scan error or survivor deliberately leaves owner.json in place.
+        let _ = self.finish_owner();
     }
 }
 
@@ -150,9 +180,12 @@ impl Runner {
     fn attach_profile(&self, thread_id: &str, spec: &mut BackendSpec) -> Result<ProfileAttachment> {
         if !crate::profile::enabled() || !crate::profile::is_hermes_backend(&spec.name) {
             return Ok(ProfileAttachment {
+                data_dir: self.data_dir.clone(),
                 agent: None,
                 _lock: None,
                 registry_lock: None,
+                owner_recorded: false,
+                owner_cleared: false,
             });
         }
         let agent = crate::profile::agent_for_thread(&self.data_dir, thread_id)?.ok_or_else(
@@ -162,15 +195,14 @@ impl Runner {
                 ))
             },
         )?;
+        crate::profile::ensure_profile_usable(&self.data_dir, &agent)?;
         // Lock order: profile writer lock → registry lock → SQLite run insert.
         // The profile lock is held across auth and the entire run, so a
         // profile cannot be deleted while an admission is in flight. The
         // registry lock closes the final mapping-check-to-run-insert window.
         let lock = crate::profile::ProfileLock::acquire(&self.data_dir, &agent)?;
         lock.verify_inode(&self.data_dir, &agent)?;
-        lock.make_inheritable()?;
         crate::profile::verify_no_survivor(&self.data_dir, &agent)?;
-        lock.record_admission_owner(&self.data_dir, &agent)?;
         let status = crate::profile::auth_status(&self.data_dir, &agent)?;
         if status != "logged_in" {
             return Err(Error::backend(format!(
@@ -184,17 +216,26 @@ impl Runner {
                 "el thread {thread_id} fue reasignado durante el arranque del run — fail-closed"
             )));
         }
+        crate::profile::ensure_profile_not_removing(&self.data_dir, &agent)?;
+        // Resolve immutable spawn inputs and record ownership intent before the
+        // final admission barrier. The lock remains CLOEXEC here.
+        let program = crate::profile::hermes_bin()?.to_string_lossy().into_owned();
+        let env = crate::profile::env_for_profile(&self.data_dir, &agent)?;
+        lock.record_admission_owner(&self.data_dir, &agent)?;
         admission_barrier();
         lock.verify_inode(&self.data_dir, &agent)?;
         // Binario absoluto: el spawn usa env_clear + PATH sanitizado, así que
         // la resolución por PATH debe quedar fijada acá.
-        spec.program = crate::profile::hermes_bin()?.to_string_lossy().into_owned();
-        spec.env = crate::profile::env_for_profile(&self.data_dir, &agent)?;
+        spec.program = program;
+        spec.env = env;
         spec.strict_initialize = true;
         Ok(ProfileAttachment {
+            data_dir: self.data_dir.clone(),
             agent: Some(agent),
             _lock: Some(lock),
             registry_lock: Some(registry_lock),
+            owner_recorded: true,
+            owner_cleared: false,
         })
     }
 
@@ -509,6 +550,7 @@ impl Runner {
             opts,
             prev_session.as_deref(),
             lease_lost_rx,
+            attachment.profile_lock(),
         ));
         drop(rt);
 
@@ -564,6 +606,19 @@ impl Runner {
             detail = Some(format!(
                 "lease del workspace {ws} perdido durante el turno; run abortado sin completar (detalle: {})",
                 detail.unwrap_or_else(|| "sin detalle".into())
+            ));
+        }
+
+        // P2-1/R3: owner evidence is part of run lifecycle. Clear it only
+        // after a clean owner/process scan under the still-held profile lock;
+        // a surviving backend or scan failure degrades the run to failed and
+        // leaves owner.json durable for the operator.
+        if attachment.agent.is_some()
+            && let Err(e) = attachment.finish_owner()
+        {
+            state = "failed";
+            detail = Some(format!(
+                "cleanup de owner del perfil falló: {e}; owner.json retenido"
             ));
         }
 
@@ -670,8 +725,21 @@ impl Runner {
         opts: &RunOptions,
         prev_session: Option<&str>,
         lease_lost_rx: Option<oneshot::Receiver<()>>,
+        profile_lock: Option<&crate::profile::ProfileLock>,
     ) -> TurnResult {
         let _ = repo;
+        // P1-1/R3: auth completed with FD_CLOEXEC intact. Inheritance is
+        // enabled only for the intended managed ACP backend, immediately
+        // before spawn.
+        if let Some(lock) = profile_lock
+            && let Err(e) = lock.make_inheritable()
+        {
+            return TurnResult {
+                stop_reason: None,
+                detail: Some(format!("no se pudo habilitar el lock para el backend: {e}")),
+                feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+            };
+        }
         let mut client = match AcpClient::spawn(spec, worktree).await {
             Ok(c) => c,
             Err(e) => {
@@ -682,6 +750,22 @@ impl Runner {
                 };
             }
         };
+        if let (Some(lock), Some(pid)) = (profile_lock, client.child_pid()) {
+            let start = crate::store::leases::process_start_time(pid as i64).unwrap_or(0);
+            if let Err(e) = lock.record_backend_owner(
+                &self.data_dir,
+                run.profile.as_deref().unwrap_or_default(),
+                pid as i64,
+                start,
+            ) {
+                let _ = client.kill().await;
+                return TurnResult {
+                    stop_reason: None,
+                    detail: Some(format!("no se pudo persistir el backend owner: {e}")),
+                    feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                };
+            }
+        }
         // S0: evidencia durable del backend (pid + starttime) para que la
         // reconciliación pueda verificar terminación tras la muerte del
         // supervisor. Sin esta evidencia, el workspace no se reutiliza.

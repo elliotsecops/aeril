@@ -59,6 +59,53 @@ if args and args[0] == "auth":
     if mode == "positive":
         print("nous: logged in")
         sys.exit(0)
+    if mode == "auth-escape-clean":
+        print("nous: logged in")
+        sys.stdout.flush()
+        pid = os.fork()
+        if pid == 0:
+            os.setsid()
+            try:
+                os.close(0)
+                os.close(1)
+                os.close(2)
+            except OSError:
+                pass
+            try:
+                with open(os.path.join(home, "fake-auth-descendant-pid"), "w") as f:
+                    f.write(f"{os.getpid()} {proc_start(os.getpid())}\n")
+            except OSError:
+                pass
+            time.sleep(600)
+            os._exit(0)
+        sys.exit(0)
+    if mode == "auth-timeout-escape":
+        pid = os.fork()
+        if pid == 0:
+            os.setsid()
+            try:
+                with open(os.path.join(home, "fake-auth-descendant-pid"), "w") as f:
+                    f.write(f"{os.getpid()} {proc_start(os.getpid())}\n")
+            except OSError:
+                pass
+            time.sleep(600)
+            os._exit(0)
+        time.sleep(600)
+        sys.exit(0)
+    if mode == "auth-malformed-escape":
+        sys.stdout.write(";;; not json\n")
+        sys.stdout.flush()
+        pid = os.fork()
+        if pid == 0:
+            os.setsid()
+            try:
+                with open(os.path.join(home, "fake-auth-descendant-pid"), "w") as f:
+                    f.write(f"{os.getpid()} {proc_start(os.getpid())}\n")
+            except OSError:
+                pass
+            time.sleep(600)
+            os._exit(0)
+        sys.exit(0)
     if mode == "truncated-positive":
         # The positive status is inside the retained prefix; the later
         # contradiction must still make the probe fail closed.
@@ -271,6 +318,17 @@ if args and args[0] == "acp":
                 "models": {"availableModels": [], "currentModelId": "fake"},
                 "modes": {"currentModeId": "default", "availableModes": []}}}), flush=True)
         elif method == "session/prompt":
+            if mode == "escape-on-turn":
+                pid = os.fork()
+                if pid == 0:
+                    os.setsid()
+                    try:
+                        with open(os.path.join(home, "fake-escaped-pid"), "w") as f:
+                            f.write(f"{os.getpid()} {proc_start(os.getpid())}\n")
+                    except OSError:
+                        pass
+                    time.sleep(600)
+                    os._exit(0)
             if mode == "linger":
                 if home:
                     try:

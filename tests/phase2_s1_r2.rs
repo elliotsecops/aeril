@@ -5,9 +5,10 @@
 
 mod common;
 
+use common::pty::TuiPty;
 use common::*;
 use serde_json::Value;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Barrier};
@@ -233,7 +234,7 @@ impl Drop for R2 {
         if std::env::var("AERIL_KEEP_TESTS").is_ok() {
             return;
         }
-        for name in ["fake-pid", "fake-escaped-pid"] {
+        for name in ["fake-pid", "fake-escaped-pid", "fake-auth-descendant-pid"] {
             let path = self.env.data.join("hermes");
             if !path.exists() {
                 continue;
@@ -1339,5 +1340,459 @@ fn r2_p3_disk_kb_does_not_follow_symlinks() {
     assert!(
         a["disk_kb"].as_u64().unwrap() < 1024,
         "disk_kb followed an external symlink: {a}"
+    );
+}
+
+// ── R3: lock inheritance, tombstones and owner lifecycle ────────────────────
+
+fn wait_run_state(r2: &R2, thread: &str, want: &str, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if r2.latest_run(thread).is_some_and(|run| run.state == want) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+fn wait_lock_free(r2: &R2, agent: &str, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        let list = r2.ok(true, &["profile", "list"]);
+        let state = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["agent_id"] == agent)
+            .map(|p| p["lock_state"].as_str().unwrap_or("unknown"))
+            .unwrap_or("missing");
+        if state == "free" {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn r3_p1_1_successful_auth_descendant_cannot_retain_writer_lock() {
+    let r2 = R2::new("r3-auth-escape-ok");
+    r2.create("a");
+    r2.auth_mode("a", "auth-escape-clean");
+    r2.init_mode("a", "valid");
+    let t = r2.thread_new();
+    r2.assign("a", &t);
+    let v = r2.ok(
+        true,
+        &[
+            "run",
+            "start",
+            "--thread",
+            &t,
+            "--prompt",
+            "x",
+            "--backend",
+            "hermes",
+        ],
+    );
+    assert_eq!(v["state"], "completed");
+    assert!(
+        r2.wait_for(&r2.home("a").join("fake-auth-descendant-pid"), 5),
+        "auth descendant was not created"
+    );
+    let list = r2.ok(true, &["profile", "list"]);
+    let a = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["agent_id"] == "a")
+        .unwrap();
+    assert_eq!(
+        a["lock_state"], "free",
+        "auth descendant retained the profile writer lock"
+    );
+    assert!(
+        !r2.agent_dir("a").join("owner.json").exists(),
+        "completed run left owner evidence behind"
+    );
+}
+
+#[test]
+fn r3_p1_1_timed_out_auth_descendant_cannot_retain_writer_lock() {
+    let r2 = R2::new("r3-auth-escape-timeout");
+    r2.create("a");
+    r2.auth_mode("a", "auth-timeout-escape");
+    let t = r2.thread_new();
+    r2.assign("a", &t);
+    let out = r2
+        .cmd(
+            true,
+            &[
+                "run",
+                "start",
+                "--thread",
+                &t,
+                "--prompt",
+                "x",
+                "--backend",
+                "hermes",
+            ],
+            &[("AERIL_PROFILE_AUTH_TIMEOUT_SECS", "1".into())],
+        )
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "timeout auth must reject admission");
+    assert!(
+        r2.wait_for(&r2.home("a").join("fake-auth-descendant-pid"), 5),
+        "auth descendant was not created"
+    );
+    let list = r2.ok(true, &["profile", "list"]);
+    let a = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["agent_id"] == "a")
+        .unwrap();
+    assert_eq!(a["lock_state"], "free");
+}
+
+#[test]
+fn r3_p1_1_malformed_auth_descendant_cannot_retain_writer_lock() {
+    let r2 = R2::new("r3-auth-escape-bad");
+    r2.create("a");
+    r2.auth_mode("a", "auth-malformed-escape");
+    let t = r2.thread_new();
+    r2.assign("a", &t);
+    let out = r2
+        .cmd(
+            true,
+            &[
+                "run",
+                "start",
+                "--thread",
+                &t,
+                "--prompt",
+                "x",
+                "--backend",
+                "hermes",
+            ],
+            &[("AERIL_PROFILE_AUTH_TIMEOUT_SECS", "1".into())],
+        )
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "malformed auth must reject admission"
+    );
+    assert!(r2.wait_for(&r2.home("a").join("fake-auth-descendant-pid"), 5));
+    let list = r2.ok(true, &["profile", "list"]);
+    let a = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["agent_id"] == "a")
+        .unwrap();
+    assert_eq!(a["lock_state"], "free");
+}
+
+#[test]
+fn r3_p1_2_tombstone_blocks_run_and_warm() {
+    let r2 = R2::new("r3-tombstone-pre");
+    r2.create("a");
+    r2.auth_mode("a", "positive");
+    let t = r2.thread_new();
+    r2.assign("a", &t);
+    mark_removing(&r2, "a");
+    let err = r2.err(
+        true,
+        &[
+            "run",
+            "start",
+            "--thread",
+            &t,
+            "--prompt",
+            "x",
+            "--backend",
+            "hermes",
+        ],
+    );
+    assert!(err.contains("removing") || err.contains("borrado"), "{err}");
+    assert!(
+        r2.latest_run(&t).is_none(),
+        "run was admitted under tombstone"
+    );
+    let err = r2.err(true, &["profile", "warm", "--agent", "a"]);
+    assert!(err.contains("removing") || err.contains("borrado"), "{err}");
+    let list = r2.ok(true, &["profile", "list"]);
+    let a = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["agent_id"] == "a")
+        .unwrap();
+    assert_eq!(a["dir_state"], "removing");
+    // Diagnostic status still works and does not initiate auth.
+    let status = r2.ok(true, &["profile", "status", "--agent", "a"]);
+    assert_eq!(status["dir_state"], "removing");
+}
+
+#[test]
+fn r3_p1_2_tombstone_during_slow_auth_rejects_admission() {
+    let r2 = R2::new("r3-tombstone-race");
+    r2.create("a");
+    r2.auth_mode("a", "slow:2");
+    r2.init_mode("a", "valid");
+    let t = r2.thread_new();
+    r2.assign("a", &t);
+    let run = r2.spawn_run(&t, &[]);
+    assert!(
+        r2.wait_for(&r2.home("a").join("fake-auth-started"), 10),
+        "slow auth did not start"
+    );
+    mark_removing(&r2, "a");
+    let out = run.wait_with_output().unwrap();
+    assert!(!out.status.success(), "admission completed under tombstone");
+    assert!(
+        r2.latest_run(&t).is_none(),
+        "run row created under tombstone"
+    );
+}
+
+#[test]
+fn r3_p1_2_sigkill_after_tombstone_removal_resumes() {
+    let r2 = R2::new("r3-tombstone-kill");
+    r2.create("a");
+    let _ = r2.thread_new();
+    let barrier = r2.env.root.join("barrier-tombstone");
+    let mut remove = r2
+        .cmd(
+            true,
+            &["profile", "remove", "--agent", "a", "--confirm"],
+            &[(
+                "AERIL_TEST_REMOVE_AFTER_TOMBSTONE_BARRIER",
+                barrier.to_string_lossy().into_owned(),
+            )],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(r2.wait_for(&barrier.join("ready"), 15));
+    unsafe {
+        libc::kill(remove.id() as i32, libc::SIGKILL);
+    }
+    let _ = remove.wait();
+    let reg: Value =
+        serde_json::from_slice(&std::fs::read(r2.env.data.join("hermes/agents.json")).unwrap())
+            .unwrap();
+    assert_eq!(reg["agents"]["a"]["removing"], true);
+    assert!(r2.agent_dir("a").exists());
+    let out = r2.out(true, &["profile", "remove", "--agent", "a", "--confirm"]);
+    assert!(
+        out.status.success(),
+        "removal did not resume after SIGKILL: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!r2.agent_dir("a").exists());
+}
+
+#[test]
+fn r3_p2_1_long_lived_supervisor_owner_is_cleared_after_run() {
+    let r2 = R2::new("r3-tui-owner");
+    r2.create("a");
+    r2.auth_mode("a", "positive");
+    r2.init_mode("a", "valid");
+    let t = r2.thread_new();
+    r2.assign("a", &t);
+    let path = r2.path_env();
+    let hermes = r2.bin.join("hermes").to_string_lossy().into_owned();
+    let extra = [
+        ("AERIL_HERMES_PROFILES", "1"),
+        ("PATH", path.as_str()),
+        ("AERIL_HERMES_BIN", hermes.as_str()),
+        ("AERIL_BACKEND", "hermes"),
+    ];
+    let mut tui = TuiPty::spawn(&r2.env, &[], &extra);
+    tui.pump(1500);
+    tui.enter();
+    tui.pump(500);
+    tui.send(b"n");
+    tui.pump(300);
+    tui.type_line("tui goal");
+    tui.pump(500);
+    assert!(
+        wait_run_state(&r2, &t, "completed", 20),
+        "TUI run did not complete"
+    );
+    assert!(tui.alive(), "TUI exited before owner assertion");
+    assert!(
+        wait_lock_free(&r2, "a", 5),
+        "live supervisor left a persistent writer lock"
+    );
+    let list = r2.ok(true, &["profile", "list"]);
+    let a = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["agent_id"] == "a")
+        .unwrap();
+    assert_eq!(a["lock_state"], "free", "live supervisor left false HOLD");
+    r2.ok(true, &["profile", "warm", "--agent", "a"]);
+    // A second admission from another process must also work.
+    let v = r2.ok(
+        true,
+        &[
+            "run",
+            "start",
+            "--thread",
+            &t,
+            "--prompt",
+            "cli goal",
+            "--backend",
+            "hermes",
+        ],
+    );
+    assert_eq!(v["state"], "completed");
+    tui.kill();
+}
+
+#[test]
+fn r3_p2_1_escaped_backend_prevents_owner_cleanup() {
+    let r2 = R2::new("r3-owner-survivor");
+    r2.create("a");
+    r2.auth_mode("a", "positive");
+    r2.init_mode("a", "escape-on-turn");
+    let t = r2.thread_new();
+    r2.assign("a", &t);
+    let v = r2.ok(
+        true,
+        &[
+            "run",
+            "start",
+            "--thread",
+            &t,
+            "--prompt",
+            "x",
+            "--backend",
+            "hermes",
+        ],
+    );
+    assert_eq!(v["state"], "failed", "escaped backend must fail cleanup");
+    assert!(r2.wait_for(&r2.home("a").join("fake-escaped-pid"), 5));
+    assert!(
+        r2.agent_dir("a").join("owner.json").exists(),
+        "owner evidence was cleared with a surviving backend"
+    );
+    let list = r2.ok(true, &["profile", "list"]);
+    let a = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["agent_id"] == "a")
+        .unwrap();
+    assert_eq!(a["lock_state"], "held");
+}
+
+#[test]
+fn r3_p2_1_owner_clear_failure_is_not_reported_as_clean() {
+    let r2 = R2::new("r3-owner-clear-fail");
+    r2.create("a");
+    r2.auth_mode("a", "positive");
+    r2.init_mode("a", "valid");
+    let t = r2.thread_new();
+    r2.assign("a", &t);
+    let out = r2
+        .cmd(
+            true,
+            &[
+                "run",
+                "start",
+                "--thread",
+                &t,
+                "--prompt",
+                "x",
+                "--backend",
+                "hermes",
+            ],
+            &[("AERIL_TEST_FAIL_OWNER_CLEAR", "1".into())],
+        )
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "run command itself should print a summary"
+    );
+    let v: Value = parse_json(&out.stdout);
+    assert_eq!(v["state"], "failed", "owner clear failure was ignored");
+    assert!(r2.agent_dir("a").join("owner.json").exists());
+}
+
+#[test]
+fn r3_p2_1_reused_supervisor_pid_is_stale() {
+    let r2 = R2::new("r3-owner-reused");
+    r2.create("a");
+    let lock = r2.agent_dir("a").join("aeril.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let meta = std::fs::metadata(&lock).unwrap();
+    let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+    let pid = sleeper.id() as i32;
+    let start = proc_start(pid).unwrap();
+    std::fs::write(
+        r2.agent_dir("a").join("owner.json"),
+        serde_json::json!({
+            "supervisor_pid": pid,
+            "supervisor_start": start + 1,
+            "backend_pid": 0,
+            "backend_start": 0,
+            "pgid": 0,
+            "started_ms": 1,
+            "lock_dev": meta.dev(),
+            "lock_ino": meta.ino(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = r2.out(true, &["profile", "warm", "--agent", "a"]);
+    assert!(
+        out.status.success(),
+        "reused supervisor PID caused a false HOLD: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+}
+
+#[test]
+fn r3_p2_2_backend_owner_write_failure_aborts_run() {
+    let r2 = R2::new("r3-backend-owner-fail");
+    r2.create("a");
+    r2.auth_mode("a", "positive");
+    r2.init_mode("a", "valid");
+    let t = r2.thread_new();
+    r2.assign("a", &t);
+    let out = r2
+        .cmd(
+            true,
+            &[
+                "run",
+                "start",
+                "--thread",
+                &t,
+                "--prompt",
+                "x",
+                "--backend",
+                "hermes",
+            ],
+            &[("AERIL_TEST_FAIL_BACKEND_OWNER_WRITE", "1".into())],
+        )
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: Value = parse_json(&out.stdout);
+    assert_eq!(v["state"], "failed");
+    assert!(
+        !r2.agent_dir("a").join("owner.json").exists(),
+        "clean failed spawn should leave no owner evidence"
     );
 }

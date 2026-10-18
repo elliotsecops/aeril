@@ -931,6 +931,40 @@ impl ProfileLock {
         )
     }
 
+    /// Updates the admission record with the actual backend identity. Must be
+    /// called while this process holds the profile lock.
+    pub fn record_backend_owner(
+        &self,
+        data_dir: &Path,
+        agent_id: &str,
+        backend_pid: i64,
+        backend_start: u64,
+    ) -> Result<()> {
+        #[cfg(debug_assertions)]
+        if std::env::var("AERIL_TEST_FAIL_BACKEND_OWNER_WRITE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            return Err(Error::integrity(
+                "fallo de escritura de backend owner inyectado por test",
+            ));
+        }
+        let (dev, ino) = self.dev_ino()?;
+        let mut owner = read_owner(data_dir, agent_id)?
+            .ok_or_else(|| Error::conflict("owner.json ausente durante spawn — fail-closed"))?;
+        let supervisor = std::process::id() as i64;
+        if owner.lock_dev != dev || owner.lock_ino != ino || owner.supervisor_pid != supervisor {
+            return Err(Error::conflict(
+                "owner.json pertenece a otra generación/proceso — no se sobrescribe",
+            ));
+        }
+        owner.backend_pid = backend_pid;
+        owner.backend_start = backend_start;
+        owner.pgid = backend_pid;
+        write_owner(data_dir, agent_id, &owner)
+    }
+
     /// Hace el fd heredable por el backend (limpia FD_CLOEXEC). Sin esto, el
     /// flock muere con el supervisor y un child sobreviviente quedaría sin
     /// protección de exclusión (P1-4).
@@ -1044,6 +1078,12 @@ fn read_owner(data_dir: &Path, agent_id: &str) -> Result<Option<OwnerRecord>> {
 }
 
 fn clear_owner(data_dir: &Path, agent_id: &str) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var("AERIL_TEST_FAIL_OWNER_CLEAR").ok().as_deref() == Some("1") {
+        return Err(Error::integrity(
+            "fallo de limpieza de owner.json inyectado por test",
+        ));
+    }
     let path = owner_path(data_dir, agent_id);
     if let Ok(meta) = std::fs::symlink_metadata(&path)
         && meta.file_type().is_symlink()
@@ -1144,6 +1184,13 @@ pub fn check_owner_evidence(data_dir: &Path, agent_id: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Terminal cleanup for an admission that still holds the profile lock.
+/// Clears owner evidence only when the owner checks and profile-wide process
+/// scan are clean; any uncertainty propagates and leaves evidence durable.
+pub fn finish_writer(data_dir: &Path, agent_id: &str) -> Result<()> {
+    verify_no_survivor(data_dir, agent_id)
 }
 
 /// Admisión temprana (P1-4): rechaza si hay un escritor sobreviviente o si
@@ -1787,8 +1834,16 @@ fn status_view(data_dir: &Path, agent_id: &str, registered: bool) -> Result<Prof
 
 /// Estado del perfil con verificación de auth fresca (no lee credenciales).
 pub fn status(data_dir: &Path, agent_id: &str) -> Result<ProfileView> {
-    let registered = load_registry(data_dir)?.agents.contains_key(agent_id);
-    let _ = auth_status(data_dir, agent_id)?; // refresca metadata (metadata-only)
+    let registry = load_registry(data_dir)?;
+    let registered = registry.agents.contains_key(agent_id);
+    let removing = registry
+        .agents
+        .get(agent_id)
+        .map(|e| e.removing)
+        .unwrap_or(false);
+    if !removing {
+        let _ = auth_status(data_dir, agent_id)?; // refresca metadata (metadata-only)
+    }
     status_view(data_dir, agent_id, registered)
 }
 
@@ -1941,14 +1996,18 @@ fn terminate_group(pgid: i64, grace: Duration) -> Result<()> {
 /// el lock de escritor. Retiene el lock (heredable) durante el handshake.
 pub fn warm_profile(data_dir: &Path, agent_id: &str) -> Result<i64> {
     let _ = assert_safe_agent_path(data_dir, agent_id)?;
+    ensure_profile_usable(data_dir, agent_id)?;
     let lock = ProfileLock::acquire(data_dir, agent_id)?;
     lock.verify_inode(data_dir, agent_id)?;
-    lock.make_inheritable()?;
     verify_no_survivor(data_dir, agent_id)?;
+    // Pre-spawn ownership intent. The lock remains CLOEXEC here; inheritance
+    // is enabled only immediately before the intended ACP spawn.
+    lock.record_admission_owner(data_dir, agent_id)?;
     let bin = hermes_bin()?;
     let env = env_for_profile(data_dir, agent_id)?;
     let timeout = Duration::from_secs(env_secs(WARM_TIMEOUT_ENV, 120));
     eprintln!("[profile] warm {agent_id}: spawn `hermes acp`…");
+    lock.make_inheritable()?;
     let mut child = std::process::Command::new(&bin)
         .arg("acp")
         .env_clear()
@@ -1961,26 +2020,22 @@ pub fn warm_profile(data_dir: &Path, agent_id: &str) -> Result<i64> {
         .map_err(|e| Error::backend(format!("no se pudo lanzar `hermes acp`: {e}")))?;
     let pid = child.id() as i64;
     let started = Instant::now();
-    // Evidencia de dueño (pid+starttime+pgid) para verificación posterior.
-    let (lock_dev, lock_ino) = lock.dev_ino()?;
-    let owner = OwnerRecord {
-        supervisor_pid: std::process::id() as i64,
-        supervisor_start: process_start_time(std::process::id() as i64).unwrap_or(0),
-        backend_pid: pid,
-        backend_start: process_start_time(pid).unwrap_or(0),
-        pgid: pid,
-        started_ms: now_ms(),
-        lock_dev,
-        lock_ino,
-    };
-    if let Err(e) = write_owner(data_dir, agent_id, &owner) {
-        let _ = terminate_group(pid, Duration::from_secs(2));
+    if let Err(e) = lock.record_backend_owner(
+        data_dir,
+        agent_id,
+        pid,
+        process_start_time(pid).unwrap_or(0),
+    ) {
+        let terminated = terminate_group(pid, Duration::from_secs(2));
         let _ = child.wait();
         let home = home_dir(data_dir, agent_id);
-        let survivors = processes_using_home(&home).unwrap_or_default();
+        let survivors = match processes_using_home(&home) {
+            Ok(v) => format!("{v:?}"),
+            Err(scan) => format!("scan-error: {scan}"),
+        };
         return Err(Error::backend(format!(
-            "no se pudo persistir owner.json ({e}); backend terminado/verificado, \
-             sobrevivientes={survivors:?} — warm falla fail-closed"
+            "no se pudo persistir backend owner ({e}); termination={terminated:?}; \
+             survivors={survivors} — warm falla fail-closed (owner admission retenido)"
         )));
     }
     let init = serde_json::json!({
@@ -2129,6 +2184,41 @@ pub fn agent_for_thread(data_dir: &Path, thread_id: &str) -> Result<Option<Strin
         .map(|(id, _)| id.clone()))
 }
 
+/// Rechaza un perfil no registrado o con tombstone de borrado. Used before
+/// any operation that would initiate a profile writer.
+pub fn ensure_profile_usable(data_dir: &Path, agent_id: &str) -> Result<()> {
+    validate_agent_id(agent_id)?;
+    let reg = load_registry_strict(data_dir)?;
+    let Some(entry) = reg.agents.get(agent_id) else {
+        return Err(Error::not_found(format!(
+            "perfil `{agent_id}` no registrado — fail-closed"
+        )));
+    };
+    if entry.removing {
+        return Err(Error::conflict(format!(
+            "el perfil `{agent_id}` tiene un borrado incompleto (removing=true): \
+             no se admite un nuevo run/warm hasta completar `profile remove`"
+        )));
+    }
+    Ok(())
+}
+
+/// Re-check under the final registry lock. Kept separate so admission can
+/// distinguish the preliminary and linearized checks in diagnostics.
+pub fn ensure_profile_not_removing(data_dir: &Path, agent_id: &str) -> Result<()> {
+    validate_agent_id(agent_id)?;
+    let reg = load_registry_strict(data_dir)?;
+    match reg.agents.get(agent_id) {
+        Some(entry) if entry.removing => Err(Error::conflict(format!(
+            "el perfil `{agent_id}` fue marcado removing durante la admisión — fail-closed"
+        ))),
+        Some(_) => Ok(()),
+        None => Err(Error::not_found(format!(
+            "perfil `{agent_id}` desapareció del registro durante la admisión — fail-closed"
+        ))),
+    }
+}
+
 /// Runs no-terminales asociados a un perfil: por vínculo durable
 /// (`runs.profile`, sobrevive a unassign/reassign) o por thread (legacy).
 /// Cualquier error de DB ⇒ `Err` (el llamador decide fail-closed).
@@ -2269,6 +2359,25 @@ pub fn unassign(data_dir: &Path, thread_id: &str, db_path: &Path) -> Result<bool
 }
 
 // ── borrado (P1-1 / C4 / H1) ─────────────────────────────────────────────────
+
+/// Debug/test-only barrier after the tombstone is durable and before any
+/// filesystem deletion. Release builds compile this to a no-op.
+fn after_tombstone_barrier() {
+    #[cfg(debug_assertions)]
+    {
+        let Ok(dir) = std::env::var("AERIL_TEST_REMOVE_AFTER_TOMBSTONE_BARRIER") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("ready"), b"1");
+        let go = dir.join("go");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !go.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
 
 /// Borrado explícito y verificado. Fail-closed ante cualquier duda.
 ///
@@ -2425,6 +2534,7 @@ pub fn remove(
         entry.removing = true;
         reg.agents.insert(agent_id.to_string(), entry);
         save_registry(data_dir, &reg)?;
+        after_tombstone_barrier();
     }
 
     // (6) Borrado + registro atómico (idempotente si falla a mitad).

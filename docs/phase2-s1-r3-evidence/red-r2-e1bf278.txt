@@ -1,0 +1,5 @@
+auth-success-descendant: RED — auth descendant retained writer lock (run rc=0)
+auth-timeout-descendant: RED — auth descendant retained writer lock (run rc=1)
+auth-malformed-descendant: RED — auth descendant retained writer lock (run rc=1)
+tombstone-blocks-use: RED — run_admitted=True warm_succeeded=True
+tui-owner-cleanup: RED — live TUI left false HOLD: aeril: error: conflicto: perfil `a`: supervisor previo VIVO (pid 946624) — HOLD fail-closed; terminá el proceso y reintentá (`aeril profile recover --agent a --confirm`)
