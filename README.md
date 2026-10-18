@@ -25,6 +25,10 @@ Aeril **no es otro modelo de IA**: es el lugar desde donde organizás y supervis
 
 ## Cómo se ve el flujo
 
+**Demostración con agente mock.** Abrir una tarea, lanzar un run, revisar el checkpoint y dejar un comentario. El agente es un mock determinista; esto no demuestra concurrencia con sesiones Hermes autenticadas.
+
+![Demostración de la TUI real de Aeril con un agente mock](docs/assets/aeril-demo.gif)
+
 ```text
 Abrís una tarea
       ↓
