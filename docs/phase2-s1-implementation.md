@@ -1,14 +1,22 @@
 # P2-S1 — Perfiles Hermes gestionados: implementación y evidencia
 
-> **R1 (post-auditoría):** este documento refleja el diseño P2-S1; la
-> remediación de los 4 P1 + hardening H1–H5 (invariantes endurecidos, tests
-> adversariales, evidencia RED/GREEN) está en
-> [`docs/phase2-s1-r1-remediation.md`](phase2-s1-r1-remediation.md). En caso
-> de discrepancia, R1 prevalece.
+> **Estado final P2-S1 (R3):** código aceptado en
+> `8051b325e821e148b7ed103367de7df184211ff4` por veredicto independiente
+> **PASS**, sin P0/P1 reproducidos. Las remediaciones históricas están en
+> [`phase2-s1-r1-remediation.md`](phase2-s1-r1-remediation.md),
+> [`phase2-s1-r2-remediation.md`](phase2-s1-r2-remediation.md) y
+> [`phase2-s1-r3-remediation.md`](phase2-s1-r3-remediation.md). En caso de
+> discrepancia, R3 prevalece.
+>
+> **Provenance:** el SHA aceptado es el de código arriba. Este documento está
+> siendo corregido en un commit **documentation-only** posterior a la
+> aceptación; el HEAD documental no está cubierto directamente por la
+> auditoría exacta de `8051b32` y requiere una confirmación estrecha de
+> procedencia/delta antes de declararlo merge-ready.
 
 **Rama:** `feat/phase2-s1-profiles` (desde `main` certificado `47f0318eaadded7b93c027ba42efe0f9778f0f87`)
 **Feature flag:** `AERIL_HERMES_PROFILES` (default **OFF**)
-**Estado:** implementación completa, pendiente de auditoría independiente
+**Estado:** código aceptado; PR **DRAFT**, pendiente de autorización humana explícita de merge
 **Restricciones respetadas:** sin merge a `main`, sin tags, sin P2-S2, sin multi-Hermes en
 producto, sin credenciales reales, sin tocar perfiles autenticados de P2-S0.
 
@@ -102,17 +110,19 @@ configurados por archivos dentro de `HERMES_HOME`). Sin credenciales reales.
 ### Resultados
 
 ```text
-cargo test (suite completa): EXIT=0 — 142/142
+cargo test (suite completa, R3 aceptado): EXIT=0 — 204/204
+  · 41 tests de la matriz R2+R3 (tests/phase2_s1_r2.rs)
   · 124 tests certificados de Fase 1 (sin regresiones)
-  · 3 unit tests nuevos (src/profile.rs)
-  · 15 tests de integración nuevos (tests/phase2_s1_profiles.rs)
+  · tests de perfil P2-S1/R1
 cargo clippy --all-targets -- -D warnings: limpio
 cargo fmt: aplicado (sin diffs pendientes)
 ```
 
-Evidencia por test: todos los `t1..t15` en verde (ver §3 para el detalle de
-lock/crash). Los tests corren en ~3.4 s en total (deterministas, sin sleeps
-largos: el timeout de warm es de 1 s configurable).
+Evidencia final: R1 reproducer **7/7 GREEN**, reproducer R3 **5/5 GREEN**,
+suite R3 **41/41 PASS** y suite completa **204/204 PASS**. Ver
+[`docs/phase2-s1-r3-remediation.md`](phase2-s1-r3-remediation.md) §4–5 para
+los logs y comandos exactos. Los tests usan Hermes fake; no acreditan
+concurrencia autenticada real.
 
 ### Unit tests (`src/profile.rs`)
 
@@ -141,45 +151,104 @@ largos: el timeout de warm es de 1 s configurable).
 ## 4. Presupuestos de performance
 
 ```text
-budget-size : binario 5,553,296 bytes (5.6 MB) ≤ 30 MB (decimal)  → PASS
+budget-size : binario 5,834,352 bytes (5.8 MB) ≤ 30 MB (decimal)  → PASS
 budget-deps : PASS (solo ABI base del OS + zlib del sistema)
-budget-mem  : idle 6.3 MB / thread abierto 7.1 MB / delta 0.86 MiB
+budget-mem  : idle 7.1 MB / thread abierto 8.0 MB / delta 0.96 MiB
               (límites 50 MB y 10 MiB)                            → PASS
-budget-start: p95 11.67 ms (límite 300 ms)                        → PASS
-budget-two  : TUI 8.2 MB · mocks 4.0 MB c/u · combinado 16.6 MB
-              arranque con 2 activos 50.9 ms · consultas avg 3.1 ms
-              (Fase 1 certificó 8.1–8.3 MB / 4.0 MB)              → sin regresión
+budget-start: p95 19.73 ms (límite 300 ms)                        → PASS
+budget-two  : TUI 8.65 MB · mocks 4.59/4.80 MB · combinado 18.25 MB
+              arranque con 2 activos 50.57 ms · consultas max 5.83 ms
+budget-scale: app 10.23 MB (≤500 MB)                               → PASS
 ```
 
 **Budget idle 192 MiB (Hermes autenticado):** sin cambios en este trabajo.
 P2-S1 no modifica el presupuesto ni la instrumentación; la medición con Hermes
 real pertenece a P2-S0 (VIOLATION registrada) y a su re-baseline en P2-S2.
 
+El release se reconstruyó explícitamente antes de medir. El target Makefile
+`$(BIN)` no depende de las fuentes; hasta corregir esa dependencia, un
+`make budget` sobre un binario release viejo no es evidencia válida.
+
 ---
 
 ## 5. Procedimiento de rollback
 
-1. **Desactivar:** quitar `AERIL_HERMES_PROFILES` del entorno (o dejarlo en 0). El
-   comportamiento vuelve al certificado en `main @ 47f0318`: los comandos
-   `aeril profile *` se rechazan y el Runner no consulta perfiles (T1, T15).
-2. **Sin migración de datos:** el subsistema es metadata fuera de la DB
-   (`<data_dir>/hermes/`); no hay cambios de esquema para el rollback. Rollback
-   de código no requiere tocar la DB ni los worktrees.
-3. **Perfiles: NUNCA borrado masivo.** Un perfil contiene estado durable y
-   potencialmente **credenciales de Hermes** (`auth.json` dentro de
-   `HERMES_HOME`). Reglas (R1-H3):
-   - No ejecutar `rm -rf <AERIL_DATA_DIR>/hermes` bajo ninguna circunstancia:
-     destruiría credenciales y evidencia sin validación.
-   - Borrado **por perfil y explícito**, con autorización del usuario:
-     `aeril profile remove --agent <id> --confirm` (requiere flag ON, verifica
-     ownership, runs no-terminales, lock, procesos y symlinks; fail-closed).
-   - Si un perfil quedara en HOLD (run no reconciliado o proceso huérfano):
-     reconciliar (`aeril recover`), terminar el proceso huérfano con identidad
-     verificada y reintentar; o `profile recover --agent <id> --confirm`.
-   - La desactivación del flag **no implica** borrar perfiles: dejarlos en
-     disco es el default seguro.
-4. **Reversión total:** `git revert` del merge del PR (o abandono de la rama).
-   `main` no fue modificado por esta rama.
+### 5.1 Esquema v4 y compatibilidad
+
+**P2-S1 SÍ cambia el esquema SQLite.** La migración v4 agrega
+`runs.profile TEXT` nullable. Los runs previos a v4 quedan con
+`runs.profile=NULL`; el flag OFF no elimina la columna ni revierte la
+migración. `Store::open` aplica v4 independientemente del flag.
+
+- Un binario v3 **puede abrir** una base v4 (la columna es nullable y el
+  binario v3 no la selecciona), pero **no entiende** la ownership de perfiles
+  gestionados.
+- El recovery v3 no reconoce `runs.profile`; si queda un backend gestionado
+  vivo, v3 puede tratarlo como un backend no gestionado y terminar su grupo.
+  **Recovery v3 con estado gestionado vivo es inseguro.**
+- El binario v3 **no puede** enforcear las restricciones de downgrade
+  descriptas abajo. No se le atribuye esa garantía.
+
+### 5.2 Procedimiento de downgrade permitido
+
+El downgrade de binario solo es admisible después de probar que no queda
+estado de ejecución gestionado vivo:
+
+1. Detener nuevas admisiones y `profile warm`.
+2. Con el binario **v4**, reconciliar los runs interrumpidos
+   (`aeril recover`) y, si corresponde, ejecutar la recuperación explícita de
+   perfiles (`aeril profile recover --agent <id> --confirm`).
+3. Verificar que no queden runs gestionados en `starting/running`, ni
+   backends/descendientes vivos, ni locks de perfil tomados, ni evidencia de
+   owner sin resolver. Verificar también tombstones `removing` y el registro
+   `agents.json`.
+4. Si cualquiera de esas condiciones no puede probarse, **abortar el
+   downgrade**. No se debe reemplazar la incertidumbre por una suposición.
+5. Recién entonces puede ejecutarse un binario v3. La restricción sigue siendo
+   operativa: v3 no la enforcea por sí mismo.
+
+Un `v3` que solo lee listados no demuestra ownership gestionado ni autoriza
+recovery. La compatibilidad de lectura no es compatibilidad de recuperación.
+
+### 5.3 Desactivar el flag no es hacer downgrade
+
+Quitar `AERIL_HERMES_PROFILES` (o dejarlo en 0) devuelve el comportamiento de
+ejecución al camino certificado, pero **no revierte** la migración v4 ni
+borra perfiles/estado. El binario v4 sigue siendo el binario recomendado para
+cualquier recovery o borrado de perfiles.
+
+### 5.4 Perfiles: nunca borrado masivo
+
+Un perfil contiene estado durable y potencialmente **credenciales de Hermes**
+(`auth.json` dentro de `HERMES_HOME`). Reglas:
+
+- No ejecutar `rm -rf <AERIL_DATA_DIR>/hermes` bajo ninguna circunstancia:
+  destruiría credenciales y evidencia sin validación.
+- Borrado **por perfil y explícito**, con autorización del usuario:
+  `aeril profile remove --agent <id> --confirm` (requiere flag ON, verifica
+  ownership, runs no-terminales, lock, procesos y symlinks; fail-closed).
+- Si un perfil quedara en HOLD (run no reconciliado o proceso huérfano):
+  reconciliar (`aeril recover`), terminar el proceso huérfano con identidad
+  verificada y reintentar; o `profile recover --agent <id> --confirm`.
+- La desactivación del flag **no implica** borrar perfiles.
+
+### 5.5 Límites de seguridad/operación aceptados
+
+**Manipulación same-UID del registro.** `.registry.lock` y los demás flocks
+coordinan procesos de Aeril que participan del contrato. Un proceso externo
+del mismo usuario que edite `agents.json` sin tomar el registry lock puede
+bypassar ese contrato. Esto es una frontera de coordinación advisory, **no un
+sandbox OS** ni una garantía contra un actor same-UID adversarial.
+
+**Downgrade con estado vivo.** El recovery v3 no reconoce `runs.profile` y
+no puede distinguir un backend gestionado. El rollback de estado gestionado
+vivo está **prohibido**; solo se permite después de la verificación v4 de
+§5.2. Si no se puede probar la ausencia de writers/owners/locks, se aborta.
+
+Guarantees permitidos: operación single-Hermes gestionada con v4, flag ON/OFF,
+migración v4 y recovery v4 con guards fail-closed. Guarantees **no** soportados:
+recovery v3 sobre estado gestionado vivo, aislamiento de un proceso same-UID
+que ignore advisory locks, y sandboxing OS.
 
 ---
 
@@ -192,12 +261,16 @@ real pertenece a P2-S0 (VIOLATION registrada) y a su re-baseline en P2-S2.
   (`openat`/`unlinkat`). El resto de los checks son fail-closed.
 - **`auth_status` de `status`** ejecuta `hermes auth status` (timeout 20 s
   configurable). En P2-S1 no hay fallback si Hermes no está disponible: `unknown`.
-- **`--clear-threads`** omite el chequeo de runs activos en la DB: es una
-  declaración explícita del operador de que las referencias son históricas; los
-  checks de lock/procesos/symlinks siguen fail-closed.
+- **`--clear-threads`** solo cubre asociaciones históricas del registro. Los
+  runs `starting/running` bloquean siempre; no existe bypass de runs activos.
+  Lock, owner, procesos, symlinks y tombstones siguen fail-closed.
 - **TUI sin cambios** (C1): el gate single-Hermes certificado permanece; la
   habilitación de N=2 autenticado es P2-S2.
 - **Sin cambios en clasificación de `failed_turn`** (P2-S2).
+- **P3 pendiente (test harness/reproducibilidad):** el reaping de PTY/TUI bajo
+  interrupción/SIGKILL no está endurecido en este cierre; el target Makefile
+  `$(BIN)` no depende de las fuentes, por lo que el rebuild release debe
+  forzarse explícitamente para evidencia de presupuestos.
 - **Hermes real no ejecutado en tests**: la suite usa un fake controlado; la
   validación con Hermes real autenticado corresponde a P2-S2 (y a la reutilización
   del harness P2-S0), respetando que los perfiles de P2-S0 no se tocan.
@@ -206,10 +279,9 @@ real pertenece a P2-S0 (VIOLATION registrada) y a su re-baseline en P2-S2.
 
 ## 7. Checklist de auditoría independiente
 
-1. `git diff main...feat/phase2-s1-profiles` — ¿el diff toca solo
-   `src/profile.rs`, `src/cli.rs`, `src/lib.rs`, `src/session.rs`,
-   `src/agent/{mod,acp}.rs`, `tests/rc2_b1.rs`, `tests/phase2_s1_profiles.rs`,
-   `docs/phase2-s1-implementation.md`? ¿Sin cambios en `src/tui/mod.rs`?
+1. `git diff 47f0318...8051b32` — revisar el subsistema de perfiles, el wiring
+   de Runner/ACP, la migración `src/store/schema.rs`, los stores de runs/eventos
+   y las suites R1/R2/R3. ¿Sin cambios en `src/tui/mod.rs`?
 2. ¿`main` intacto en `47f0318` y sin tags nuevos?
 3. ¿Flag OFF ⇒ T1/T15 pasan y el código no consulta perfiles?
 4. ¿Ninguna referencia de **acceso** a `auth.json` en el diff (solo comentarios que
@@ -221,13 +293,18 @@ real pertenece a P2-S0 (VIOLATION registrada) y a su re-baseline en P2-S2.
 8. ¿Sin credenciales reales en tests, docs ni artefactos? ¿Perfiles P2-S0 intactos?
 9. ¿Suite completa + fmt + clippy + presupuestos verdes? ¿Sin cambios al budget
    de 192 MiB idle?
-10. ¿Rollback probado conceptualmente (flag OFF) y documentado?
+10. ¿El rollback v4 está documentado y el downgrade v3 solo se permite después
+    de probar ausencia de writers/owners/locks (§5.2)? ¿Queda claro que flag
+    OFF no revierte el esquema v4?
 
 ## 8. Commits de la rama
 
-- `b5eba7176f4a403ab6efb89f98913c51d1a65896` — implementación + tests + doc
-  (`feat(p2s1): perfiles Hermes gestionados (feature flag OFF por default)`)
-- segundo commit (docs-only): registro de estos SHAs (tip de la rama al cierre)
+- **SHA de código aceptado:** `8051b325e821e148b7ed103367de7df184211ff4` —
+  R3, PASS independiente.
+- **Commit documentation-only de este cierre:** el HEAD posterior a este
+  documento; no está cubierto directamente por la auditoría exacta de
+  `8051b32`. Requiere confirmación estrecha de procedencia/delta antes de
+  declarar merge-ready.
 
 Base: `main @ 47f0318eaadded7b93c027ba42efe0f9778f0f87` (no modificado).
 
