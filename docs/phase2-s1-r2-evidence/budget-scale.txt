@@ -1,0 +1,10 @@
+{
+  "agents_rss_mb": 22.69140625,
+  "app_ok": true,
+  "app_rss_mb": 10.30078125,
+  "failures": 0,
+  "gate_app_mb": 500,
+  "note": "Agentes MOCK: caracteriza el overhead de la aplicación; NO prueba el consumo de Hermes real (perfil compartido, no medible en v0)",
+  "runs": 5,
+  "total_rss_mb": 32.9921875
+}

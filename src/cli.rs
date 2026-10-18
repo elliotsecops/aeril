@@ -150,6 +150,7 @@ fn dispatch(args: &[String], t0: Instant) -> Result<i32> {
         Some("lease") => cmd_lease(&p, &db_path),
         Some("worktree") => cmd_worktree(&p, &data_dir, &db_path),
         Some("workspace") => cmd_workspace(&p, &data_dir, &db_path),
+        Some("profile") => cmd_profile(&p, &data_dir, &db_path),
         Some("integrate") => cmd_integrate(&p, &db_path),
         Some("validate") => cmd_validate(&p, &data_dir, &db_path),
         Some("export") => cmd_export(&p, &db_path),
@@ -251,6 +252,7 @@ fn run_view(store: &Store, run: &runs::RunRow) -> Result<Value> {
         "thread_id": run.thread_id,
         "workspace_id": run.workspace_id,
         "backend": run.backend,
+        "profile": run.profile,
         "state": run.state,
         "supervisor": {"status": sup_status, "detail": supervisor.detail},
         "lease": lease_json,
@@ -297,6 +299,19 @@ fn cmd_run(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
                 }
             };
             let mut store = open_store(db_path)?;
+            // P2-S1 R1 (P1-4): admisión temprana ANTES de la reconciliación
+            // de crash. Si el perfil gestionado del thread tiene un escritor
+            // sobreviviente, el run se RECHAZA sin tocar al sobreviviente
+            // (la reconciliación certificada termina backends huérfanos
+            // verificados; con perfiles gestionados la decisión debe ser del
+            // operador: matar verificando identidad y reconciliar con
+            // `aeril recover`).
+            if crate::profile::enabled()
+                && crate::profile::is_hermes_backend(&backend)
+                && let Some(agent) = crate::profile::agent_for_thread(data_dir, &thread_id)?
+            {
+                crate::profile::preflight_no_live_writer(data_dir, &agent)?;
+            }
             // S0: reconciliar runs interrumpidos (supervisores muertos) y
             // checkpoints pendientes antes de arrancar un run nuevo.
             crate::recovery::reconcile_interrupted_runs(&mut store)?;
@@ -346,6 +361,7 @@ fn print_run_summary(summary: &session::RunSummary) -> Result<()> {
         "state": summary.state,
         "stop_reason": summary.stop_reason,
         "engine_session_id": summary.engine_session_id,
+        "profile": summary.profile,
         "detail": summary.detail,
         "snapshot": snapshot,
     }))?;
@@ -717,6 +733,96 @@ fn cmd_recover(_p: &Parsed, db_path: &Path) -> Result<i32> {
 }
 
 // ── worktree ─────────────────────────────────────────────────────────────────
+
+// ── profile (P2-S1) ──────────────────────────────────────────────────────────
+
+fn cmd_profile(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
+    if !crate::profile::enabled() {
+        return Err(Error::invalid(format!(
+            "perfiles gestionados deshabilitados; exportá {}=1 para habilitar (default OFF)",
+            crate::profile::FLAG_ENV
+        )));
+    }
+    let json_view = |v: &crate::profile::ProfileView| -> Value {
+        json!({
+            "agent_id": v.agent_id,
+            "registered": v.registered,
+            "dir_state": v.dir_state,
+            "auth_status": v.auth_status,
+            "auth_checked_ms": v.auth_checked_ms,
+            "thread_ids": v.thread_ids,
+            "lock_held": v.lock_held,
+            "lock_state": v.lock_state,
+            "warmed_ms": v.warmed_ms,
+            "disk_kb": v.disk_kb,
+            "removing": v.removing,
+        })
+    };
+    match p.pos.get(1).map(String::as_str) {
+        Some("create") => {
+            let agent_id = p.require("agent")?;
+            let provider = p.flag("provider").unwrap_or_else(|| "nous".into());
+            let model = p.flag("model");
+            let warm = p.yes("warm");
+            let v = crate::profile::create(data_dir, &agent_id, &provider, model.as_deref(), warm)?;
+            print_json(&json_view(&v))?;
+            Ok(0)
+        }
+        Some("list") => {
+            let list = crate::profile::list(data_dir)?;
+            let arr: Vec<Value> = list.iter().map(&json_view).collect();
+            print_json(&Value::Array(arr))?;
+            Ok(0)
+        }
+        Some("status") => {
+            let agent_id = p.require("agent")?;
+            let v = crate::profile::status(data_dir, &agent_id)?;
+            print_json(&json_view(&v))?;
+            Ok(0)
+        }
+        Some("warm") => {
+            let agent_id = p.require("agent")?;
+            let warmed_ms = crate::profile::warm_profile(data_dir, &agent_id)?;
+            print_json(&json!({"agent_id": agent_id, "warmed_ms": warmed_ms}))?;
+            Ok(0)
+        }
+        Some("assign") => {
+            let agent_id = p.require("agent")?;
+            let thread_id = p.require("thread")?;
+            crate::profile::assign(data_dir, &agent_id, &thread_id, db_path)?;
+            print_json(&json!({"assigned": true, "agent_id": agent_id, "thread_id": thread_id}))?;
+            Ok(0)
+        }
+        Some("unassign") => {
+            let thread_id = p.require("thread")?;
+            let removed = crate::profile::unassign(data_dir, &thread_id, db_path)?;
+            print_json(&json!({"unassigned": removed, "thread_id": thread_id}))?;
+            Ok(0)
+        }
+        Some("recover") => {
+            let agent_id = p.require("agent")?;
+            if !p.yes("confirm") {
+                return Err(Error::invalid(
+                    "profile recover requiere --confirm (reconciliación explícita)",
+                ));
+            }
+            let verdict = crate::profile::recover(data_dir, &agent_id)?;
+            print_json(&json!({"agent_id": agent_id, "recovery": verdict}))?;
+            Ok(0)
+        }
+        Some("remove") => {
+            let agent_id = p.require("agent")?;
+            let confirm = p.yes("confirm");
+            let clear_threads = p.yes("clear-threads");
+            crate::profile::remove(data_dir, &agent_id, confirm, clear_threads, db_path)?;
+            print_json(&json!({"removed": true, "agent_id": agent_id}))?;
+            Ok(0)
+        }
+        other => Err(Error::invalid(format!(
+            "profile {other:?} no soportado (create|list|status|warm|assign|unassign|remove|recover)"
+        ))),
+    }
+}
 
 // ── workspace ────────────────────────────────────────────────────────────────
 

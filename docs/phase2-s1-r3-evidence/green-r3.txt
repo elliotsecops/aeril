@@ -1,0 +1,5 @@
+auth-success-descendant: GREEN — auth descendant did not retain lock (run rc=0)
+auth-timeout-descendant: GREEN — auth descendant did not retain lock (run rc=1)
+auth-malformed-descendant: GREEN — auth descendant did not retain lock (run rc=1)
+tombstone-blocks-use: GREEN — run and warm rejected
+tui-owner-cleanup: GREEN — live TUI did not block warm

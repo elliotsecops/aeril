@@ -1,0 +1,37 @@
+Old v3 binary: /home/elliot/aeril/target/debug/aeril (main 47f0318eaadded7b93c027ba42efe0f9778f0f87)
+Database created by R2 candidate with user_version=4 and runs.profile present.
+
+$ old-v3 thread list
+[
+  {
+    "repo_path": "/tmp/aeril-r2-oldcompat/repo/",
+    "state": "open",
+    "thread_id": "f3a5b1caf04e49f1b36bef6842859244",
+    "title": "compat",
+    "updated_ms": 1792290309274
+  }
+]
+
+$ old-v3 run list --limit 5
+[
+  {
+    "backend": "mock",
+    "ended_ms": 1792290309274,
+    "lease": {"status": "missing"},
+    "run_id": "c80f8ceb7aa940518a3a8ec91760d926",
+    "started_ms": 1792290309266,
+    "state": "completed",
+    "status": "completed",
+    "supervisor": {"detail": "supervisor muerto (pid 3886734)", "status": "dead"},
+    "thread_id": "f3a5b1caf04e49f1b36bef6842859244",
+    "workspace_id": "7795c4f721e14906bfcff76170dd2ce1"
+  }
+]
+
+PRAGMA user_version = 4
+runs.profile column present = True
+legacy run profile = NULL
+
+Conclusion: v3 can read the upgraded schema. It CANNOT safely recover managed
+runs because it does not know runs.profile. Do not downgrade while managed
+writers or unresolved managed runs exist. See §4 of the remediation report.

@@ -123,6 +123,7 @@ fn insert_run_started_without_supervisor(env: &TestEnv, thread: &str, run_id: &s
             worktree_path: String::new(),
             branch: String::new(),
             base_oid: String::new(),
+            profile: None,
             resumed_session: None,
             supervisor_pid: None,
             supervisor_pid_start: None,

@@ -327,7 +327,21 @@ fn backend_state(store: &Store, run: &RunRow) -> Result<Backend> {
     let b: payload::BackendSpawned = ev.parse()?;
     match identify_pid(b.pid, b.pid_start) {
         // Identidad verificada (vivo o zombie): el grupo es atribuible.
-        PidIdentity::Ours { .. } => terminate_verified_backend(&b),
+        PidIdentity::Ours { .. } => {
+            // P2-S1 R1 (P1-4): con perfiles gestionados habilitados y un run
+            // asociado a un perfil, la reconciliación NO termina al backend
+            // sobreviviente: lo declara inseguro y la admisión de perfiles
+            // rechaza hasta que el OPERADOR termine el proceso (identidad
+            // verificada) y reintente. Con el flag OFF el comportamiento
+            // certificado de Fase 1 queda intacto.
+            if run.profile.is_some() {
+                return Ok(Backend::Unsafe(format!(
+                    "perfil gestionado `{}`: terminación automática deshabilitada (P1-4);                      terminá el proceso huérfano verificando identidad y reconciliá",
+                    run.profile.as_deref().unwrap_or("?")
+                )));
+            }
+            terminate_verified_backend(&b)
+        }
         // PID inexistente: sin miembros vivos del grupo homónimo no queda
         // escritor; con miembros, la atribución no es verificable (posible
         // reutilización de PGID) ⇒ unsafe SIN enviar señal.
@@ -457,7 +471,8 @@ pub fn reconcile_interrupted_runs(store: &mut Store) -> Result<Vec<RunRecovery>>
     let stale: Vec<RunRow> = {
         let mut stmt = store.conn.prepare(
             "SELECT id, thread_id, workspace_id, repo_path, worktree_path, branch, base_oid,
-                    backend, backend_version, engine_session_id, state, started_ms, ended_ms
+                    backend, backend_version, engine_session_id, state, started_ms, ended_ms,
+                    profile
              FROM runs WHERE state IN ('starting','running') ORDER BY started_ms ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -475,6 +490,7 @@ pub fn reconcile_interrupted_runs(store: &mut Store) -> Result<Vec<RunRecovery>>
                 state: row.get(10)?,
                 started_ms: row.get(11)?,
                 ended_ms: row.get(12)?,
+                profile: row.get(13)?,
             })
         })?;
         rows.collect::<rusqlite::Result<_>>()?
@@ -701,7 +717,8 @@ pub fn workspace_reuse_verdict(conn: &Connection, workspace_id: &str) -> Result<
     let run: Option<RunRow> = {
         let mut stmt = conn.prepare(
             "SELECT id, thread_id, workspace_id, repo_path, worktree_path, branch, base_oid,
-                    backend, backend_version, engine_session_id, state, started_ms, ended_ms
+                    backend, backend_version, engine_session_id, state, started_ms, ended_ms,
+                    profile
              FROM runs WHERE workspace_id = ?1 ORDER BY started_ms DESC, id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![workspace_id], |row| {
@@ -719,6 +736,7 @@ pub fn workspace_reuse_verdict(conn: &Connection, workspace_id: &str) -> Result<
                 state: row.get(10)?,
                 started_ms: row.get(11)?,
                 ended_ms: row.get(12)?,
+                profile: row.get(13)?,
             })
         })?;
         match rows.next() {

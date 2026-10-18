@@ -1,0 +1,43 @@
+P1-1a: GREEN — denegado/inalterado (rc=1)
+  P1-1a-recon: recover rc=0; remove post-reconciliación rc=0 (perfil eliminado)
+P1-1b: GREEN — unassign rc=1, remove rc=1, dir=intact
+P1-1c: GREEN — denegado con DB inaccesible (rc=1)
+  P1-2[positive]: auth_status=logged_in (esperado logged_in)
+  P1-2[positive-exit1]: auth_status=unknown (esperado no-positive)
+  P1-2[not-currently]: auth_status=absent (esperado no-positive)
+  P1-2[not-signed]: auth_status=absent (esperado no-positive)
+  P1-2[logged-out]: auth_status=absent (esperado no-positive)
+  P1-2[no-credentials]: auth_status=absent (esperado no-positive)
+  P1-2[other-provider]: auth_status=unknown (esperado no-positive)
+  P1-2[contradictory]: auth_status=unknown (esperado no-positive)
+  P1-2[malformed]: auth_status=unknown (esperado no-positive)
+  P1-2[empty]: auth_status=unknown (esperado no-positive)
+P1-2: GREEN — matriz adversarial completa sin positivos falsos
+  P1-3[valid]: warm rc=0(PASS) (esperado PASS)
+  P1-3[fragmented]: warm rc=0(PASS) (esperado PASS)
+  P1-3[notif-masquerade]: warm rc=non-zero (esperado reject)
+  P1-3[string-result]: warm rc=non-zero (esperado reject)
+  P1-3[wrong-id]: warm rc=non-zero (esperado reject)
+  P1-3[null-result]: warm rc=non-zero (esperado reject)
+  P1-3[error]: warm rc=non-zero (esperado reject)
+  P1-3[bare-result]: warm rc=non-zero (esperado reject)
+  P1-3[missing-protocol]: warm rc=non-zero (esperado reject)
+  P1-3[oversized]: warm rc=non-zero (esperado reject)
+  P1-3[eof-mid-frame]: warm rc=non-zero (esperado reject)
+  P1-3[no-response]: warm rc=non-zero (esperado reject)
+  P1-3[endless-notifications]: warm rc=non-zero (esperado reject)
+  P1-3[notifications-then-valid]: warm rc=0(PASS) (esperado PASS)
+P1-3: GREEN — validación estricta completa (14/14)
+P1-4: GREEN — survivor=True, warm rc=1, run admitido=False, remove rc=1
+  P1-4: sobreviviente terminado (alive=False)
+P1-4-recon: GREEN — recover rc=0; warm post-reconciliación rc=0
+
+=== resumen ===
+P1-1a: GREEN — denegado/inalterado (rc=1)
+P1-1b: GREEN — unassign rc=1, remove rc=1, dir=intact
+P1-1c: GREEN — denegado con DB inaccesible (rc=1)
+P1-2: GREEN — matriz adversarial completa sin positivos falsos
+P1-3: GREEN — validación estricta completa (14/14)
+P1-4: GREEN — survivor=True, warm rc=1, run admitido=False, remove rc=1
+P1-4-recon: GREEN — recover rc=0; warm post-reconciliación rc=0
+total: 7 escenarios, 0 RED

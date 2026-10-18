@@ -1,0 +1,454 @@
+   Compiling aeril v0.1.0 (/home/elliot/aeril-phase0)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.70s
+     Running unittests src/lib.rs (target/debug/deps/aeril-1bda2ddbe4026a5b)
+
+running 14 tests
+test git::diff::tests::hunk_range ... ok
+test profile::tests::agent_id_validation ... ok
+test profile::tests::mountinfo_fault_injection ... ok
+test profile::tests::registry_roundtrip ... ok
+test profile::tests::enabled_flag_parsing ... ok
+test profile::tests::auth_classifier_adversarial_matrix ... ok
+test profile::tests::init_validator_adversarial_matrix ... ok
+test timeutil::tests::iso_epoch ... ok
+test util::tests::fnv_estable ... ok
+test profile::tests::proc_scan_fault_injection ... ok
+test profile::tests::atomic_write_concurrent_unique_tmp ... ok
+test profile::tests::non_terminal_run_guard_covers_starting_and_running ... ok
+test store::tests::fk_habilitadas_y_esquema ... ok
+test store::tests::migracion_v2_a_v3_conserva_datos ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/aeril-dad644409676a1cb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/agent_flow.rs (target/debug/deps/agent_flow-e534bf4a4ba39cf1)
+
+running 4 tests
+test run_sin_cambios_no_publica_checkpoint ... ok
+test flujo_agente_registra_eventos_normalizados_y_permisos ... ok
+test feedback_sin_backend_sano_no_se_declara_entregado ... ok
+test feedback_entregado_con_ack_y_nuevo_checkpoint ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.09s
+
+     Running tests/edge_cases.rs (target/debug/deps/edge_cases-c437b7d1005a4efa)
+
+running 4 tests
+test objetos_faltantes_se_reportan_sin_fabricar_exito ... ok
+test ref_conflictiva_detiene_y_nunca_sobrescribe ... ok
+test integracion_stale_y_divergente_bloquean_sin_tocar_nada ... ok
+test cancelacion_detiene_el_turno_del_motor ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
+
+     Running tests/phase1_concurrency.rs (target/debug/deps/phase1_concurrency-a56393ccf121ecab)
+
+running 11 tests
+test g6_auditoria_de_permisos_aislada ... ok
+test g4_revision_durable_tras_borrado ... ok
+test g2b_sigkill_de_la_tui_completa_se_reconcilia ... ok
+test g5_restauracion_independiente ... ok
+test g9_integracion_concurrente_ff ... ok
+test g8_hermes_una_sesion_por_vez ... ok
+test g1_dos_runs_concurrentes_desde_una_tui ... ok
+test g7_mediciones_con_dos_runs ... ok
+test g2a_crash_supervisor_aislado ... ok
+test g2b_falla_backend_de_a_en_tui ... ok
+test g3_cancelacion_independiente_y_por_plazo ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.80s
+
+     Running tests/phase1_s0.rs (target/debug/deps/phase1_s0-1603c4c0a18beae4)
+
+running 7 tests
+test s0_starting_y_running_con_supervisor_muerto_se_reconcilian ... ok
+test s0_checkpoint_pendiente_se_recupera_y_el_run_no_se_fabrica ... ok
+test s0_sigkill_mid_turn_reconcilia_duradero_e_idempotente ... ok
+test s0_segundo_thread_y_artefactos_preservados ... ok
+test s0_backend_desconocido_bloquea_reuso_y_no_toca_el_viejo ... ok
+test s0_backend_huerfano_se_termina_antes_de_reusar ... ok
+test s0_supervisor_vivo_no_se_reconcilia ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.06s
+
+     Running tests/phase1_s0_safety.rs (target/debug/deps/phase1_s0_safety-25fe056309a35a1b)
+
+running 6 tests
+test t4_pid_reutilizado_no_recibe_senal ... ok
+test t3_pid_start_cero_no_mata_proceso_ajeno_y_bloquea_reuso ... ok
+test t6_estado_inseguro_no_se_olvida_ni_con_el_pid_muerto ... ok
+test t5_grupo_verificado_se_termina_y_permite_reuso ... ok
+test t1_leader_reapeado_con_hijo_vivo_no_permite_reuso ... ok
+test t2_leader_zombie_con_hijo_vivo_se_termina_o_bloquea ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.71s
+
+     Running tests/phase1_s2.rs (target/debug/deps/phase1_s2-a321e6a8455fa2bb)
+
+running 8 tests
+test s2_lease_de_otro_run_no_se_presenta_como_valido ... ok
+test s2_supervisor_desconocido_y_lease_ausente ... ok
+test s2_run_activo_visible_desde_otro_proceso ... ok
+test s2_dos_runs_activos_en_threads_separados ... ok
+test s2_stale_tras_sigkill_se_reporta_sin_mutaciones ... ok
+test s2_filtro_active_solo_no_resueltos ... ok
+test s2_completados_y_fallidos ... ok
+test s2_lecturas_concurrentes_no_mutan_la_db ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.07s
+
+     Running tests/phase1_s3.rs (target/debug/deps/phase1_s3-da4527f9d7714092)
+
+running 9 tests
+test t3_un_run_por_thread ... ok
+test t8_salida_segura_con_runs_vivos ... ok
+test t2_capacidad_maxima_rechaza_tercero ... ok
+test t9_hermes_real_un_run_por_vez ... ok
+test t1_dos_runs_concurrentes_solapan ... ok
+test t7_navegacion_y_revision_de_snapshots ... ok
+test t6_aislamiento_de_eventos_entre_threads ... ok
+test t4_cancelacion_independiente ... ok
+test t5_slot_no_se_libera_antes_del_ack ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.57s
+
+     Running tests/phase1_s4.rs (target/debug/deps/phase1_s4-a11b0e611cd87327)
+
+running 11 tests
+test s4_lease_liveness_real ... ok
+test s4_lease_vivo_bloquea_borrado_y_rc21 ... ok
+test s4_borrado_preserva_historia ... ok
+test s4_invalid_y_mismatched_no_reutilizables ... ok
+test s4_listado_readonly_y_determinista ... ok
+test s4_lista_workspace_verificado ... ok
+test s4_dos_workspaces_independientes ... ok
+test s4_worktree_ausente_no_es_valido ... ok
+test s4_repo_no_disponible_es_diagnostico ... ok
+test s4_unsafe_bloquea_reuso_y_rm_exige_unsafe_ok ... ok
+test s4_rehidratacion_desde_checkpoint ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.10s
+
+     Running tests/phase1_s4_r1.rs (target/debug/deps/phase1_s4_r1-721b3b9612c91c42)
+
+running 7 tests
+test r2_supervisor_desconocido_se_rechaza ... ok
+test r1_sin_lease_supervisor_vivo_se_rechaza ... ok
+test r7_flujo_de_recuperacion ... ok
+test r6_unsafe_ok_no_pisa_lease ... ok
+test r3_unsafe_ok_permite_borrado_sin_lease_y_preserva_historia ... ok
+test r4_adquisicion_concurrente_gana ... ok
+test r5_borrado_gana_y_el_competidor_recrea ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.87s
+
+     Running tests/phase1_s6_bench.rs (target/debug/deps/phase1_s6_bench-1a68b2cf5c7698ee)
+
+running 3 tests
+test s6r1_canary_dir_refusal_preserves_files ... ok
+test s6r1_benchmark_safety_python_suite ... ok
+test s6r1_unsafe_targets_refused ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/phase2_s1_profiles.rs (target/debug/deps/phase2_s1_profiles-547c1fab6b855212)
+
+running 15 tests
+test t2_create_layout_permissions_metadata ... ok
+test t1_flag_off_refuses_profile_management ... ok
+{
+  "agent_id": "par-a",
+  "auth_checked_ms": null,
+  "auth_status": "unknown",
+  "dir_state": "ok",
+  "disk_kb": 0,
+  "lock_held": false,
+  "lock_state": "free",
+  "registered": true,
+  "removing": false,
+  "thread_ids": [],
+  "warmed_ms": null
+}
+{
+  "agent_id": "par-b",
+  "auth_checked_ms": null,
+  "auth_status": "unknown",
+  "dir_state": "ok",
+  "disk_kb": 0,
+  "lock_held": false,
+  "lock_state": "free",
+  "registered": true,
+  "removing": false,
+  "thread_ids": [],
+  "warmed_ms": null
+}
+{
+  "agent_id": "par-c",
+  "auth_checked_ms": null,
+  "auth_status": "unknown",
+  "dir_state": "ok",
+  "disk_kb": 0,
+  "lock_held": false,
+  "lock_state": "free",
+  "registered": true,
+  "removing": false,
+  "thread_ids": [],
+  "warmed_ms": null
+}
+{
+  "agent_id": "same-a",
+  "auth_checked_ms": null,
+  "auth_status": "unknown",
+  "dir_state": "ok",
+  "disk_kb": 0,
+  "lock_held": false,
+  "lock_state": "free",
+  "registered": true,
+  "removing": false,
+  "thread_ids": [],
+  "warmed_ms": null
+}
+{
+  "agent_id": "same-a",
+  "auth_checked_ms": null,
+  "auth_status": "unknown",
+  "dir_state": "ok",
+  "disk_kb": 0,
+  "lock_held": false,
+  "lock_state": "free",
+  "registered": true,
+  "removing": false,
+  "thread_ids": [],
+  "warmed_ms": null
+}
+test t11_interrupted_ops_reconcile ... ok
+{
+  "agent_id": "same-a",
+  "auth_checked_ms": null,
+  "auth_status": "unknown",
+  "dir_state": "ok",
+  "disk_kb": 0,
+  "lock_held": false,
+  "lock_state": "free",
+  "registered": true,
+  "removing": false,
+  "thread_ids": [],
+  "warmed_ms": null
+}
+test t12_registry_lock_concurrent_ops ... ok
+test t4_list_states_and_orphans ... ok
+test t10_remove_guards ... ok
+test t3_create_idempotent_and_repair ... ok
+test t5_assign_unassign_mapping ... ok
+test t6_status_auth_without_credentials ... ok
+test t7_warm_ok_records_env_and_warmed_ms ... ok
+test t14_runner_profile_env_and_writer_lock ... ok
+test t8_warm_timeout_bounded ... ok
+test t13_runner_fail_closed ... ok
+test t15_flag_off_preserves_certified_behavior ... ok
+test t9_writer_lock_contention_and_release ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.46s
+
+     Running tests/phase2_s1_r1.rs (target/debug/deps/phase2_s1_r1-ecaad958ae11b455)
+
+running 15 tests
+test r1_p1_1c_unreadable_database_denies_removal ... ok
+test r1_p1_1f_partial_crash_removal_is_idempotent ... ok
+test r1_h1_unreadable_lock_is_unknown_and_blocks_removal ... ok
+test r1_p1_1g_missing_database_denies_removal ... ok
+test r1_h2_concurrent_meta_updates_no_lost_update ... ok
+test r1_p1_1d_active_run_blocks_removal ... ok
+test r1_p1_1a_unresolved_run_blocks_removal_even_with_clear_threads ... ok
+test r1_p1_1b_unassign_during_unresolved_run_denied ... ok
+test r1_h4_flag_on_full_run_with_managed_profile ... ok
+test r1_p1_1e_terminal_run_allows_explicit_removal ... ok
+test r1_p1_2_auth_matrix_never_false_positive ... ok
+test r1_p1_2_runner_admission_rejects_exit1_positive_text ... ok
+test r1_p1_4_surviving_writer_after_supervisor_sigkill ... ok
+test r1_p1_3_noncooperative_child_is_terminated ... ok
+test r1_p1_3_warm_strict_initialize_matrix ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.43s
+
+     Running tests/phase2_s1_r2.rs (target/debug/deps/phase2_s1_r2-81c2cf034c55fdf8)
+
+running 41 tests
+test r2_h4_interrupted_v4_ddl_is_idempotent ... ok
+test r2_h3_remove_honors_live_and_corrupt_owner_records ... ok
+test r2_h2_owner_write_failure_aborts_spawn ... ok
+test r2_h5_partial_removal_is_idempotent_and_resumable ... ok
+test r2_h4_concurrent_migration_is_serialized ... ok
+test r2_h5_removing_profile_cannot_be_recreated_or_reassigned ... ok
+test r2_h5_partial_removal_resumes_after_owner_recovery ... ok
+test r2_p1b_corrupt_registry_is_fail_closed ... ok
+test r2_h2_escaped_grandchild_is_not_reported_clean ... ok
+test r2_h7_warm_requires_agent_capabilities ... ok
+test r2_p1b_missing_registry_blocks_destructive_removal ... ok
+test r2_p1d_agents_json_symlink_is_rejected ... ok
+test r2_p1b_legacy_null_run_blocks_profile_deletion ... ok
+test r2_p1d_meta_lock_symlink_is_rejected ... ok
+test r2_p1a_profile_deletion_during_admission_is_blocked ... ok
+test r2_p1d_owner_symlink_is_rejected ... ok
+test r2_h6_run_list_and_exports_include_profile ... ok
+test r2_p1d_registry_lock_symlink_is_rejected ... ok
+test r2_p1d_symlinked_metadata_is_rejected ... ok
+test r2_p1d_symlinked_lock_files_are_rejected ... ok
+test r2_p1d_symlinked_home_and_san_home_are_rejected ... ok
+test r2_p1d_symlinked_root_is_rejected ... ok
+test r2_p1c_flag_off_recovery_does_not_kill_managed_survivor ... ok
+test r2_p3_disk_kb_does_not_follow_symlinks ... ok
+test r2_p1d_lock_inode_replacement_is_detected ... ok
+test r2_p1e_truncated_or_contradictory_auth_is_unknown ... ok
+test r2_p1a_reassignment_during_final_mapping_check_is_consistent ... ok
+test r3_p1_2_sigkill_after_tombstone_removal_resumes ... ok
+test r2_p1e_descendant_holding_stdout_cannot_extend_auth_timeout ... ok
+test r3_p1_1_successful_auth_descendant_cannot_retain_writer_lock ... ok
+test r2_p1a_reassignment_during_slow_auth_fails_closed ... ok
+test r3_p1_2_tombstone_blocks_run_and_warm ... ok
+test r3_p2_1_reused_supervisor_pid_is_stale ... ok
+test r3_p2_1_escaped_backend_prevents_owner_cleanup ... ok
+test r3_p1_1_malformed_auth_descendant_cannot_retain_writer_lock ... ok
+test r3_p1_1_timed_out_auth_descendant_cannot_retain_writer_lock ... ok
+test r3_p2_1_owner_clear_failure_is_not_reported_as_clean ... ok
+test r3_p2_2_backend_owner_write_failure_aborts_run ... ok
+test r2_h1_h7_managed_runs_require_strict_initialize ... ok
+test r3_p1_2_tombstone_during_slow_auth_rejects_admission ... ok
+test r3_p2_1_long_lived_supervisor_owner_is_cleared_after_run ... ok
+
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.68s
+
+     Running tests/rc2_1_lease_fence.rs (target/debug/deps/rc2_1_lease_fence-d5d6263287c1bcf5)
+
+running 4 tests
+test b_force_release_con_heartbeat_vencido_y_dueno_vivo_se_rechaza ... ok
+test c_recuperacion_de_dueno_muerto_verificado ... ok
+test a_force_release_con_dueno_vivo_se_rechaza ... ok
+test d_dueno_obsoleto_no_publica_ready_ni_completa ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.05s
+
+     Running tests/rc2_a5.rs (target/debug/deps/rc2_a5-e15615c3958370b6)
+
+running 4 tests
+test a5_submodulo_no_inicializado_sin_escrituras_captura_lo_soportado ... ok
+test a5_escritura_bajo_submodulo_no_inicializado_se_rechaza ... ok
+test a5_edicion_mixta_con_escritura_bajo_gitlink_se_rechaza_completa ... ok
+test a5_submodulo_inicializado_modificado_sigue_rechazandose ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.31s
+
+     Running tests/rc2_b1.rs (target/debug/deps/rc2_b1-ae8851747a4a44c2)
+
+running 3 tests
+test b1_configuracion_extrema_no_paniquea ... ok
+test b1_frame_individual_mayor_que_el_budget_transita_solo ... ok
+test b1_cota_de_bytes_en_vuelo_con_consumidor_lento ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+
+     Running tests/rc2_b5.rs (target/debug/deps/rc2_b5-8affc317aaf3fb0f)
+
+running 6 tests
+test b5_rm_bloqueado_con_ttl_vencido_y_dueno_vivo ... ok
+test b5_perdida_de_lease_aborta_al_dueno_sin_reportar_completitud ... ok
+test b5_dueno_muerto_recupera_sin_autorizar_dos_escritores ... ok
+test b5_pid_reusado_no_habilita_toma_de_control ... ok
+test b5_suspension_con_ttl_corto_sigue_bloqueando_y_luego_libera ... ok
+test b5_ttl_vencido_con_dueno_vivo_no_transfiere_ownership ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.07s
+
+     Running tests/test_a_retention.rs (target/debug/deps/test_a_retention-bc5200b17e1e3a34)
+
+running 2 tests
+test test_a_retencion_de_la_revision_comentada ... ok
+test test_a_bis_el_comentario_sobrevive_a_mas_ediciones ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+
+     Running tests/test_b_crash.rs (target/debug/deps/test_b_crash-379d6af9f83b2ce4)
+
+running 2 tests
+test crash_externo_con_sigkill_desde_afuera ... ok
+test crash_en_cada_frontera_se_recupera_o_reporta ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.49s
+
+     Running tests/wave_a.rs (target/debug/deps/wave_a-39b44cc9affbcfd5)
+
+running 16 tests
+test a1_cas_idempotente_si_otro_ya_integró_lo_mismo ... ok
+test a1_cas_rechaza_avance_concurrente_y_preserva_el_commit_ajeno ... ok
+test a2_pedido_no_persistido_no_autoriza ... ok
+test a2_camino_feliz_registra_decision_y_transmision ... ok
+test a2_decision_no_persistida_no_autoriza ... ok
+test a3_resume_con_load_fallido_cae_a_sesion_nueva_y_lo_registra ... ok
+test a3_resume_usa_el_id_previo_y_lo_registra ... ok
+test a4_persistencia_de_delivered_fallida_no_marca_entrega ... ok
+test a4_conexion_perdida_no_entrega_feedback ... ok
+test a4_updates_de_setup_no_entregan_feedback ... ok
+test a5_estados_soportados_se_capturan_y_los_ignorados_no ... ok
+test a4_reintento_tras_fallo_entrega_de_verdad ... ok
+test a6_validacion_usa_checkout_aislado_del_snapshot ... ok
+test b7_hash_cubre_todos_los_bytes_no_solo_la_cola ... ok
+test a6_modificacion_concurrente_del_worktree_no_afecta_la_validacion ... ok
+test a5_submodulo_modificado_se_rechaza_explicitamente ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.45s
+
+     Running tests/wave_b.rs (target/debug/deps/wave_b-7740f4966d3f38b1)
+
+running 12 tests
+test b3_creacion_concurrente_del_mismo_oid_es_idempotente ... ok
+test b3_creacion_concurrente_de_otro_oid_es_conflicto ... ok
+[
+  {
+    "action": "run_interrupted",
+    "backend": "backend muerto (pid 992798)",
+    "run_id": "c03653bd1f6e4306ac8e8cb7fb5f05d6",
+    "supervisor": "supervisor muerto (pid 992772)",
+    "thread_id": "de656396d9a54cb882d2841d15b5a5b5",
+    "unsafe_state": false,
+    "workspace_id": "6a139f7d1dd84fb68b8aae969131f6ee"
+  },
+  {
+    "action": "completed_ready",
+    "ref_recreated": true,
+    "snapshot_id": "9341ab941d4e4992994ba4811b51bdbb"
+  }
+]
+[
+  {
+    "action": "run_already_resolved",
+    "run_id": "c03653bd1f6e4306ac8e8cb7fb5f05d6",
+    "thread_id": "de656396d9a54cb882d2841d15b5a5b5"
+  },
+  {
+    "action": "already_resolved",
+    "snapshot_id": "9341ab941d4e4992994ba4811b51bdbb"
+  }
+]
+test b3_recuperacion_concurrente_no_duplica_ready ... ok
+test b1_linea_gigante_se_rechaza_antes_de_acumularla ... ok
+test b1_presupuesto_del_turno_es_acumulado ... ok
+test b2_patch_demasiado_grande_se_rechaza_explicitamente ... ok
+test b2_comentarios_paginados_sin_cargar_patches ... ok
+test b4_crash_antes_del_cas_deja_intento_abandonado_no_fabricado ... ok
+test b4_crash_despues_del_cas_se_reconcilia_con_evidencia ... ok
+test b5_run_concurrente_y_borrado_bloqueados_por_lease ... ok
+test b5_lease_de_dueno_muerto_se_toma_y_se_registra ... ok
+test b6_backend_que_ignora_la_cancelacion_termina_por_plazo ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.13s
+
+   Doc-tests aeril
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

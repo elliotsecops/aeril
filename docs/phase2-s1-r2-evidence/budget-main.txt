@@ -1,0 +1,117 @@
+binario: 5825424 bytes (5.8 MB) · límite 30 MB (decimal)
+budget-size: PASS
+--- ldd target/release/aeril ---
+	linux-vdso.so.1 (0x00007495c8a8d000)
+	libz.so.1 => /usr/lib/x86_64-linux-gnu/libz.so.1 (0x00007495c8a4a000)
+	libgcc_s.so.1 => /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 (0x00007495c8a1c000)
+	libm.so.6 => /usr/lib/x86_64-linux-gnu/libm.so.6 (0x00007495c82da000)
+	libc.so.6 => /usr/lib/x86_64-linux-gnu/libc.so.6 (0x00007495c8000000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007495c8a8f000)
+----------------
+budget-deps: PASS (solo ABI base del OS + zlib del sistema)
+{
+  "db_bytes": 336535552,
+  "dir": "bench-data/bench",
+  "elapsed_ms": 8792,
+  "events": 100000,
+  "threads": 100
+}
+{
+  "measurement": "arranque → entrada procesada que ABRE un thread (timeline + comentarios), externo, pty",
+  "build_profile": "release (lto=thin, strip=symbols, codegen-units=1)",
+  "dataset": "fixtures sintéticas del perfil v0.4 (100×1000×10, con comentarios)",
+  "cache_condition": "warm page cache del host (no se vació la caché del SO)",
+  "method": "spawn externo + beacons internos; p95 sobre muestras externas; n_fail debe ser 0",
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu": "Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz",
+    "ram_gb": 15.4,
+    "storage": "/dev/nvme0n1p5",
+    "storage_fstype": "ext4"
+  },
+  "n_ok": 0,
+  "n_fail": 0,
+  "failures": [],
+  "samples_ms": [],
+  "mem_run_ms_informativo": 5011.01,
+  "p50_ms": null,
+  "p95_ms": null,
+  "max_ms": null,
+  "min_ms": null,
+  "rss_idle_kb": 7552,
+  "rss_idle_mb": 7.4,
+  "rss_thread_open_kb": 8348,
+  "rss_thread_open_mb": 8.2,
+  "per_thread_delta_mib": 0.78,
+  "budget_startup_ms": 300.0,
+  "budget_rss_mb": 50.0,
+  "budget_delta_mib": 10.0,
+  "startup_verdict": "N/A (modo RSS: mide idle vs thread abierto)",
+  "rss_verdict": "PASS",
+  "delta_verdict": "PASS"
+}
+{
+  "measurement": "arranque → entrada procesada que ABRE un thread (timeline + comentarios), externo, pty",
+  "build_profile": "release (lto=thin, strip=symbols, codegen-units=1)",
+  "dataset": "fixtures sintéticas del perfil v0.4 (100×1000×10, con comentarios)",
+  "cache_condition": "warm page cache del host (no se vació la caché del SO)",
+  "method": "spawn externo + beacons internos; p95 sobre muestras externas; n_fail debe ser 0",
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu": "Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz",
+    "ram_gb": 15.4,
+    "storage": "/dev/nvme0n1p5",
+    "storage_fstype": "ext4"
+  },
+  "n_ok": 30,
+  "n_fail": 0,
+  "failures": [],
+  "samples_ms": [
+    9.0,
+    9.04,
+    9.17,
+    9.25,
+    9.27,
+    9.37,
+    9.38,
+    9.4,
+    9.4,
+    9.4,
+    9.42,
+    9.53,
+    9.63,
+    9.67,
+    9.69,
+    9.77,
+    9.81,
+    9.9,
+    10.04,
+    10.08,
+    10.22,
+    10.36,
+    10.46,
+    10.51,
+    10.52,
+    10.66,
+    10.82,
+    13.6,
+    15.28,
+    15.34
+  ],
+  "mem_run_ms_informativo": null,
+  "p50_ms": 9.73,
+  "p95_ms": 15.28,
+  "max_ms": 15.34,
+  "min_ms": 9.0,
+  "rss_idle_kb": null,
+  "rss_idle_mb": null,
+  "rss_thread_open_kb": null,
+  "rss_thread_open_mb": null,
+  "per_thread_delta_mib": null,
+  "budget_startup_ms": 300.0,
+  "budget_rss_mb": 50.0,
+  "budget_delta_mib": 10.0,
+  "startup_verdict": "PASS"
+}

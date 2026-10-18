@@ -1,0 +1,74 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running tests/phase2_s1_r2.rs (target/debug/deps/phase2_s1_r2-81c2cf034c55fdf8)
+
+running 12 tests
+test r2_p1a_profile_deletion_during_admission_is_blocked ... ok
+test r2_p1a_reassignment_during_final_mapping_check_is_consistent ...
+thread 'r2_p1a_reassignment_during_final_mapping_check_is_consistent' (3627971) panicked at tests/phase2_s1_r2.rs:348:5:
+assertion `left == right` failed: run profile and registry diverged; run status=exit status: 0 stderr= reassign_rc=exit status: 0
+  left: Some("a")
+ right: Some("b")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test r2_p1b_corrupt_registry_is_fail_closed ... ok
+test r2_p1b_legacy_null_run_blocks_profile_deletion ...
+thread 'r2_p1b_legacy_null_run_blocks_profile_deletion' (3628208) panicked at tests/phase2_s1_r2.rs:461:5:
+legacy fake backend did not reach the turn
+FAILED
+test r2_p1b_missing_registry_blocks_destructive_removal ...
+thread 'r2_p1b_missing_registry_blocks_destructive_removal' (3630788) panicked at tests/phase2_s1_r2.rs:88:9:
+aeril ["profile", "remove", "--agent", "a", "--confirm", "--clear-threads"] debía fallar y salió 0:
+stdout: {
+  "agent_id": "a",
+  "removed": true
+}
+
+FAILED
+test r2_p1c_flag_off_recovery_does_not_kill_managed_survivor ...
+thread 'r2_p1c_flag_off_recovery_does_not_kill_managed_survivor' (3630805) panicked at tests/phase2_s1_r2.rs:539:5:
+flag-OFF recovery killed a managed survivor
+FAILED
+test r2_p1d_symlinked_home_and_san_home_are_rejected ...
+thread 'r2_p1d_symlinked_home_and_san_home_are_rejected' (3630913) panicked at tests/phase2_s1_r2.rs:571:5:
+symlinked home was accepted
+FAILED
+test r2_p1d_symlinked_lock_files_are_rejected ...
+thread 'r2_p1d_symlinked_lock_files_are_rejected' (3630935) panicked at tests/phase2_s1_r2.rs:602:64:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+FAILED
+test r2_p1d_symlinked_metadata_is_rejected ...
+thread 'r2_p1d_symlinked_metadata_is_rejected' (3630948) panicked at tests/phase2_s1_r2.rs:622:5:
+symlinked profile.json was accepted
+FAILED
+test r2_p1d_symlinked_root_is_rejected ...
+thread 'r2_p1d_symlinked_root_is_rejected' (3630971) panicked at tests/phase2_s1_r2.rs:556:5:
+symlinked root was accepted
+FAILED
+test r2_p1e_descendant_holding_stdout_cannot_extend_auth_timeout ...
+thread 'r2_p1e_descendant_holding_stdout_cannot_extend_auth_timeout' (3630984) panicked at tests/phase2_s1_r2.rs:682:9:
+auth probe hung on a descendant-held stdout
+FAILED
+test r2_p1e_truncated_or_contradictory_auth_is_unknown ...
+thread 'r2_p1e_truncated_or_contradictory_auth_is_unknown' (3632006) panicked at tests/phase2_s1_r2.rs:649:9:
+assertion `left != right` failed: mode stderr-contradictory produced a false positive
+  left: String("logged_in")
+ right: "logged_in"
+FAILED
+
+failures:
+
+failures:
+    r2_p1a_reassignment_during_final_mapping_check_is_consistent
+    r2_p1b_legacy_null_run_blocks_profile_deletion
+    r2_p1b_missing_registry_blocks_destructive_removal
+    r2_p1c_flag_off_recovery_does_not_kill_managed_survivor
+    r2_p1d_symlinked_home_and_san_home_are_rejected
+    r2_p1d_symlinked_lock_files_are_rejected
+    r2_p1d_symlinked_metadata_is_rejected
+    r2_p1d_symlinked_root_is_rejected
+    r2_p1e_descendant_holding_stdout_cannot_extend_auth_timeout
+    r2_p1e_truncated_or_contradictory_auth_is_unknown
+
+test result: FAILED. 2 passed; 10 failed; 0 ignored; 0 measured; 0 filtered out; finished in 64.16s
+
+error: test failed, to rerun pass `--test phase2_s1_r2`
