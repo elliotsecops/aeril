@@ -1,20 +1,28 @@
    Compiling aeril v0.1.0 (/home/elliot/aeril-phase0)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.79s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.06s
      Running tests/phase2_s1_r2.rs (target/debug/deps/phase2_s1_r2-81c2cf034c55fdf8)
 
-running 29 tests
+running 30 tests
+test r2_h1_h7_managed_runs_require_strict_initialize ... ok
+test r2_h2_escaped_grandchild_is_not_reported_clean ... ok
+test r2_h2_owner_write_failure_aborts_spawn ... ok
+test r2_h3_remove_honors_live_and_corrupt_owner_records ... ok
+test r2_h4_concurrent_migration_is_serialized ... ok
 test r2_h4_interrupted_v4_ddl_is_idempotent ... ok
 test r2_h5_partial_removal_is_idempotent_and_resumable ... ok
-test r2_h3_remove_honors_live_and_corrupt_owner_records ... ok
 test r2_h5_partial_removal_resumes_after_owner_recovery ... ok
-test r2_h4_concurrent_migration_is_serialized ... ok
 test r2_h5_removing_profile_cannot_be_recreated_or_reassigned ... ok
-test r2_h2_owner_write_failure_aborts_spawn ... ok
-test r2_p1b_corrupt_registry_is_fail_closed ... ok
-test r2_h2_escaped_grandchild_is_not_reported_clean ... ok
+test r2_h6_run_list_and_exports_include_profile ... ok
 test r2_h7_warm_requires_agent_capabilities ... ok
+test r2_p1a_profile_deletion_during_admission_is_blocked ... ok
+test r2_p1a_reassignment_during_final_mapping_check_is_consistent ... ok
+test r2_p1a_reassignment_during_slow_auth_fails_closed ... ok
+test r2_p1b_corrupt_registry_is_fail_closed ... ok
+test r2_p1b_legacy_null_run_blocks_profile_deletion ... ok
 test r2_p1b_missing_registry_blocks_destructive_removal ... ok
+test r2_p1c_flag_off_recovery_does_not_kill_managed_survivor ... ok
 test r2_p1d_agents_json_symlink_is_rejected ... ok
+test r2_p1d_lock_inode_replacement_is_detected ... ok
 test r2_p1d_meta_lock_symlink_is_rejected ... ok
 test r2_p1d_owner_symlink_is_rejected ... ok
 test r2_p1d_registry_lock_symlink_is_rejected ... ok
@@ -22,15 +30,8 @@ test r2_p1d_symlinked_home_and_san_home_are_rejected ... ok
 test r2_p1d_symlinked_lock_files_are_rejected ... ok
 test r2_p1d_symlinked_metadata_is_rejected ... ok
 test r2_p1d_symlinked_root_is_rejected ... ok
-test r2_p1b_legacy_null_run_blocks_profile_deletion ... ok
+test r2_p1e_descendant_holding_stdout_cannot_extend_auth_timeout ... ok
 test r2_p1e_truncated_or_contradictory_auth_is_unknown ... ok
 test r2_p3_disk_kb_does_not_follow_symlinks ... ok
-test r2_p1c_flag_off_recovery_does_not_kill_managed_survivor ... ok
-test r2_h6_run_list_and_exports_include_profile ... ok
-test r2_p1a_profile_deletion_during_admission_is_blocked ... ok
-test r2_p1a_reassignment_during_final_mapping_check_is_consistent ... ok
-test r2_p1e_descendant_holding_stdout_cannot_extend_auth_timeout ... ok
-test r2_p1a_reassignment_during_slow_auth_fails_closed ... ok
-test r2_h1_h7_managed_runs_require_strict_initialize ... ok
 
-test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.22s
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.28s

@@ -167,8 +167,10 @@ impl Runner {
         // profile cannot be deleted while an admission is in flight. The
         // registry lock closes the final mapping-check-to-run-insert window.
         let lock = crate::profile::ProfileLock::acquire(&self.data_dir, &agent)?;
+        lock.verify_inode(&self.data_dir, &agent)?;
         lock.make_inheritable()?;
         crate::profile::verify_no_survivor(&self.data_dir, &agent)?;
+        lock.record_admission_owner(&self.data_dir, &agent)?;
         let status = crate::profile::auth_status(&self.data_dir, &agent)?;
         if status != "logged_in" {
             return Err(Error::backend(format!(
@@ -183,6 +185,7 @@ impl Runner {
             )));
         }
         admission_barrier();
+        lock.verify_inode(&self.data_dir, &agent)?;
         // Binario absoluto: el spawn usa env_clear + PATH sanitizado, así que
         // la resolución por PATH debe quedar fijada acá.
         spec.program = crate::profile::hermes_bin()?.to_string_lossy().into_owned();

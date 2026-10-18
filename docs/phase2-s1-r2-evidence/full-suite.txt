@@ -1,22 +1,22 @@
    Compiling aeril v0.1.0 (/home/elliot/aeril-phase0)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.85s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.02s
      Running unittests src/lib.rs (target/debug/deps/aeril-1bda2ddbe4026a5b)
 
 running 14 tests
 test git::diff::tests::hunk_range ... ok
-test profile::tests::auth_classifier_adversarial_matrix ... ok
 test profile::tests::agent_id_validation ... ok
+test profile::tests::enabled_flag_parsing ... ok
+test profile::tests::auth_classifier_adversarial_matrix ... ok
 test profile::tests::mountinfo_fault_injection ... ok
 test profile::tests::init_validator_adversarial_matrix ... ok
-test profile::tests::enabled_flag_parsing ... ok
 test timeutil::tests::iso_epoch ... ok
 test util::tests::fnv_estable ... ok
-test profile::tests::registry_roundtrip ... ok
 test profile::tests::atomic_write_concurrent_unique_tmp ... ok
+test profile::tests::registry_roundtrip ... ok
 test profile::tests::proc_scan_fault_injection ... ok
+test store::tests::fk_habilitadas_y_esquema ... ok
 test profile::tests::non_terminal_run_guard_covers_starting_and_running ... ok
 test store::tests::migracion_v2_a_v3_conserva_datos ... ok
-test store::tests::fk_habilitadas_y_esquema ... ok
 
 test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
@@ -34,7 +34,7 @@ test flujo_agente_registra_eventos_normalizados_y_permisos ... ok
 test feedback_sin_backend_sano_no_se_declara_entregado ... ok
 test feedback_entregado_con_ack_y_nuevo_checkpoint ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
 
      Running tests/edge_cases.rs (target/debug/deps/edge_cases-c437b7d1005a4efa)
 
@@ -61,7 +61,7 @@ test g2a_crash_supervisor_aislado ... ok
 test g2b_falla_backend_de_a_en_tui ... ok
 test g3_cancelacion_independiente_y_por_plazo ... ok
 
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.82s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.80s
 
      Running tests/phase1_s0.rs (target/debug/deps/phase1_s0-1603c4c0a18beae4)
 
@@ -86,13 +86,13 @@ test t5_grupo_verificado_se_termina_y_permite_reuso ... ok
 test t1_leader_reapeado_con_hijo_vivo_no_permite_reuso ... ok
 test t2_leader_zombie_con_hijo_vivo_se_termina_o_bloquea ... ok
 
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.70s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.71s
 
      Running tests/phase1_s2.rs (target/debug/deps/phase1_s2-a321e6a8455fa2bb)
 
 running 8 tests
-test s2_lease_de_otro_run_no_se_presenta_como_valido ... ok
 test s2_supervisor_desconocido_y_lease_ausente ... ok
+test s2_lease_de_otro_run_no_se_presenta_como_valido ... ok
 test s2_run_activo_visible_desde_otro_proceso ... ok
 test s2_dos_runs_activos_en_threads_separados ... ok
 test s2_stale_tras_sigkill_se_reporta_sin_mutaciones ... ok
@@ -123,16 +123,16 @@ running 11 tests
 test s4_lease_liveness_real ... ok
 test s4_lease_vivo_bloquea_borrado_y_rc21 ... ok
 test s4_borrado_preserva_historia ... ok
-test s4_dos_workspaces_independientes ... ok
 test s4_invalid_y_mismatched_no_reutilizables ... ok
-test s4_lista_workspace_verificado ... ok
 test s4_listado_readonly_y_determinista ... ok
+test s4_dos_workspaces_independientes ... ok
+test s4_lista_workspace_verificado ... ok
 test s4_worktree_ausente_no_es_valido ... ok
 test s4_repo_no_disponible_es_diagnostico ... ok
 test s4_unsafe_bloquea_reuso_y_rm_exige_unsafe_ok ... ok
 test s4_rehidratacion_desde_checkpoint ... ok
 
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.12s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.16s
 
      Running tests/phase1_s4_r1.rs (target/debug/deps/phase1_s4_r1-721b3b9612c91c42)
 
@@ -154,15 +154,14 @@ test s6r1_canary_dir_refusal_preserves_files ... ok
 test s6r1_benchmark_safety_python_suite ... ok
 test s6r1_unsafe_targets_refused ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
 
      Running tests/phase2_s1_profiles.rs (target/debug/deps/phase2_s1_profiles-547c1fab6b855212)
 
 running 15 tests
 test t1_flag_off_refuses_profile_management ... ok
-test t2_create_layout_permissions_metadata ... ok
 {
-  "agent_id": "par-c",
+  "agent_id": "par-a",
   "auth_checked_ms": null,
   "auth_status": "unknown",
   "dir_state": "ok",
@@ -170,6 +169,7 @@ test t2_create_layout_permissions_metadata ... ok
   "lock_held": false,
   "lock_state": "free",
   "registered": true,
+  "removing": false,
   "thread_ids": [],
   "warmed_ms": null
 }
@@ -182,11 +182,13 @@ test t2_create_layout_permissions_metadata ... ok
   "lock_held": false,
   "lock_state": "free",
   "registered": true,
+  "removing": false,
   "thread_ids": [],
   "warmed_ms": null
 }
+test t2_create_layout_permissions_metadata ... ok
 {
-  "agent_id": "par-a",
+  "agent_id": "par-c",
   "auth_checked_ms": null,
   "auth_status": "unknown",
   "dir_state": "ok",
@@ -194,18 +196,7 @@ test t2_create_layout_permissions_metadata ... ok
   "lock_held": false,
   "lock_state": "free",
   "registered": true,
-  "thread_ids": [],
-  "warmed_ms": null
-}
-{
-  "agent_id": "same-a",
-  "auth_checked_ms": null,
-  "auth_status": "unknown",
-  "dir_state": "ok",
-  "disk_kb": 0,
-  "lock_held": false,
-  "lock_state": "free",
-  "registered": true,
+  "removing": false,
   "thread_ids": [],
   "warmed_ms": null
 }
@@ -218,6 +209,7 @@ test t2_create_layout_permissions_metadata ... ok
   "lock_held": false,
   "lock_state": "free",
   "registered": true,
+  "removing": false,
   "thread_ids": [],
   "warmed_ms": null
 }
@@ -230,12 +222,26 @@ test t2_create_layout_permissions_metadata ... ok
   "lock_held": false,
   "lock_state": "free",
   "registered": true,
+  "removing": false,
+  "thread_ids": [],
+  "warmed_ms": null
+}
+{
+  "agent_id": "same-a",
+  "auth_checked_ms": null,
+  "auth_status": "unknown",
+  "dir_state": "ok",
+  "disk_kb": 0,
+  "lock_held": false,
+  "lock_state": "free",
+  "registered": true,
+  "removing": false,
   "thread_ids": [],
   "warmed_ms": null
 }
 test t12_registry_lock_concurrent_ops ... ok
-test t4_list_states_and_orphans ... ok
 test t11_interrupted_ops_reconcile ... ok
+test t4_list_states_and_orphans ... ok
 test t10_remove_guards ... ok
 test t3_create_idempotent_and_repair ... ok
 test t5_assign_unassign_mapping ... ok
@@ -243,67 +249,68 @@ test t7_warm_ok_records_env_and_warmed_ms ... ok
 test t6_status_auth_without_credentials ... ok
 test t14_runner_profile_env_and_writer_lock ... ok
 test t8_warm_timeout_bounded ... ok
-test t15_flag_off_preserves_certified_behavior ... ok
 test t13_runner_fail_closed ... ok
+test t15_flag_off_preserves_certified_behavior ... ok
 test t9_writer_lock_contention_and_release ... ok
 
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.44s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.43s
 
      Running tests/phase2_s1_r1.rs (target/debug/deps/phase2_s1_r1-ecaad958ae11b455)
 
 running 15 tests
 test r1_p1_1c_unreadable_database_denies_removal ... ok
 test r1_p1_1f_partial_crash_removal_is_idempotent ... ok
+test r1_h2_concurrent_meta_updates_no_lost_update ... ok
 test r1_h1_unreadable_lock_is_unknown_and_blocks_removal ... ok
 test r1_p1_1g_missing_database_denies_removal ... ok
-test r1_h2_concurrent_meta_updates_no_lost_update ... ok
 test r1_p1_1d_active_run_blocks_removal ... ok
-test r1_p1_1b_unassign_during_unresolved_run_denied ... ok
 test r1_p1_1a_unresolved_run_blocks_removal_even_with_clear_threads ... ok
+test r1_p1_1b_unassign_during_unresolved_run_denied ... ok
 test r1_p1_2_auth_matrix_never_false_positive ... ok
-test r1_h4_flag_on_full_run_with_managed_profile ... ok
 test r1_p1_1e_terminal_run_allows_explicit_removal ... ok
+test r1_h4_flag_on_full_run_with_managed_profile ... ok
 test r1_p1_2_runner_admission_rejects_exit1_positive_text ... ok
 test r1_p1_4_surviving_writer_after_supervisor_sigkill ... ok
 test r1_p1_3_noncooperative_child_is_terminated ... ok
 test r1_p1_3_warm_strict_initialize_matrix ... ok
 
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.23s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.32s
 
      Running tests/phase2_s1_r2.rs (target/debug/deps/phase2_s1_r2-81c2cf034c55fdf8)
 
-running 29 tests
-test r2_h4_concurrent_migration_is_serialized ... ok
+running 30 tests
 test r2_h4_interrupted_v4_ddl_is_idempotent ... ok
 test r2_h5_partial_removal_is_idempotent_and_resumable ... ok
+test r2_h4_concurrent_migration_is_serialized ... ok
 test r2_h3_remove_honors_live_and_corrupt_owner_records ... ok
-test r2_h5_removing_profile_cannot_be_recreated_or_reassigned ... ok
 test r2_h5_partial_removal_resumes_after_owner_recovery ... ok
+test r2_h5_removing_profile_cannot_be_recreated_or_reassigned ... ok
 test r2_h2_owner_write_failure_aborts_spawn ... ok
-test r2_h2_escaped_grandchild_is_not_reported_clean ... ok
 test r2_p1b_corrupt_registry_is_fail_closed ... ok
-test r2_p1b_missing_registry_blocks_destructive_removal ... ok
+test r2_h2_escaped_grandchild_is_not_reported_clean ... ok
 test r2_h7_warm_requires_agent_capabilities ... ok
+test r2_p1b_missing_registry_blocks_destructive_removal ... ok
 test r2_p1d_agents_json_symlink_is_rejected ... ok
+test r2_p1b_legacy_null_run_blocks_profile_deletion ... ok
 test r2_p1d_meta_lock_symlink_is_rejected ... ok
 test r2_p1d_owner_symlink_is_rejected ... ok
 test r2_p1d_registry_lock_symlink_is_rejected ... ok
 test r2_p1d_symlinked_home_and_san_home_are_rejected ... ok
 test r2_p1d_symlinked_lock_files_are_rejected ... ok
-test r2_p1d_symlinked_metadata_is_rejected ... ok
-test r2_p1d_symlinked_root_is_rejected ... ok
-test r2_p1b_legacy_null_run_blocks_profile_deletion ... ok
 test r2_p1c_flag_off_recovery_does_not_kill_managed_survivor ... ok
+test r2_p1d_symlinked_root_is_rejected ... ok
+test r2_p1d_symlinked_metadata_is_rejected ... ok
 test r2_p1e_truncated_or_contradictory_auth_is_unknown ... ok
 test r2_p3_disk_kb_does_not_follow_symlinks ... ok
+test r2_p1a_profile_deletion_during_admission_is_blocked ... ok
 test r2_h6_run_list_and_exports_include_profile ... ok
 test r2_p1a_reassignment_during_final_mapping_check_is_consistent ... ok
-test r2_p1a_profile_deletion_during_admission_is_blocked ... ok
+test r2_p1d_lock_inode_replacement_is_detected ... ok
 test r2_p1e_descendant_holding_stdout_cannot_extend_auth_timeout ... ok
 test r2_p1a_reassignment_during_slow_auth_fails_closed ... ok
 test r2_h1_h7_managed_runs_require_strict_initialize ... ok
 
-test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.24s
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.24s
 
      Running tests/rc2_1_lease_fence.rs (target/debug/deps/rc2_1_lease_fence-d5d6263287c1bcf5)
 
@@ -318,12 +325,12 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
      Running tests/rc2_a5.rs (target/debug/deps/rc2_a5-e15615c3958370b6)
 
 running 4 tests
-test a5_edicion_mixta_con_escritura_bajo_gitlink_se_rechaza_completa ... ok
 test a5_submodulo_no_inicializado_sin_escrituras_captura_lo_soportado ... ok
+test a5_edicion_mixta_con_escritura_bajo_gitlink_se_rechaza_completa ... ok
 test a5_escritura_bajo_submodulo_no_inicializado_se_rechaza ... ok
 test a5_submodulo_inicializado_modificado_sigue_rechazandose ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.20s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.26s
 
      Running tests/rc2_b1.rs (target/debug/deps/rc2_b1-ae8851747a4a44c2)
 
@@ -360,29 +367,29 @@ running 2 tests
 test crash_externo_con_sigkill_desde_afuera ... ok
 test crash_en_cada_frontera_se_recupera_o_reporta ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.29s
 
      Running tests/wave_a.rs (target/debug/deps/wave_a-39b44cc9affbcfd5)
 
 running 16 tests
 test a1_cas_idempotente_si_otro_ya_integró_lo_mismo ... ok
 test a1_cas_rechaza_avance_concurrente_y_preserva_el_commit_ajeno ... ok
-test a2_camino_feliz_registra_decision_y_transmision ... ok
-test a2_pedido_no_persistido_no_autoriza ... ok
 test a2_decision_no_persistida_no_autoriza ... ok
+test a2_pedido_no_persistido_no_autoriza ... ok
+test a2_camino_feliz_registra_decision_y_transmision ... ok
 test a3_resume_con_load_fallido_cae_a_sesion_nueva_y_lo_registra ... ok
 test a3_resume_usa_el_id_previo_y_lo_registra ... ok
 test a4_persistencia_de_delivered_fallida_no_marca_entrega ... ok
 test a4_conexion_perdida_no_entrega_feedback ... ok
 test a4_updates_de_setup_no_entregan_feedback ... ok
 test a5_estados_soportados_se_capturan_y_los_ignorados_no ... ok
-test a6_validacion_usa_checkout_aislado_del_snapshot ... ok
 test a4_reintento_tras_fallo_entrega_de_verdad ... ok
+test a6_validacion_usa_checkout_aislado_del_snapshot ... ok
 test b7_hash_cubre_todos_los_bytes_no_solo_la_cola ... ok
 test a6_modificacion_concurrente_del_worktree_no_afecta_la_validacion ... ok
 test a5_submodulo_modificado_se_rechaza_explicitamente ... ok
 
-test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.27s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.29s
 
      Running tests/wave_b.rs (target/debug/deps/wave_b-7740f4966d3f38b1)
 
@@ -392,32 +399,32 @@ test b3_creacion_concurrente_de_otro_oid_es_conflicto ... ok
 [
   {
     "action": "run_interrupted",
-    "backend": "backend muerto (pid 3937492)",
-    "run_id": "6f9d69f8e5404042982241fda294892f",
-    "supervisor": "supervisor muerto (pid 3937474)",
-    "thread_id": "b6fff167b99344bfb034d89a14d8b995",
+    "backend": "backend muerto (pid 4018341)",
+    "run_id": "ca1b906ebebe41eeb2587fa78217b99d",
+    "supervisor": "supervisor muerto (pid 4018311)",
+    "thread_id": "909110fae7e843aea9376d61b7361f82",
     "unsafe_state": false,
-    "workspace_id": "dd3b745e4f504b80a43fc733c6cc5322"
+    "workspace_id": "c92d1ea8d2374f608dabcc17cbc21ca7"
   },
   {
     "action": "completed_ready",
     "ref_recreated": true,
-    "snapshot_id": "4775a1689a9f483cb25c716c5c2333b6"
+    "snapshot_id": "086264fd774d43c68bf5c2323f99d326"
   }
 ]
 [
   {
     "action": "run_already_resolved",
-    "run_id": "6f9d69f8e5404042982241fda294892f",
-    "thread_id": "b6fff167b99344bfb034d89a14d8b995"
+    "run_id": "ca1b906ebebe41eeb2587fa78217b99d",
+    "thread_id": "909110fae7e843aea9376d61b7361f82"
   }
 ]
 test b3_recuperacion_concurrente_no_duplica_ready ... ok
-test b1_presupuesto_del_turno_es_acumulado ... ok
 test b1_linea_gigante_se_rechaza_antes_de_acumularla ... ok
+test b1_presupuesto_del_turno_es_acumulado ... ok
 test b2_patch_demasiado_grande_se_rechaza_explicitamente ... ok
-test b2_comentarios_paginados_sin_cargar_patches ... ok
 test b4_crash_antes_del_cas_deja_intento_abandonado_no_fabricado ... ok
+test b2_comentarios_paginados_sin_cargar_patches ... ok
 test b4_crash_despues_del_cas_se_reconcilia_con_evidencia ... ok
 test b5_run_concurrente_y_borrado_bloqueados_por_lease ... ok
 test b5_lease_de_dueno_muerto_se_toma_y_se_registra ... ok

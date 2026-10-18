@@ -788,6 +788,40 @@ fn r2_p1d_registry_lock_symlink_is_rejected() {
 }
 
 #[test]
+fn r2_p1d_lock_inode_replacement_is_detected() {
+    let r2 = R2::new("r2-p1d-lockinode");
+    r2.create("a");
+    r2.auth_mode("a", "positive");
+    let t = r2.thread_new();
+    r2.assign("a", &t);
+    let barrier = r2.env.root.join("barrier-lock-inode");
+    let run = r2.spawn_run(
+        &t,
+        &[(
+            "AERIL_TEST_PROFILE_ADMISSION_BARRIER",
+            barrier.to_string_lossy().into_owned(),
+        )],
+    );
+    assert!(r2.wait_for(&barrier.join("ready"), 15));
+    // Replace the lock path while the admission still holds the old inode.
+    std::fs::remove_file(r2.agent_dir("a").join("aeril.lock")).unwrap();
+    std::fs::write(r2.agent_dir("a").join("aeril.lock"), b"").unwrap();
+    // A second writer must not admit through the fresh inode.
+    let warm = r2.out(true, &["profile", "warm", "--agent", "a"]);
+    assert!(
+        !warm.status.success(),
+        "second writer admitted through a replaced lock inode"
+    );
+    std::fs::write(barrier.join("go"), b"1").unwrap();
+    let out = run.wait_with_output().unwrap();
+    assert!(
+        !out.status.success(),
+        "admission did not detect its lock inode being replaced"
+    );
+    assert!(r2.latest_run(&t).is_none());
+}
+
+#[test]
 fn r2_p1d_meta_lock_symlink_is_rejected() {
     let r2 = R2::new("r2-p1d-metalock");
     r2.create("a");

@@ -142,6 +142,10 @@ no deadlock.
 - Lecturas de `profile.json`, `owner.json` y `agents.json` usan
   `symlink_metadata` + `O_NOFOLLOW`.
 - `aeril.lock`, `.meta.lock`, `.registry.lock` se abren con `O_NOFOLLOW`.
+- `ProfileLock` liga el `dev:ino` del lock a `owner.json` y verifica que el
+  path siga apuntando al inodo bloqueado antes de decisiones críticas. Un
+  unlink+create del lock path no permite admitir un segundo writer si el owner
+  registrado no está probadamente muerto.
 - `write_atomic` exige padre real y rechaza target symlink.
 - `assert_profile_components_safe` cubre home, san-home, metadata y locks.
 - `disk_kb` ignora symlinks.
@@ -234,8 +238,8 @@ afirma rollback compatible para sesiones gestionadas vivas.
 - `docs/phase2-s1-r2-evidence/red-baseline-f1a7635.txt`: suite R2 contra R1;
   **10/12 escenarios RED** (los dos restantes ya estaban protegidos por el
   profile lock o por el parseo de registro corrupto).
-- `docs/phase2-s1-r2-evidence/green-candidate.txt`: **29/29 R2 PASS**.
-- `docs/phase2-s1-r2-evidence/full-suite.txt`: **192/192 Cargo PASS**,
+- `docs/phase2-s1-r2-evidence/green-candidate.txt`: **30/30 R2 PASS**.
+- `docs/phase2-s1-r2-evidence/full-suite.txt`: **193/193 Cargo PASS**,
   incluida la suite Phase 1 y los 3 tests de seguridad del bench.
 - `docs/phase2-s1-r2-evidence/r1-repro-green.txt`: `r1_repro.py` **7/7 GREEN**.
 - `docs/phase2-s1-r2-evidence/budget-main.txt`,
@@ -261,6 +265,7 @@ los tests R2 son aditivos; los 15 tests R1 siguen verdes.
 | `r2_p1d_symlinked_home_and_san_home_are_rejected` | home/san-home symlink no se siguen ni se chmodifican. |
 | `r2_p1d_symlinked_lock_files_are_rejected` | `aeril.lock` symlink fail-closed. |
 | `r2_p1d_registry_lock_symlink_is_rejected` | `.registry.lock` symlink fail-closed. |
+| `r2_p1d_lock_inode_replacement_is_detected` | unlink+create del lock path no admite un segundo writer; la admisión detecta el inodo cambiado. |
 | `r2_p1d_meta_lock_symlink_is_rejected` | `.meta.lock` symlink fail-closed. |
 | `r2_p1d_owner_symlink_is_rejected` | `owner.json` symlink no se sigue en remove. |
 | `r2_p1d_agents_json_symlink_is_rejected` | `agents.json` symlink no se sigue. |
@@ -288,17 +293,17 @@ Host: Intel i7-8550U, 15.4 GB, ext4, build release LTO thin/strip.
 
 | Gate | Resultado |
 |---|---|
-| Cargo suite | **192/192 PASS** |
+| Cargo suite | **193/193 PASS** |
 | R1 repro | **7/7 GREEN** |
 | `cargo fmt --check` | PASS |
 | `cargo clippy --all-targets -- -D warnings` | PASS |
-| Binario | 5,788,336 B (5.8 MB) ≤ 30 MB |
-| RSS idle / thread abierto / delta | 6.5 MB / 7.4 MB / 0.92 MiB (≤50 MB / ≤10 MiB) |
-| Arranque p95 (30 muestras, 0 fail) | 12.9 ms ≤ 300 ms |
-| 5 mocks: app / agentes / total | 9.68 MB / 20.41 MB / 30.10 MB; app ≤500 MB PASS |
-| 2 runs mock en TUI | TUI 8.55 MB; mocks 4.18/4.26 MB; combinado 16.99 MB |
-| Arranque con 2 runs activos | 50.6 ms |
-| Consultas `run list`/`workspace list` | max 5.59 ms, avg 3.48 ms |
+| Binario | 5,825,424 B (5.8 MB) ≤ 30 MB |
+| RSS idle / thread abierto / delta | 7.4 MB / 8.2 MB / 0.78 MiB (≤50 MB / ≤10 MiB) |
+| Arranque p95 (30 muestras, 0 fail) | 15.28 ms ≤ 300 ms |
+| 5 mocks: app / agentes / total | 10.30 MB / 22.69 MB / 32.99 MB; app ≤500 MB PASS |
+| 2 runs mock en TUI | TUI 8.82 MB; mocks 4.64/4.62 MB; combinado 18.09 MB |
+| Arranque con 2 runs activos | 49.87 ms |
+| Consultas `run list`/`workspace list` | max 3.98 ms, avg 2.92 ms |
 
 Ningún umbral fue relajado. Los números de Hermes real no se infieren de los
 mocks.

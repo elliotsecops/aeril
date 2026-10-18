@@ -841,6 +841,19 @@ impl ProfileLock {
         let dir = root_real.join(agent_id);
         require_real_dir(&dir, "directorio del perfil")?;
         let path = dir.join("aeril.lock");
+        let path_identity = std::fs::symlink_metadata(&path)
+            .ok()
+            .map(|m| (m.dev(), m.ino()));
+        if let (Some(owner), Some((dev, ino))) = (read_owner(data_dir, agent_id)?, path_identity)
+            && owner.lock_ino != 0
+            && (owner.lock_dev != dev || owner.lock_ino != ino)
+            && !owner_is_stale(data_dir, agent_id, &owner)?
+        {
+            return Err(Error::conflict(format!(
+                "perfil `{agent_id}`: el inodo de aeril.lock cambió respecto de owner.json \
+                 y el dueño registrado no está probadamente muerto — fail-closed"
+            )));
+        }
         let f = match open_nofollow(&path, true, true) {
             Ok(f) => f,
             Err(Error::NotFound(_)) => {
@@ -860,7 +873,62 @@ impl ProfileLock {
                 "el perfil `{agent_id}` ya tiene un escritor ACP activo (aeril.lock ocupado)"
             )));
         }
-        Ok(ProfileLock { file: f })
+        let lock = ProfileLock { file: f };
+        lock.verify_inode(data_dir, agent_id)?;
+        Ok(lock)
+    }
+
+    fn dev_ino(&self) -> Result<(u64, u64)> {
+        let meta = self.file.metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    /// Verifica que el path siga apuntando al inodo bloqueado. Detecta un
+    /// reemplazo unlink+create del lock file mientras el lock antiguo sigue
+    /// abierto.
+    pub fn verify_inode(&self, data_dir: &Path, agent_id: &str) -> Result<()> {
+        let root_real = safe_root(data_dir, false)?;
+        let path = root_real.join(agent_id).join("aeril.lock");
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+            Error::conflict(format!(
+                "aeril.lock desapareció o no es inspeccionable ({e}) — fail-closed"
+            ))
+        })?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(Error::conflict(
+                "aeril.lock ya no es un archivo regular — fail-closed",
+            ));
+        }
+        let (held_dev, held_ino) = self.dev_ino()?;
+        if meta.dev() != held_dev || meta.ino() != held_ino {
+            return Err(Error::conflict(format!(
+                "el inodo de aeril.lock cambió durante la operación (held {held_dev}:{held_ino}, path {}:{})) — fail-closed",
+                meta.dev(),
+                meta.ino()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Registra al supervisor actual y el inodo del lock antes de spawnear un
+    /// writer. El backend se agrega/verifica por el escaneo de HERMES_HOME.
+    pub fn record_admission_owner(&self, data_dir: &Path, agent_id: &str) -> Result<()> {
+        let (dev, ino) = self.dev_ino()?;
+        let pid = std::process::id() as i64;
+        write_owner(
+            data_dir,
+            agent_id,
+            &OwnerRecord {
+                supervisor_pid: pid,
+                supervisor_start: process_start_time(pid).unwrap_or(0),
+                backend_pid: 0,
+                backend_start: 0,
+                pgid: 0,
+                started_ms: now_ms(),
+                lock_dev: dev,
+                lock_ino: ino,
+            },
+        )
     }
 
     /// Hace el fd heredable por el backend (limpia FD_CLOEXEC). Sin esto, el
@@ -931,6 +999,10 @@ struct OwnerRecord {
     backend_start: u64,
     pgid: i64,
     started_ms: i64,
+    #[serde(default)]
+    lock_dev: u64,
+    #[serde(default)]
+    lock_ino: u64,
 }
 
 fn write_owner(data_dir: &Path, agent_id: &str, rec: &OwnerRecord) -> Result<()> {
@@ -942,6 +1014,22 @@ fn write_owner(data_dir: &Path, agent_id: &str, rec: &OwnerRecord) -> Result<()>
     }
     let bytes = serde_json::to_vec_pretty(rec)?;
     write_atomic(&owner_path(data_dir, agent_id), &bytes)
+}
+
+fn owner_is_stale(data_dir: &Path, agent_id: &str, owner: &OwnerRecord) -> Result<bool> {
+    for (pid, start) in [
+        (owner.supervisor_pid, owner.supervisor_start),
+        (owner.backend_pid, owner.backend_start),
+    ] {
+        match pid_identity(pid, start) {
+            PidId::Absent | PidId::Reused | PidId::Ours { zombie: true } => {}
+            PidId::Ours { zombie: false } | PidId::Unknown => {
+                return Ok(false);
+            }
+        }
+    }
+    let real = assert_safe_agent_path(data_dir, agent_id)?;
+    Ok(processes_using_home(&real.join("home"))?.is_empty())
 }
 
 fn read_owner(data_dir: &Path, agent_id: &str) -> Result<Option<OwnerRecord>> {
@@ -1094,6 +1182,7 @@ pub fn preflight_no_live_writer(data_dir: &Path, agent_id: &str) -> Result<()> {
 /// identidad no verificable, rechaza (jamás fuerza).
 pub fn recover(data_dir: &Path, agent_id: &str) -> Result<String> {
     let _lock = ProfileLock::acquire(data_dir, agent_id)?;
+    _lock.verify_inode(data_dir, agent_id)?;
     verify_no_survivor(data_dir, agent_id)?;
     Ok("reconciled".into())
 }
@@ -1853,6 +1942,7 @@ fn terminate_group(pgid: i64, grace: Duration) -> Result<()> {
 pub fn warm_profile(data_dir: &Path, agent_id: &str) -> Result<i64> {
     let _ = assert_safe_agent_path(data_dir, agent_id)?;
     let lock = ProfileLock::acquire(data_dir, agent_id)?;
+    lock.verify_inode(data_dir, agent_id)?;
     lock.make_inheritable()?;
     verify_no_survivor(data_dir, agent_id)?;
     let bin = hermes_bin()?;
@@ -1872,6 +1962,7 @@ pub fn warm_profile(data_dir: &Path, agent_id: &str) -> Result<i64> {
     let pid = child.id() as i64;
     let started = Instant::now();
     // Evidencia de dueño (pid+starttime+pgid) para verificación posterior.
+    let (lock_dev, lock_ino) = lock.dev_ino()?;
     let owner = OwnerRecord {
         supervisor_pid: std::process::id() as i64,
         supervisor_start: process_start_time(std::process::id() as i64).unwrap_or(0),
@@ -1879,6 +1970,8 @@ pub fn warm_profile(data_dir: &Path, agent_id: &str) -> Result<i64> {
         backend_start: process_start_time(pid).unwrap_or(0),
         pgid: pid,
         started_ms: now_ms(),
+        lock_dev,
+        lock_ino,
     };
     if let Err(e) = write_owner(data_dir, agent_id, &owner) {
         let _ = terminate_group(pid, Duration::from_secs(2));
@@ -2213,7 +2306,9 @@ pub fn remove(
     // the writer exclusion is already held when the registry is inspected.
     let _profile_lock = if dir_exists {
         let _ = assert_safe_agent_path(data_dir, agent_id)?;
-        Some(ProfileLock::acquire(data_dir, agent_id)?)
+        let lock = ProfileLock::acquire(data_dir, agent_id)?;
+        lock.verify_inode(data_dir, agent_id)?;
+        Some(lock)
     } else {
         None
     };
