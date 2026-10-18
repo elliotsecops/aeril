@@ -1,66 +1,124 @@
 # Aeril 🪶
 
-Un terminal donde el agente de IA es un **participante nativo** del entorno: cada panel es un *thread* — prompt, razonamiento, diff y comentarios del humano, anclados a un snapshot inmutable y recuperables días después.
+**Tu espacio de trabajo para agentes de IA, directamente en la terminal.**
 
-**La promesa:** corre completo en un ThinkPad de 2018 con 16 GB. No necesitás comprar una laptop nueva.
+Trabajá con agentes que escriben código sin perder de vista qué están haciendo, qué cambiaron ni dónde quedó cada tarea. Aeril reúne sus ejecuciones, archivos, revisiones e historial en un solo lugar.
 
-> Estado: **Fase 1 COMPLETA para concurrencia mock determinista (N=2)** —
-> auditorías independientes con veredicto final **PASS**. Registro y límites:
-> [`docs/phase1-status.md`](docs/phase1-status.md).
-> Commit certificado Fase 0: [`41ab86cc`](https://github.com/elliotsecops/aeril/commit/41ab86cc28acad3476da3662723fd2411d6db16b) (62/62 tests).
-> S5 (G1–G9) certificado: [`1cfe627`](https://github.com/elliotsecops/aeril/commit/1cfe6279cf9de6260493da937590b63c116c49ac) ·
-> S6-R2 (benchmark seguro) certificado: [`647b539`](https://github.com/elliotsecops/aeril/commit/647b539124d191664947b1952186fd8cfca5dc02).
-> Certificado: dos runs mock concurrentes en una TUI, workspaces/checkpoints
-> durables, reconciliación y cancelación por run, borrado guardado, restauración
-> por OID exacto e integración FF concurrente, con presupuestos release verificados.
-> **Fuera del alcance certificado:** dos sesiones Hermes autenticadas
-> concurrentes, aislamiento de credenciales del host, restauración verificada de
-> contexto conversacional, readiness productivo y sandboxing OS.
+**Menos ventanas. Menos consumo de recursos. Más control sobre tu trabajo.**
 
-**Entregado en Fase 0** (el corte vertical completo, un thread):
+> **Hecho para máquinas modestas.** La idea es que puedas usar tu entorno de agentes sin necesitar una computadora costosa: desde una laptop sencilla hasta una VM o un VPS económico. Aeril es ligero; el agente de IA que conectes puede consumir bastante más memoria. Consulta [qué plataformas hemos probado](#dónde-puede-correr).
 
-- editar → snapshot inmutable → revisar → comentar → feedback → reanudar tras crash → validar → integrar (fast-forward), con el gate A/B automatizado.
-- Workspaces verificados por Aeril, refs de checkpoint propias, recuperación al reabrir sin tocar el working tree, comentarios anclados a contenido inmutable, permisos fail-closed, pipeline ACP byte-bounded, leases de workspace con fence transaccional.
-- Presupuestos medidos en la laptop objetivo: arranque p95 ≈ 26 ms, RSS idle ≈ 6.7 MB, binario ≈ 5.5 MB (declaración completa en el handoff de ingeniería).
+## ¿Para qué sirve?
 
-**Entregado en Fase 1 (aceptación de ingeniería con mock determinista):**
+Imaginá que estás construyendo una aplicación y le pedís a un agente de IA que corrija un error. Después querés revisar los cambios, dejarle indicaciones y continuar mañana. En lugar de reconstruir a mano qué pasó, Aeril organiza ese trabajo para vos.
 
-- Reconciliación durable de runs interrumpidos (S0) y visibilidad `run list [--active]` (S2).
-- TUI con dos runs supervisados a la vez (N=2, uno por thread), cancelación
-  independiente con ack y salida segura (S3).
-- Ciclo de vida de workspaces: `workspace list` de solo lectura y borrado
-  guardado con fence transaccional de lease (S4/S4-R1).
-- E2E G1–G9: concurrencia real, crash de supervisor, falla de backend,
-  cancelación, revisión durable, rehidratación por OID exacto e integración
-  fast-forward concurrente (S5).
-- Presupuestos release re-medidos: arranque p95 ≈ 13 ms, RSS idle ≈ 6.8 MB,
-  binario ≈ 5.6 MB, 5 mocks ≈ 29.5 MB total (app 9.7 MB).
+Con Aeril podés:
 
-**Límites declarados** (no sobreprometer):
+- **Mantener las tareas ordenadas.** Cada tarea tiene su propio historial y espacio de trabajo.
+- **Ver qué cambió.** Revisá las modificaciones antes de integrarlas a tu proyecto.
+- **Dar feedback y continuar.** Comentá los cambios y usá esas observaciones para el siguiente intento.
+- **Retomar después de un cierre inesperado.** Aeril conserva el historial y los puntos de control verificados para que sepas dónde quedó el trabajo.
+- **Evitar interferencias.** Supervisa los espacios de trabajo y comprueba que no se estén usando de forma incompatible.
+- **Trabajar sin un entorno pesado.** La interfaz corre en la terminal y está diseñada para usar poca memoria.
 
-- Hermes real sigue siendo **single-run** (la TUI lo impone): sesiones ACP
-  autenticadas concurrentes **no verificadas**; el aislamiento de estado por
-  `HERMES_HOME` sí fue verificado (S1), pero las credenciales del host **no
-  están garantizadas** y el onboarding multi-perfil no está implementado.
-- Restauración de **contexto conversacional no verificada** (`verified=false`);
-  los checkpoints restauran archivos por OID exacto, no memoria del agente, y
-  las ediciones no chequeadas no son recuperables.
-- Hermes real **no** fue medido con 5 agentes (comparte `~/.hermes`); el bench de
-  escala y el escenario de 2 runs usan agentes mock y lo declaran.
-- Los leases coordinan procesos de Aeril entre sí y los worktrees **no** son un
-  sandbox de seguridad.
-- Submódulos y patches grandes (> 4 MiB) se rechazan explícitamente en v0.
+Aeril **no es otro modelo de IA**: es el lugar desde donde organizás y supervisás agentes externos. Hermes es uno de los motores con los que se integra.
 
-Documentación:
+## Cómo se ve el flujo
 
-- Constitución, presupuestos duros e invariantes: [MANIFIESTO.md](MANIFIESTO.md)
-- Estado de aceptación de Fase 1 (S6): [docs/phase1-status.md](docs/phase1-status.md)
-- Plan de Fase 1 (S0–S6, gates G1–G9): [docs/phase1-plan.md](docs/phase1-plan.md)
-- Estado del proyecto y próximo paso: [HANDOFF.md](HANDOFF.md)
-- Estado de implementación: [docs/phase0-status.md](docs/phase0-status.md)
-- Handoff de ingeniería (cómo reproducir): [docs/phase0-engineering-handoff.md](docs/phase0-engineering-handoff.md)
-- Aceptación de la segunda auditoría (blockers RC2/RC2.1): [docs/phase0-rc2-acceptance.md](docs/phase0-rc2-acceptance.md)
-- Matriz de remediación de la primera auditoría: [docs/phase0-remediation-matrix.md](docs/phase0-remediation-matrix.md)
-- Especificación del ACP de Hermes verificada contra el código: [docs/acp-hermes-spec.md](docs/acp-hermes-spec.md)
+```text
+Abrís una tarea
+      ↓
+El agente trabaja en su espacio
+      ↓
+Revisás qué modificó
+      ↓
+Dejás comentarios o aprobás
+      ↓
+Continuás, guardás o integrás el trabajo
+```
 
-*Velocidad y liviandad, juntas, en el aire.*
+Tu proyecto sigue siendo un repositorio Git normal. Aeril no te obliga a cambiar de editor ni a adoptar un sistema de versiones propio.
+
+## Empezar
+
+**Estado actual: versión temprana para desarrolladores.** Todavía no ofrecemos un instalador universal ni prometemos una experiencia lista para cualquier máquina.
+
+Necesitás Linux, Git, Rust/Cargo y un agente externo compatible si querés ejecutar tareas reales. Construí Aeril desde el repositorio:
+
+```bash
+git clone https://github.com/elliotsecops/aeril.git
+cd aeril
+cargo build --release
+./target/release/aeril
+```
+
+Ese último comando abre la interfaz de terminal. Para registrar un proyecto Git desde la CLI:
+
+```bash
+./target/release/aeril thread new --repo /ruta/a/tu/proyecto --title "Corregir inicio de sesión"
+./target/release/aeril thread list
+```
+
+Esto crea y lista tareas; **no inicia por sí solo un agente**. Para trabajar con un motor real, necesitás configurarlo por separado.
+
+## ¿Dónde puede correr?
+
+Aeril está diseñado para mantener bajo el consumo de recursos del **gestor**, independientemente de dónde ejecutes tus agentes.
+
+| Entorno | Situación |
+|---|---|
+| Laptop o PC con Linux | Entorno de desarrollo y pruebas utilizado |
+| VM Linux | Opción natural para instalar y probar; depende de la distribución y sus dependencias |
+| VPS Linux económico | Objetivo de despliegue ligero, no una garantía para un plan de precio concreto |
+| Raspberry Pi | Interesante como plataforma ligera; compatibilidad ARM no certificada |
+| Android con Termux | Posibilidad futura; no probado ni soportado oficialmente |
+
+**¿Un VPS de $5?** Esa es la clase de infraestructura económica a la que apuntamos, **no una promesa de que un agente de IA completo funcione dentro de ese presupuesto**. Los motores, modelos y servicios externos tienen sus propios requisitos y costes.
+
+## ¿Qué funciona hoy?
+
+Aeril ya incluye la interfaz de terminal, historial de tareas, revisión de cambios, puntos de control, recuperación y gestión de espacios de trabajo. Las pruebas automatizadas verificaron dos ejecuciones concurrentes con agentes simulados.
+
+También se integró la gestión de perfiles Hermes, con controles para evitar el uso simultáneo incorrecto de una sesión. **Esta función permanece desactivada por defecto.**
+
+Lo que **todavía no** estamos anunciando como listo:
+
+- Dos sesiones reales y autenticadas de Hermes funcionando simultáneamente.
+- Aislamiento total del resto de los archivos o credenciales de tu computadora.
+- Restauración automática de la memoria conversacional de un agente.
+- Compatibilidad certificada con Raspberry Pi, Termux o todos los proveedores de VPS.
+
+Podés seguir los avances y límites conocidos en [HANDOFF.md](HANDOFF.md) y [el estado de Fase 1](docs/phase1-status.md).
+
+## Nerd stuff 🤓
+
+Los detalles de ingeniería viven aquí, no en la presentación del producto.
+
+**Construcción:** Rust, interfaz de terminal con Ratatui, datos locales en SQLite y espacios de trabajo basados en Git. Los motores externos se comunican con Aeril mediante un protocolo estructurado; Hermes utiliza ACP.
+
+**Mediciones del gestor Aeril** (build release, candidato P2-S1 R3 auditado):
+
+| Medida | Resultado |
+|---|---:|
+| Tamaño del ejecutable | 5.8 MB |
+| RAM en reposo | ~7 MB |
+| RAM adicional al abrir un hilo | ~1 MiB |
+| Arranque, p95 | ~20 ms |
+| Suite de pruebas Rust | 204/204 PASS |
+
+Son mediciones en un entorno específico, **no mínimos garantizados para cualquier hardware**. La RAM de Hermes o de cualquier otro agente externo **no está incluida** en el dato de RAM en reposo.
+
+**Garantías y límites:** Aeril conserva evidencia de ejecuciones y cambios; los puntos de control recuperan archivos verificados, no pensamientos ni memoria privada de un modelo. Los espacios de trabajo separan tareas, pero no son sandboxes del sistema operativo. Los bloqueos coordinan procesos cooperativos y no impiden que un proceso malicioso con el mismo usuario altere archivos.
+
+**Detalles para auditores y colaboradores:**
+
+- [Manifiesto y presupuestos](MANIFIESTO.md)
+- [Estado y pruebas de Fase 1](docs/phase1-status.md)
+- [Implementación de perfiles Hermes P2-S1](docs/phase2-s1-implementation.md)
+- [Remediación y evidencias de auditoría R3](docs/phase2-s1-r3-remediation.md)
+- [Contrato ACP de Hermes](docs/acp-hermes-spec.md)
+- [Estado actual y siguientes pasos](HANDOFF.md)
+
+---
+
+**Aeril. Una terminal más ligera para trabajar con agentes de IA.**
