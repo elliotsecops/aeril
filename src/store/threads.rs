@@ -6,6 +6,7 @@ use crate::ids::new_id;
 use crate::store::events::{self, payload};
 use crate::timeutil::now_ms;
 use rusqlite::{Connection, TransactionBehavior, params};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct ThreadRow {
@@ -16,6 +17,21 @@ pub struct ThreadRow {
     pub state: String,
     pub created_ms: i64,
     pub updated_ms: i64,
+}
+
+/// Proyección de lectura para la lista de tareas de la TUI.
+///
+/// Incluye solo metadatos del último run: no carga eventos ni payloads.
+/// El orden coincide con `list_projection` para que los índices de la lista
+/// sigan siendo los mismos que los del resto de la TUI.
+#[derive(Debug, Clone)]
+pub struct ThreadRunSummary {
+    pub thread_id: String,
+    pub run_count: i64,
+    pub latest_state: Option<String>,
+    pub latest_branch: Option<String>,
+    pub started_ms: Option<i64>,
+    pub ended_ms: Option<i64>,
 }
 
 fn row_to_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
@@ -82,6 +98,43 @@ pub fn list_projection(conn: &Connection, limit: i64) -> Result<Vec<ThreadRow>> 
     ))?;
     let rows = stmt.query_map(params![limit], row_to_thread)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Resumen liviano del último run por thread para la lista de tareas.
+///
+/// Una sola consulta evita N+1 consultas al refrescar la TUI. Los threads sin
+/// runs siguen apareciendo con `latest_state = None`.
+pub fn run_summaries(conn: &Connection, limit: i64) -> Result<HashMap<String, ThreadRunSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id,
+                (SELECT COUNT(*) FROM runs r WHERE r.thread_id = t.id),
+                r.state, r.branch, r.started_ms, r.ended_ms
+         FROM threads t
+         LEFT JOIN runs r ON r.id = (
+             SELECT r2.id FROM runs r2
+             WHERE r2.thread_id = t.id
+             ORDER BY r2.started_ms DESC, r2.id DESC
+             LIMIT 1
+         )
+         ORDER BY t.updated_ms DESC, t.id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok(ThreadRunSummary {
+            thread_id: row.get(0)?,
+            run_count: row.get(1)?,
+            latest_state: row.get(2)?,
+            latest_branch: row.get(3)?,
+            started_ms: row.get(4)?,
+            ended_ms: row.get(5)?,
+        })
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let row = row?;
+        out.insert(row.thread_id.clone(), row);
+    }
+    Ok(out)
 }
 
 pub fn set_repo_path(conn: &Connection, id: &str, repo_path: &str) -> Result<()> {
