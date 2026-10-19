@@ -34,6 +34,7 @@ pub struct ThreadDetail {
     pub patch: Vec<String>,
     pub patch_scroll: u16,
     pub run_summary: Option<ThreadRunSummary>,
+    pub progress: events::RunProgress,
     pub checkpoint: Option<CheckpointPanel>,
 }
 
@@ -214,6 +215,7 @@ impl App {
             patch: Vec::new(),
             patch_scroll: 0,
             run_summary: None,
+            progress: events::RunProgress::default(),
             checkpoint: None,
         };
         self.detail = Some(detail);
@@ -231,6 +233,14 @@ impl App {
         };
         detail.run_summary = run_summary;
         detail.events = events::fetch_tail(&self.store.conn, &detail.thread_id, 100)?;
+        let current_run_id = detail
+            .run_summary
+            .as_ref()
+            .and_then(|s| s.latest_run_id.clone());
+        detail.progress = match current_run_id.as_deref() {
+            Some(run_id) => events::run_progress(&self.store.conn, &detail.thread_id, run_id)?,
+            None => events::RunProgress::default(),
+        };
         // Resúmenes livianos (sin patches): la memoria de revisión queda
         // acotada; el patch se carga SOLO para el evento seleccionado.
         detail.comments = review::list_comment_summaries(&self.store, &detail.thread_id, 200, 0)?;
@@ -1308,21 +1318,16 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
 }
 
 fn latest_goal(detail: &ThreadDetail) -> Option<String> {
-    let current_run = detail
+    if detail
         .run_summary
         .as_ref()
-        .and_then(|s| s.latest_run_id.as_deref());
-    detail
-        .events
-        .iter()
-        .rev()
-        .find(|ev| {
-            ev.kind == events::K_RUN_STARTED
-                && current_run.is_some()
-                && ev.run_id.as_deref() == current_run
-        })
-        .and_then(|ev| ev.parse::<events::payload::RunStarted>().ok())
-        .map(|p| p.goal)
+        .and_then(|s| s.latest_run_id.as_ref())
+        .is_some()
+    {
+        detail.progress.goal.clone()
+    } else {
+        None
+    }
 }
 
 fn run_ended(detail: &ThreadDetail) -> bool {
@@ -1344,26 +1349,17 @@ fn run_is_active(detail: &ThreadDetail) -> bool {
 }
 
 fn checklist(detail: &ThreadDetail) -> Vec<(String, Color, String)> {
-    let current_run = detail
+    if detail
         .run_summary
         .as_ref()
-        .and_then(|s| s.latest_run_id.as_deref());
-    let Some(current_run) = current_run else {
+        .and_then(|s| s.latest_run_id.as_ref())
+        .is_none()
+    {
         return Vec::new();
-    };
-    let current_events = detail
-        .events
-        .iter()
-        .filter(|ev| ev.run_id.as_deref() == Some(current_run));
-    let mut has_session = false;
-    let mut has_activity = false;
-    let mut has_checkpoint = false;
-    for ev in current_events {
-        has_session |= ev.kind == events::K_ENGINE_SESSION;
-        has_activity |=
-            ev.kind == events::K_AGENT_TOOL_CALL || ev.kind == events::K_PERMISSION_REQUESTED;
-        has_checkpoint |= ev.kind == events::K_CHECKPOINT_READY;
     }
+    let has_session = detail.progress.has_session;
+    let has_activity = detail.progress.has_activity;
+    let has_checkpoint = detail.progress.has_checkpoint;
     if detail
         .run_summary
         .as_ref()
@@ -2574,6 +2570,103 @@ mod tests {
         }
     }
 
+    fn run_payload(run_id: &str, goal: &str) -> serde_json::Value {
+        serde_json::json!({
+            "backend": "mock",
+            "goal": goal,
+            "workspace_id": format!("ws-{run_id}"),
+            "repo_path": "/tmp/repo",
+            "worktree_path": format!("/tmp/worktree-{run_id}"),
+            "branch": format!("branch-{run_id}"),
+            "base_oid": "0000000000000000000000000000000000000000"
+        })
+    }
+
+    fn long_thread_detail(total_events: usize) -> ThreadDetail {
+        let mut store = Store::open_in_memory().unwrap();
+        let thread = threads::create(&mut store.conn, "long", "/tmp/repo", "r1").unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO runs (id, thread_id, branch, backend, state, started_ms, ended_ms)
+                 VALUES ('run-old', ?1, 'branch-old', 'mock', 'completed', 1, 2)",
+                rusqlite::params![thread.id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO runs (id, thread_id, branch, backend, state, started_ms)
+                 VALUES ('run-new', ?1, 'branch-new', 'mock', 'running', 30)",
+                rusqlite::params![thread.id],
+            )
+            .unwrap();
+        let tx = store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let append = |kind: &str, run_id: &str, payload: serde_json::Value| {
+            events::append_tx(&tx, &thread.id, Some(run_id), kind, "system", &payload, 0).unwrap();
+        };
+        append(
+            events::K_RUN_STARTED,
+            "run-old",
+            run_payload("run-old", "old goal"),
+        );
+        append(events::K_ENGINE_SESSION, "run-old", serde_json::json!({}));
+        append(events::K_AGENT_TOOL_CALL, "run-old", serde_json::json!({}));
+        append(events::K_CHECKPOINT_READY, "run-old", serde_json::json!({}));
+        append(events::K_RUN_ENDED, "run-old", serde_json::json!({}));
+        append(
+            events::K_RUN_STARTED,
+            "run-new",
+            run_payload("run-new", "new goal"),
+        );
+        append(events::K_ENGINE_SESSION, "run-new", serde_json::json!({}));
+        for _ in 8..total_events {
+            append(events::K_AGENT_MESSAGE, "run-new", serde_json::json!({}));
+        }
+        tx.commit().unwrap();
+
+        let old_progress = events::run_progress(&store.conn, &thread.id, "run-old").unwrap();
+        assert!(old_progress.has_checkpoint);
+        let progress = events::run_progress(&store.conn, &thread.id, "run-new").unwrap();
+        assert_eq!(progress.goal.as_deref(), Some("new goal"));
+        assert!(progress.has_session);
+        assert!(!progress.has_activity);
+        assert!(!progress.has_checkpoint);
+        let summaries = threads::run_summaries(&store.conn, 10).unwrap();
+        let summary = summaries.get(&thread.id).unwrap().clone();
+        assert_eq!(summary.latest_run_id.as_deref(), Some("run-new"));
+        let events = events::fetch_tail(&store.conn, &thread.id, 100).unwrap();
+        assert_eq!(events.len(), 100);
+        assert!(
+            events
+                .iter()
+                .all(|ev| ev.kind != events::K_RUN_STARTED
+                    || ev.run_id.as_deref() != Some("run-new")),
+            "the current run start must be outside the 100-event window"
+        );
+        ThreadDetail {
+            thread_id: thread.id,
+            title: "long".into(),
+            repo_path: "/tmp/repo".into(),
+            events,
+            sel: 0,
+            comments: Vec::new(),
+            patch: Vec::new(),
+            patch_scroll: 0,
+            run_summary: Some(summary),
+            progress,
+            checkpoint: Some(CheckpointPanel {
+                ready: events::payload::CheckpointReady::default(),
+                run_id: Some("run-old".into()),
+                ordinal: 1,
+                total: 1,
+            }),
+        }
+    }
+
     fn detail_with_two_runs() -> ThreadDetail {
         ThreadDetail {
             thread_id: "thread".into(),
@@ -2601,6 +2694,12 @@ mod tests {
                 started_ms: Some(100),
                 ended_ms: None,
             }),
+            progress: events::RunProgress {
+                goal: Some("new goal".into()),
+                has_session: true,
+                has_activity: false,
+                has_checkpoint: false,
+            },
             checkpoint: Some(CheckpointPanel {
                 ready: events::payload::CheckpointReady::default(),
                 run_id: Some("run-old".into()),
@@ -2627,5 +2726,30 @@ mod tests {
         assert_eq!(step("Checkpoint verified").0, "○");
         assert_eq!(step("Run finalized").0, "○");
         assert_eq!(latest_goal(&detail).as_deref(), Some("new goal"));
+    }
+
+    #[test]
+    fn long_history_does_not_hide_current_run_progress() {
+        for total_events in [150usize, 1000] {
+            let detail = long_thread_detail(total_events);
+            let steps = checklist(&detail);
+            let step = |text: &str| {
+                steps
+                    .iter()
+                    .find(|(_, _, label)| label == text)
+                    .unwrap_or_else(|| panic!("missing step {text} for {total_events} events"))
+            };
+            assert_eq!(step("Engine session opened").0, "✓");
+            assert_eq!(step("Agent activity captured").0, "●");
+            assert_eq!(step("Checkpoint verified").0, "○");
+            assert_eq!(latest_goal(&detail).as_deref(), Some("new goal"));
+            assert_eq!(
+                detail
+                    .checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| checkpoint.run_id.as_deref()),
+                Some("run-old")
+            );
+        }
     }
 }
