@@ -64,6 +64,12 @@ pub enum Mode {
     Help,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NarrowView {
+    Run,
+    Review,
+}
+
 /// S3: un run supervisado por esta TUI. El slot nace al lanzar y muere SOLO
 /// con la nota terminal de esa invocación (`RunDone`/`Error`): pedir
 /// cancelación no libera capacidad (el run puede seguir vivo hasta el ack).
@@ -89,13 +95,13 @@ const TEXT: Color = Color::Rgb(201, 209, 217);
 const TEXT_BRIGHT: Color = Color::Rgb(235, 239, 244);
 const MUTED: Color = Color::Rgb(125, 133, 144);
 const DIM: Color = Color::Rgb(82, 89, 101);
-const ACCENT: Color = Color::Rgb(88, 166, 255);
-const ACCENT_BG: Color = Color::Rgb(30, 49, 77);
-const GREEN: Color = Color::Rgb(63, 185, 80);
-const RED: Color = Color::Rgb(248, 81, 73);
-const YELLOW: Color = Color::Rgb(210, 153, 34);
-const MAGENTA: Color = Color::Rgb(188, 140, 255);
-const CYAN: Color = Color::Rgb(57, 197, 207);
+const ACCENT: Color = Color::Rgb(111, 158, 232);
+const ACCENT_BG: Color = Color::Rgb(38, 59, 89);
+const GREEN: Color = Color::Rgb(127, 179, 107);
+const RED: Color = Color::Rgb(214, 110, 110);
+const YELLOW: Color = Color::Rgb(214, 179, 106);
+const MAGENTA: Color = Color::Rgb(180, 142, 173);
+const CYAN: Color = Color::Rgb(111, 168, 163);
 
 fn is_hermes_backend(backend: &str) -> bool {
     backend == "hermes" || backend.starts_with("hermes:")
@@ -110,6 +116,7 @@ pub struct App {
     pub thread_sel: usize,
     pub detail: Option<ThreadDetail>,
     pub mode: Mode,
+    pub narrow_view: NarrowView,
     pub status: String,
     pub recovery_note: Option<String>,
     pub ui_rx: mpsc::Receiver<UiNote>,
@@ -294,11 +301,11 @@ impl App {
 
     fn start_comment(&mut self) -> Result<()> {
         let Some(ev) = self.selected_event() else {
-            self.status = "seleccioná un checkpoint listo (📌) para comentar".into();
+            self.status = "seleccioná un checkpoint listo para comentar".into();
             return Ok(());
         };
         if ev.kind != events::K_CHECKPOINT_READY {
-            self.status = "solo se comenta sobre eventos `checkpoint.ready` (📌)".into();
+            self.status = "solo se comenta sobre eventos `checkpoint.ready`".into();
             return Ok(());
         }
         let ready: events::payload::CheckpointReady = ev.parse()?;
@@ -379,7 +386,7 @@ impl App {
         ) {
             Ok(id) => {
                 self.status = format!(
-                    "comentario {} agregado (🚩 abierto, f para enviar feedback)",
+                    "comentario {} agregado (abierto, f para enviar feedback)",
                     &id[..8]
                 );
                 self.refresh_detail()?;
@@ -698,6 +705,16 @@ impl App {
                 self.mode = Mode::Normal;
             }
             Mode::Normal => match key.code {
+                KeyCode::Tab => {
+                    self.narrow_view = match self.narrow_view {
+                        NarrowView::Run => NarrowView::Review,
+                        NarrowView::Review => NarrowView::Run,
+                    };
+                    self.status = match self.narrow_view {
+                        NarrowView::Run => "vista: run".into(),
+                        NarrowView::Review => "vista: checkpoint / review".into(),
+                    };
+                }
                 KeyCode::Char('q') => {
                     if self.runs.is_empty() {
                         self.should_quit = true;
@@ -812,6 +829,7 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
         thread_sel: 0,
         detail: None,
         mode: Mode::Normal,
+        narrow_view: NarrowView::Run,
         status: String::new(),
         recovery_note,
         ui_rx,
@@ -935,18 +953,12 @@ fn summarize_recovery(
 
 // ── render ───────────────────────────────────────────────────────────────────
 
-fn panel(title: Line<'static>) -> Block<'static> {
+fn panel() -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(BORDER))
         .style(Style::default().bg(PANEL_BG).fg(TEXT))
-        .title(title)
-}
-
-fn panel_right(mut block: Block<'static>, right: Line<'static>) -> Block<'static> {
-    block = block.title_top(right.alignment(Alignment::Right));
-    block
 }
 
 fn label_style() -> Style {
@@ -957,8 +969,8 @@ fn key_badge(key: &str) -> Span<'static> {
     Span::styled(
         format!(" {key} "),
         Style::default()
-            .fg(ACCENT)
-            .bg(ACCENT_BG)
+            .fg(TEXT_BRIGHT)
+            .bg(PANEL_BG_ALT)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -1060,29 +1072,49 @@ fn running_thread_count(app: &App) -> usize {
 
 fn render(f: &mut Frame, app: &mut App) {
     f.render_widget(Block::default().style(Style::default().bg(BG)), f.area());
+    let footer_height =
+        if matches!(app.mode, Mode::Normal) && app.status.is_empty() && app.recovery_note.is_none()
+        {
+            2
+        } else {
+            3
+        };
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(3),
+        Constraint::Length(footer_height),
     ])
     .split(f.area());
 
     render_header(f, app, chunks[0]);
 
-    let body = Layout::horizontal([
-        Constraint::Percentage(24),
-        Constraint::Percentage(44),
-        Constraint::Percentage(32),
-    ])
-    .split(chunks[1]);
-    render_tasks(f, app, body[0]);
-    render_run(f, app, body[1]);
-    render_checkpoint(f, app, body[2]);
+    if f.area().width < 110 {
+        // En terminales angostas, tres columnas dejan de ser legibles. La
+        // lista de tareas queda fija y el panel principal alterna Run/Review.
+        let body = Layout::horizontal([Constraint::Percentage(36), Constraint::Percentage(64)])
+            .split(chunks[1]);
+        render_tasks(f, app, body[0]);
+        match app.narrow_view {
+            NarrowView::Run => render_run(f, app, body[1]),
+            NarrowView::Review => render_checkpoint(f, app, body[1]),
+        }
+    } else {
+        let body = Layout::horizontal([
+            Constraint::Percentage(24),
+            Constraint::Percentage(44),
+            Constraint::Percentage(32),
+        ])
+        .split(chunks[1]);
+        render_tasks(f, app, body[0]);
+        render_run(f, app, body[1]);
+        render_checkpoint(f, app, body[2]);
+    }
     render_footer(f, app, chunks[2]);
 }
 
 fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let block = panel(Line::from(vec![
+    let compact = area.width < 110;
+    let mut title = vec![
         Span::styled(
             " Aeril",
             Style::default()
@@ -1090,19 +1122,50 @@ fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ·  Fase 1", Style::default().fg(MUTED)),
-        Span::styled("  │  coding agent workspace ", Style::default().fg(DIM)),
-    ]));
+    ];
+    if !compact {
+        title.push(Span::styled(
+            "  │  coding agent workspace ",
+            Style::default().fg(DIM),
+        ));
+    }
+    let block = panel();
     f.render_widget(block, area);
     let inner = area.inner(Margin {
         horizontal: 2,
         vertical: 1,
     });
+    if compact {
+        let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(22)]).split(inner);
+        f.render_widget(
+            Paragraph::new(Line::from(title)).style(Style::default().bg(PANEL_BG)),
+            cols[0],
+        );
+        f.render_widget(
+            Paragraph::new(now_clock())
+                .style(Style::default().fg(MUTED))
+                .alignment(Alignment::Right),
+            cols[1],
+        );
+        return;
+    }
+    let workspace_width = if area.width >= 140 {
+        52
+    } else if area.width >= 120 {
+        46
+    } else {
+        38
+    };
     let cols = Layout::horizontal([
         Constraint::Min(34),
-        Constraint::Length(38),
+        Constraint::Length(workspace_width),
         Constraint::Length(22),
     ])
     .split(inner);
+    f.render_widget(
+        Paragraph::new(Line::from(title)).style(Style::default().bg(PANEL_BG)),
+        cols[0],
+    );
     let repo = selected_repo(app);
     let workspace = if repo.is_empty() {
         "workspace  no task selected".to_string()
@@ -1126,35 +1189,56 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let summary = if area.width >= 34 {
         format!("{} total  ·  {} running ", app.threads.len(), running)
     } else {
-        format!("{} · {} run ", app.threads.len(), running)
+        format!("{} · {} active ", app.threads.len(), running)
     };
-    let block = panel_right(
-        panel(Line::from(Span::styled(
-            " Tasks ",
+    let block = panel();
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 2,
+        vertical: 0,
+    });
+    f.render_widget(block, area);
+    let header = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+    let summary_width = summary.chars().count() as u16;
+    let header_cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(summary_width)])
+        .split(header[0]);
+    f.render_widget(
+        Paragraph::new("Tasks").style(
             Style::default()
                 .fg(TEXT_BRIGHT)
+                .bg(PANEL_BG)
                 .add_modifier(Modifier::BOLD),
-        ))),
-        Line::from(Span::styled(summary, Style::default().fg(MUTED))),
+        ),
+        header_cols[0],
     );
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    f.render_widget(
+        Paragraph::new(summary)
+            .style(Style::default().fg(MUTED).bg(PANEL_BG))
+            .alignment(Alignment::Right),
+        header_cols[1],
+    );
+    let list_area = header[2];
     if app.threads.is_empty() {
         f.render_widget(
             Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled("  No tasks yet.", Style::default().fg(MUTED))),
+                Line::from(Span::styled("No tasks yet.", Style::default().fg(MUTED))),
                 Line::from(Span::styled(
-                    "  Create one from the CLI, then refresh.",
+                    "Create one from the CLI, then refresh.",
                     Style::default().fg(DIM),
                 )),
             ])
             .style(Style::default().bg(PANEL_BG)),
-            inner,
+            list_area,
         );
         return;
     }
-    let title_width = inner.width.saturating_sub(9) as usize;
+    let title_width = list_area.width.saturating_sub(9) as usize;
+    let show_branch_inline = list_area.width >= 36;
+    let compact_items = list_area.width < 30;
     let items: Vec<ListItem> = app
         .threads
         .iter()
@@ -1167,30 +1251,47 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             let branch = summary
                 .and_then(|s| s.latest_branch.clone())
                 .unwrap_or_else(|| "—".into());
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(format!(" {:>2}  ", idx + 1), Style::default().fg(DIM)),
-                    Span::styled("● ", Style::default().fg(color)),
-                    Span::styled(
-                        truncate_chars(&thread.title, title_width.max(8)),
-                        Style::default().fg(TEXT_BRIGHT),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("      ", Style::default()),
-                    Span::styled(state, Style::default().fg(color)),
-                    Span::styled(format!("  ·  {elapsed}"), Style::default().fg(MUTED)),
-                ]),
-                Line::from(vec![
+            let status = format!("{state}  ·  {elapsed}");
+            let mut status_line = vec![
+                Span::styled("      ", Style::default()),
+                Span::styled(status.clone(), Style::default().fg(color)),
+            ];
+            let mut lines = vec![Line::from(vec![
+                Span::styled(format!(" {:>2}  ", idx + 1), Style::default().fg(DIM)),
+                Span::styled("● ", Style::default().fg(color)),
+                Span::styled(
+                    truncate_chars(&thread.title, title_width.max(8)),
+                    Style::default().fg(TEXT_BRIGHT),
+                ),
+            ])];
+            if show_branch_inline {
+                let branch_text = format!("↳ {}", truncate_chars(&branch, 14));
+                let padding = list_area
+                    .width
+                    .saturating_sub(
+                        6 + status.chars().count() as u16 + branch_text.chars().count() as u16,
+                    )
+                    .max(2) as usize;
+                status_line.push(Span::raw(" ".repeat(padding)));
+                status_line.push(Span::styled(branch_text, Style::default().fg(DIM)));
+                lines.push(Line::from(status_line));
+            } else if compact_items {
+                lines.push(Line::from(status_line));
+            } else {
+                lines.push(Line::from(status_line));
+                lines.push(Line::from(vec![
                     Span::styled("      ", Style::default()),
                     Span::styled(
                         format!("↳ {}", truncate_chars(&branch, title_width.max(8))),
                         Style::default().fg(DIM),
                     ),
-                ]),
-                Line::from(""),
-            ])
-            .style(if selected {
+                ]));
+            }
+            if !compact_items {
+                lines.push(Line::from(""));
+                lines.push(Line::from(""));
+            }
+            ListItem::new(lines).style(if selected {
                 Style::default().bg(ACCENT_BG)
             } else {
                 Style::default().bg(PANEL_BG)
@@ -1203,7 +1304,7 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         .highlight_symbol("");
     let mut state = ListState::default();
     state.select(Some(app.thread_sel));
-    f.render_stateful_widget(list, inner, &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
 }
 
 fn latest_goal(detail: &ThreadDetail) -> Option<String> {
@@ -1282,15 +1383,16 @@ fn checklist(detail: &ThreadDetail) -> Vec<(String, Color, String)> {
 }
 
 fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
-    let thread_id = app.detail.as_ref().map(|d| d.thread_id.clone());
-    let Some(thread_id) = thread_id else {
-        let block = panel(Line::from(Span::styled(
-            " Run ",
-            Style::default()
-                .fg(TEXT_BRIGHT)
-                .add_modifier(Modifier::BOLD),
-        )));
-        let inner = block.inner(area);
+    let detail_meta = app
+        .detail
+        .as_ref()
+        .map(|d| (d.thread_id.clone(), d.title.clone()));
+    let Some((thread_id, thread_title)) = detail_meta else {
+        let block = panel();
+        let inner = block.inner(area).inner(Margin {
+            horizontal: 1,
+            vertical: 0,
+        });
         f.render_widget(block, area);
         f.render_widget(
             Paragraph::new(vec![
@@ -1316,45 +1418,70 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         .get(&thread_id)
         .map(|s| s.run_count)
         .unwrap_or(0);
-    let block = panel_right(
-        panel(Line::from(vec![
+    let block = panel();
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 2,
+        vertical: 0,
+    });
+    f.render_widget(block, area);
+    let header = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+    let status = format!(
+        "{}  ·  {}",
+        state,
+        elapsed_for(app.run_summaries.get(&thread_id))
+    );
+    let status_width = status.chars().count() as u16;
+    let header_cols =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(status_width + 2)])
+            .split(header[0]);
+    let title_width = header_cols[0].width.saturating_sub(16) as usize;
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled(
-                " Run ",
+                format!(
+                    "Run {}",
+                    if run_no > 0 {
+                        run_no.to_string()
+                    } else {
+                        "—".into()
+                    }
+                ),
                 Style::default()
                     .fg(TEXT_BRIGHT)
+                    .bg(PANEL_BG)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(" — ", Style::default().fg(DIM).bg(PANEL_BG)),
             Span::styled(
-                if run_no > 0 {
-                    format!("{run_no} ")
-                } else {
-                    "— ".into()
-                },
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                truncate_chars(&thread_title, title_width.max(8)),
+                Style::default().fg(TEXT_BRIGHT).bg(PANEL_BG),
             ),
         ])),
-        Line::from(Span::styled(
-            format!(
-                "{}  ·  {} ",
-                state,
-                elapsed_for(app.run_summaries.get(&thread_id))
-            ),
-            Style::default().fg(state_color),
-        )),
+        header_cols[0],
     );
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    f.render_widget(
+        Paragraph::new(status)
+            .style(Style::default().fg(state_color).bg(PANEL_BG))
+            .alignment(Alignment::Right),
+        header_cols[1],
+    );
     let Some(detail) = app.detail.as_mut() else {
         return;
     };
+    let compact = area.width < 70;
     let sections = Layout::vertical([
         Constraint::Length(4),
-        Constraint::Length(7),
+        Constraint::Length(if compact { 2 } else { 7 }),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(5),
     ])
-    .split(inner);
+    .split(header[2]);
 
     let goal = latest_goal(detail)
         .unwrap_or_else(|| "No run yet. Press n to describe the next task.".to_string());
@@ -1374,6 +1501,26 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             "  Waiting for the first run.",
             Style::default().fg(DIM),
         ))]
+    } else if compact {
+        let done = steps
+            .iter()
+            .filter(|(icon, ..)| icon.as_str() == "✓")
+            .count();
+        let active =
+            steps
+                .iter()
+                .find(|(icon, ..)| icon.as_str() == "●")
+                .map(|(_, color, text)| {
+                    Span::styled(format!("  ·  ● {text}"), Style::default().fg(*color))
+                });
+        let mut line = vec![Span::styled(
+            format!("  {done}/{} steps complete", steps.len()),
+            Style::default().fg(MUTED),
+        )];
+        if let Some(active) = active {
+            line.push(active);
+        }
+        vec![Line::from(line)]
     } else {
         steps
             .into_iter()
@@ -1535,77 +1682,119 @@ fn patch_display_lines(detail: &ThreadDetail) -> Vec<Line<'static>> {
 
 fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let checkpoint = app.detail.as_ref().and_then(|d| d.checkpoint.as_ref());
-    let title_right = checkpoint
-        .map(|c| format!(" {} / {} ", c.ordinal, c.total))
+    let ordinal = checkpoint
+        .map(|c| format!("{} / {}", c.ordinal, c.total))
         .unwrap_or_default();
-    let block = panel_right(
-        panel(Line::from(Span::styled(
-            " Checkpoint ",
+    let block = panel();
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 2,
+        vertical: 0,
+    });
+    f.render_widget(block, area);
+    let header = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+    let ordinal_width = ordinal.chars().count() as u16;
+    let header_cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(ordinal_width)])
+        .split(header[0]);
+    f.render_widget(
+        Paragraph::new("Checkpoint").style(
             Style::default()
                 .fg(TEXT_BRIGHT)
+                .bg(PANEL_BG)
                 .add_modifier(Modifier::BOLD),
-        ))),
-        Line::from(Span::styled(title_right, Style::default().fg(MUTED))),
+        ),
+        header_cols[0],
     );
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    f.render_widget(
+        Paragraph::new(ordinal)
+            .style(Style::default().fg(MUTED).bg(PANEL_BG))
+            .alignment(Alignment::Right),
+        header_cols[1],
+    );
+    let content = header[2];
     let Some(detail) = app.detail.as_ref() else {
         f.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Select a task to inspect its checkpoints.",
-                    Style::default().fg(DIM),
-                )),
-            ])
+            Paragraph::new(vec![Line::from(Span::styled(
+                "Select a task to inspect its checkpoints.",
+                Style::default().fg(DIM),
+            ))])
             .style(Style::default().bg(PANEL_BG)),
-            inner,
+            content,
         );
         return;
     };
     let Some(checkpoint) = checkpoint else {
         f.render_widget(
             Paragraph::new(vec![
-                Line::from(""),
                 Line::from(Span::styled(
-                    "  No verified checkpoint yet.",
+                    "No verified checkpoint yet.",
                     Style::default().fg(MUTED),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Run an agent, then select its checkpoint.",
+                    "Run an agent, then select its checkpoint.",
                     Style::default().fg(DIM),
                 )),
             ])
             .style(Style::default().bg(PANEL_BG)),
-            inner,
+            content,
         );
         return;
     };
+    let compact = area.height < 30;
     let sections = Layout::vertical([
-        Constraint::Length(6),
+        Constraint::Length(if compact { 3 } else { 6 }),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Min(7),
+        Constraint::Min(3),
         Constraint::Length(1),
-        Constraint::Length(8),
+        Constraint::Length(if compact { 5 } else { 8 }),
     ])
-    .split(inner);
+    .split(content);
     let additions: usize = checkpoint.ready.files.iter().map(|f| f.additions).sum();
     let deletions: usize = checkpoint.ready.files.iter().map(|f| f.deletions).sum();
     let snapshot = &checkpoint.ready.snapshot_id;
     let oid = &checkpoint.ready.oid;
-    f.render_widget(
-        Paragraph::new(vec![
+    let summary_lines = if compact {
+        vec![
             Line::from(vec![
-                Span::styled(" Snapshot  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("{}  ·  ", &snapshot[..8.min(snapshot.len())]),
+                    Style::default().fg(TEXT_BRIGHT),
+                ),
+                Span::styled(
+                    format!("{} files  ", checkpoint.ready.files.len()),
+                    Style::default().fg(TEXT),
+                ),
+                Span::styled(
+                    format!("+{additions}  -{deletions}"),
+                    Style::default().fg(GREEN),
+                ),
+            ]),
+            Line::from(Span::styled(
+                if checkpoint.ready.recovered {
+                    "recovered · verified"
+                } else {
+                    "verified · immutable"
+                },
+                Style::default().fg(GREEN),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(vec![
+                Span::styled("Snapshot  ", Style::default().fg(MUTED)),
                 Span::styled(
                     snapshot[..8.min(snapshot.len())].to_string(),
                     Style::default().fg(TEXT_BRIGHT),
                 ),
             ]),
             Line::from(vec![
-                Span::styled(" Files     ", Style::default().fg(MUTED)),
+                Span::styled("Files     ", Style::default().fg(MUTED)),
                 Span::styled(
                     format!("{} changed", checkpoint.ready.files.len()),
                     Style::default().fg(TEXT),
@@ -1616,14 +1805,14 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 ),
             ]),
             Line::from(vec![
-                Span::styled(" OID       ", Style::default().fg(MUTED)),
+                Span::styled("OID       ", Style::default().fg(MUTED)),
                 Span::styled(
                     oid[..8.min(oid.len())].to_string(),
                     Style::default().fg(DIM),
                 ),
             ]),
             Line::from(vec![
-                Span::styled(" State     ", Style::default().fg(MUTED)),
+                Span::styled("State     ", Style::default().fg(MUTED)),
                 Span::styled(
                     if checkpoint.ready.recovered {
                         "recovered · verified"
@@ -1633,8 +1822,10 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     Style::default().fg(GREEN),
                 ),
             ]),
-        ])
-        .style(Style::default().bg(PANEL_BG)),
+        ]
+    };
+    f.render_widget(
+        Paragraph::new(summary_lines).style(Style::default().bg(PANEL_BG)),
         sections[0],
     );
     f.render_widget(
@@ -1645,13 +1836,15 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
     let total = detail.patch.len();
     let scroll = (detail.patch_scroll as usize).min(total.saturating_sub(1));
-    let available = sections[3].height.saturating_sub(1) as usize;
+    let available = sections[3].height as usize;
     let visible_end = (scroll + available).min(total);
     let title = if total == 0 {
-        " Patch  ·  pending ".to_string()
+        "Patch  ·  pending".to_string()
+    } else if area.width < 46 {
+        format!("Patch  {}-{}/{}", scroll + 1, visible_end, total)
     } else {
         format!(
-            " Patch  ·  lines {}-{} of {}  ·  PgUp/PgDn ",
+            "Patch  ·  lines {}-{} of {}  ·  PgUp/PgDn",
             scroll + 1,
             visible_end,
             total
@@ -1681,9 +1874,10 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .border_style(Style::default().fg(BORDER)),
         sections[4],
     );
-    let mut note_lines = vec![Line::from(vec![
+    let notes = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(sections[5]);
+    let mut note_header = vec![Line::from(vec![
         Span::styled(
-            " Review notes",
+            "Review notes",
             Style::default()
                 .fg(TEXT_BRIGHT)
                 .add_modifier(Modifier::BOLD),
@@ -1693,37 +1887,39 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Style::default().fg(MUTED),
         ),
     ])];
-    if detail.comments.is_empty() {
-        note_lines.push(Line::from(Span::styled(
-            "  Select a checkpoint and press c to add one.",
+    if let Some(comment) = detail.comments.last() {
+        note_header.push(Line::from(vec![
+            Span::styled("● ", Style::default().fg(ACCENT)),
+            Span::styled("You", Style::default().fg(TEXT_BRIGHT)),
+            Span::styled(
+                format!("  {}", format_relative(comment.created_ms)),
+                Style::default().fg(DIM),
+            ),
+        ]));
+        f.render_widget(
+            Paragraph::new(comment.text.clone())
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(TEXT).bg(PANEL_BG)),
+            notes[1].inner(Margin {
+                horizontal: 2,
+                vertical: 0,
+            }),
+        );
+    } else {
+        note_header.push(Line::from(Span::styled(
+            "Select a checkpoint and press c to add one.",
             Style::default().fg(DIM),
         )));
-    } else {
-        for comment in detail.comments.iter().rev().take(2) {
-            note_lines.push(Line::from(vec![
-                Span::styled("  ● ", Style::default().fg(ACCENT)),
-                Span::styled("You", Style::default().fg(TEXT_BRIGHT)),
-                Span::styled(
-                    format!("  {}", format_relative(comment.created_ms)),
-                    Style::default().fg(DIM),
-                ),
-            ]));
-            note_lines.push(Line::from(Span::styled(
-                format!(
-                    "    {}",
-                    truncate_chars(&comment.text, (area.width as usize).saturating_sub(8))
-                ),
-                Style::default().fg(TEXT),
-            )));
-        }
     }
     f.render_widget(
-        Paragraph::new(note_lines).style(Style::default().bg(PANEL_BG)),
-        sections[5],
+        Paragraph::new(note_header).style(Style::default().bg(PANEL_BG)),
+        notes[0],
     );
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let compact = area.width < 110;
+    let medium = area.width < 140;
     f.render_widget(
         Block::default()
             .borders(Borders::TOP)
@@ -1744,31 +1940,65 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     } else {
         format!("{active} run(s) active")
     };
-    let right = format!("● {status}  ·  {}", short_repo(&selected_repo(app)));
+    let right = if area.width < 140 {
+        format!("● {status} ")
+    } else {
+        format!("● {status}  ·  {}", short_repo(&selected_repo(app)))
+    };
 
     let (heading, input) = match &app.mode {
         Mode::Normal => {
-            let keys = Line::from(vec![
-                key_badge("n"),
-                Span::raw(" new run   "),
-                key_badge("r"),
-                Span::raw(" refresh   "),
-                key_badge("c"),
-                Span::raw(" comment   "),
-                key_badge("i"),
-                Span::raw(" integrate   "),
-                key_badge("x"),
-                Span::raw(" cancel   "),
-                key_badge("?"),
-                Span::raw(" help   "),
-                key_badge("q"),
-                Span::raw(" quit"),
-            ]);
-            let status = if app.status.is_empty() {
-                "Ready · Enter opens the selected task.".to_string()
+            let keys = if compact {
+                Line::from(vec![
+                    key_badge("n"),
+                    Span::raw(" run   "),
+                    key_badge("r"),
+                    Span::raw(" refresh   "),
+                    key_badge("c"),
+                    Span::raw(" comment   "),
+                    key_badge("Tab"),
+                    Span::raw(if app.narrow_view == NarrowView::Run {
+                        " review   "
+                    } else {
+                        " run   "
+                    }),
+                    key_badge("q"),
+                    Span::raw(" quit"),
+                ])
+            } else if medium {
+                Line::from(vec![
+                    key_badge("n"),
+                    Span::raw(" run   "),
+                    key_badge("r"),
+                    Span::raw(" refresh   "),
+                    key_badge("c"),
+                    Span::raw(" comment   "),
+                    key_badge("x"),
+                    Span::raw(" cancel   "),
+                    key_badge("?"),
+                    Span::raw(" help   "),
+                    key_badge("q"),
+                    Span::raw(" quit"),
+                ])
             } else {
-                app.status.clone()
+                Line::from(vec![
+                    key_badge("n"),
+                    Span::raw(" new run   "),
+                    key_badge("r"),
+                    Span::raw(" refresh   "),
+                    key_badge("c"),
+                    Span::raw(" comment   "),
+                    key_badge("i"),
+                    Span::raw(" integrate   "),
+                    key_badge("x"),
+                    Span::raw(" cancel   "),
+                    key_badge("?"),
+                    Span::raw(" help   "),
+                    key_badge("q"),
+                    Span::raw(" quit"),
+                ])
             };
+            let status = app.status.clone();
             (
                 keys,
                 Line::from(Span::styled(status, Style::default().fg(MUTED))),
@@ -1777,7 +2007,11 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Mode::CommentInput { anchor_desc, .. } => (
             Line::from(vec![
                 Span::styled(
-                    format!("COMENTARIO [{anchor_desc}] "),
+                    if compact {
+                        "COMENTARIO ".to_string()
+                    } else {
+                        format!("COMENTARIO [{anchor_desc}] ")
+                    },
                     Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("Enter guarda · Esc cancela", Style::default().fg(MUTED)),
@@ -1795,7 +2029,11 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ),
         Mode::BranchInput { .. } => (
             Line::from(Span::styled(
-                "INTEGRAR fast-forward: escribí la rama destino · Enter ejecuta · Esc cancela",
+                if compact {
+                    "INTEGRAR FF · Enter ejecuta · Esc cancela"
+                } else {
+                    "INTEGRAR fast-forward: escribí la rama destino · Enter ejecuta · Esc cancela"
+                },
                 Style::default().fg(MAGENTA),
             )),
             Line::from(Span::styled(
@@ -1811,7 +2049,11 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ),
         Mode::RunInput { .. } => (
             Line::from(Span::styled(
-                "NUEVO RUN: escribí el objetivo en el thread abierto · Enter lanza · Esc cancela",
+                if compact {
+                    "NUEVO RUN · Enter lanza · Esc cancela"
+                } else {
+                    "NUEVO RUN: escribí el objetivo en el thread abierto · Enter lanza · Esc cancela"
+                },
                 Style::default().fg(ACCENT),
             )),
             Line::from(Span::styled(
@@ -1827,7 +2069,11 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ),
         Mode::Help => (
             Line::from(Span::styled(
-                "↑↓ select · Enter open · n run · c comment · f feedback · i integrate · x cancel · PgUp/PgDn patch · r refresh · q quit",
+                if compact {
+                    "↑↓ select · Enter open · n run · c comment · Tab view · r refresh · q quit"
+                } else {
+                    "↑↓ select · Enter open · n run · c comment · f feedback · i integrate · x cancel · PgUp/PgDn patch · r refresh · q quit"
+                },
                 Style::default().fg(MUTED),
             )),
             Line::from(Span::styled(
@@ -1836,7 +2082,15 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             )),
         ),
     };
-    let row = Layout::horizontal([Constraint::Min(0), Constraint::Length(30)]).split(rows[0]);
+    let right_width = if compact {
+        22
+    } else if area.width >= 140 {
+        58
+    } else {
+        30
+    };
+    let row =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(rows[0]);
     f.render_widget(
         Paragraph::new(heading).style(Style::default().bg(BG)),
         row[0],
@@ -1885,7 +2139,7 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
                 seq,
-                Span::raw("💬 "),
+                Span::styled("msg   ", Style::default().fg(DIM)),
                 Span::raw(truncate_chars(
                     p.text.lines().next().unwrap_or_default(),
                     76,
@@ -1897,7 +2151,7 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
                 seq,
-                Span::raw("🔧 "),
+                Span::styled("tool  ", Style::default().fg(DIM)),
                 Span::raw(truncate_chars(&p.title, 60)),
                 Span::raw(p.status.map(|s| format!(" [{s}]")).unwrap_or_default()),
             ])
@@ -1907,7 +2161,7 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
                 seq,
-                Span::raw("🔐 "),
+                Span::styled("perm  ", Style::default().fg(DIM)),
                 Span::raw(truncate_chars(&p.title, 70)),
             ])
         }
@@ -1917,7 +2171,7 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
             Line::from(vec![
                 seq,
                 Span::styled(
-                    format!("🔐 → {} ({}) ", p.option_id, p.policy),
+                    format!("perm → {} ({}) ", p.option_id, p.policy),
                     Style::default().fg(DIM),
                 ),
             ])
@@ -1943,7 +2197,7 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
             let dels: usize = p.files.iter().map(|f| f.deletions).sum();
             Line::from(vec![
                 seq,
-                Span::styled("📌 checkpoint ", Style::default().fg(YELLOW)),
+                Span::styled("checkpoint ", Style::default().fg(YELLOW)),
                 Span::styled(
                     p.snapshot_id[..8.min(p.snapshot_id.len())].to_string(),
                     Style::default().fg(YELLOW),
@@ -1977,7 +2231,7 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
                 .unwrap_or("open");
             Line::from(vec![
                 seq,
-                Span::styled("🚩 ", Style::default().fg(MAGENTA)),
+                Span::styled("note  ", Style::default().fg(MAGENTA)),
                 Span::raw(format!(
                     "{}:{}-{} [{state}] ",
                     p.anchor.path, p.anchor.start_line, p.anchor.end_line
@@ -1995,7 +2249,7 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
             Line::from(vec![
                 seq,
                 Span::styled(
-                    format!("📤 feedback enviado ({} comentarios) ", p.comment_ids.len()),
+                    format!("feedback enviado ({} comentarios) ", p.comment_ids.len()),
                     Style::default().fg(ACCENT),
                 ),
             ])
@@ -2006,10 +2260,7 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
             Line::from(vec![
                 seq,
                 Span::styled(
-                    format!(
-                        "📬 feedback ENTREGADO ({} comentarios) ",
-                        p.comment_ids.len()
-                    ),
+                    format!("feedback ENTREGADO ({} comentarios) ", p.comment_ids.len()),
                     Style::default().fg(GREEN),
                 ),
             ])
@@ -2038,7 +2289,7 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
             Line::from(vec![
                 seq,
                 Span::styled(
-                    format!("⏹ run terminó: {} ", p.state),
+                    format!("run terminó: {} ", p.state),
                     Style::default().fg(color),
                 ),
             ])
@@ -2052,9 +2303,10 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
                 seq,
+                Span::styled("session  ", Style::default().fg(DIM)),
                 Span::styled(
                     format!(
-                        "🔌 sesión del motor {} ",
+                        "sesión del motor {} ",
                         if p.resumed { "reanudada" } else { "nueva" }
                     ),
                     Style::default().fg(DIM),
@@ -2089,7 +2341,7 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
             Line::from(vec![
                 seq,
                 Span::styled(
-                    format!("🧪 validación exit {} ", p.exit_code),
+                    format!("test  validación exit {} ", p.exit_code),
                     Style::default().fg(color),
                 ),
                 Span::raw(truncate_chars(&p.command, 40)),
