@@ -28,6 +28,7 @@ pub struct ThreadRow {
 pub struct ThreadRunSummary {
     pub thread_id: String,
     pub run_count: i64,
+    pub latest_run_id: Option<String>,
     pub latest_state: Option<String>,
     pub latest_branch: Option<String>,
     pub started_ms: Option<i64>,
@@ -108,7 +109,7 @@ pub fn run_summaries(conn: &Connection, limit: i64) -> Result<HashMap<String, Th
     let mut stmt = conn.prepare(
         "SELECT t.id,
                 (SELECT COUNT(*) FROM runs r WHERE r.thread_id = t.id),
-                r.state, r.branch, r.started_ms, r.ended_ms
+                r.id, r.state, r.branch, r.started_ms, r.ended_ms
          FROM threads t
          LEFT JOIN runs r ON r.id = (
              SELECT r2.id FROM runs r2
@@ -123,10 +124,11 @@ pub fn run_summaries(conn: &Connection, limit: i64) -> Result<HashMap<String, Th
         Ok(ThreadRunSummary {
             thread_id: row.get(0)?,
             run_count: row.get(1)?,
-            latest_state: row.get(2)?,
-            latest_branch: row.get(3)?,
-            started_ms: row.get(4)?,
-            ended_ms: row.get(5)?,
+            latest_run_id: row.get(2)?,
+            latest_state: row.get(3)?,
+            latest_branch: row.get(4)?,
+            started_ms: row.get(5)?,
+            ended_ms: row.get(6)?,
         })
     })?;
     let mut out = HashMap::new();

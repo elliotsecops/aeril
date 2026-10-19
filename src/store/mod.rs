@@ -138,9 +138,11 @@ mod tests {
         let summaries = threads::run_summaries(&store.conn, 10).unwrap();
         let idle_summary = summaries.get(&idle.id).unwrap();
         assert_eq!(idle_summary.run_count, 0);
+        assert_eq!(idle_summary.latest_run_id, None);
         assert_eq!(idle_summary.latest_state, None);
         let busy_summary = summaries.get(&busy.id).unwrap();
         assert_eq!(busy_summary.run_count, 2);
+        assert_eq!(busy_summary.latest_run_id.as_deref(), Some("run-new"));
         assert_eq!(busy_summary.latest_state.as_deref(), Some("completed"));
         assert_eq!(busy_summary.latest_branch.as_deref(), Some("new"));
         assert_eq!(busy_summary.started_ms, Some(30));

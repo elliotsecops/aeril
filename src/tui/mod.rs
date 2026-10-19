@@ -39,6 +39,7 @@ pub struct ThreadDetail {
 
 pub struct CheckpointPanel {
     pub ready: events::payload::CheckpointReady,
+    pub run_id: Option<String>,
     pub ordinal: usize,
     pub total: usize,
 }
@@ -273,6 +274,7 @@ impl App {
             detail.patch = ready.patch.lines().map(str::to_string).collect();
             detail.checkpoint = Some(CheckpointPanel {
                 ready,
+                run_id: ev.run_id.clone(),
                 ordinal,
                 total,
             });
@@ -1114,21 +1116,15 @@ fn render(f: &mut Frame, app: &mut App) {
 
 fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let compact = area.width < 110;
-    let mut title = vec![
+    let title = vec![
         Span::styled(
             " Aeril",
             Style::default()
                 .fg(TEXT_BRIGHT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ·  Fase 1", Style::default().fg(MUTED)),
+        Span::styled("  |  Agent workspace", Style::default().fg(MUTED)),
     ];
-    if !compact {
-        title.push(Span::styled(
-            "  │  coding agent workspace ",
-            Style::default().fg(DIM),
-        ));
-    }
     let block = panel();
     f.render_widget(block, area);
     let inner = area.inner(Margin {
@@ -1257,7 +1253,11 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 Span::styled(status.clone(), Style::default().fg(color)),
             ];
             let mut lines = vec![Line::from(vec![
-                Span::styled(format!(" {:>2}  ", idx + 1), Style::default().fg(DIM)),
+                Span::styled(
+                    if selected { "▌" } else { " " },
+                    Style::default().fg(if selected { ACCENT } else { PANEL_BG }),
+                ),
+                Span::styled(format!("{:>2}  ", idx + 1), Style::default().fg(DIM)),
                 Span::styled("● ", Style::default().fg(color)),
                 Span::styled(
                     truncate_chars(&thread.title, title_width.max(8)),
@@ -1308,11 +1308,19 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
 }
 
 fn latest_goal(detail: &ThreadDetail) -> Option<String> {
+    let current_run = detail
+        .run_summary
+        .as_ref()
+        .and_then(|s| s.latest_run_id.as_deref());
     detail
         .events
         .iter()
         .rev()
-        .find(|ev| ev.kind == events::K_RUN_STARTED)
+        .find(|ev| {
+            ev.kind == events::K_RUN_STARTED
+                && current_run.is_some()
+                && ev.run_id.as_deref() == current_run
+        })
         .and_then(|ev| ev.parse::<events::payload::RunStarted>().ok())
         .map(|p| p.goal)
 }
@@ -1336,20 +1344,32 @@ fn run_is_active(detail: &ThreadDetail) -> bool {
 }
 
 fn checklist(detail: &ThreadDetail) -> Vec<(String, Color, String)> {
-    let has_session = detail
+    let current_run = detail
+        .run_summary
+        .as_ref()
+        .and_then(|s| s.latest_run_id.as_deref());
+    let Some(current_run) = current_run else {
+        return Vec::new();
+    };
+    let current_events = detail
         .events
         .iter()
-        .any(|ev| ev.kind == events::K_ENGINE_SESSION);
-    let has_activity = detail.events.iter().any(|ev| {
-        ev.kind == events::K_AGENT_TOOL_CALL || ev.kind == events::K_PERMISSION_REQUESTED
-    });
-    let has_checkpoint = detail.checkpoint.is_some();
-    let has_run = detail
+        .filter(|ev| ev.run_id.as_deref() == Some(current_run));
+    let mut has_session = false;
+    let mut has_activity = false;
+    let mut has_checkpoint = false;
+    for ev in current_events {
+        has_session |= ev.kind == events::K_ENGINE_SESSION;
+        has_activity |=
+            ev.kind == events::K_AGENT_TOOL_CALL || ev.kind == events::K_PERMISSION_REQUESTED;
+        has_checkpoint |= ev.kind == events::K_CHECKPOINT_READY;
+    }
+    if detail
         .run_summary
         .as_ref()
         .and_then(|s| s.latest_state.as_deref())
-        .is_some();
-    if !has_run {
+        .is_none()
+    {
         return Vec::new();
     }
     let active = run_is_active(detail);
@@ -1511,7 +1531,10 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 .iter()
                 .find(|(icon, ..)| icon.as_str() == "●")
                 .map(|(_, color, text)| {
-                    Span::styled(format!("  ·  ● {text}"), Style::default().fg(*color))
+                    Span::styled(
+                        format!("  ·  ● {}", truncate_chars(text, 16)),
+                        Style::default().fg(*color),
+                    )
                 });
         let mut line = vec![Span::styled(
             format!("  {done}/{} steps complete", steps.len()),
@@ -1640,26 +1663,74 @@ fn patch_line(
     Line::from(vec![numbers, Span::styled(line.to_string(), body_style)])
 }
 
+fn diff_path(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("diff --git a/")?;
+    let (_, path) = rest.split_once(" b/")?;
+    Some(path.to_string())
+}
+
+fn is_git_metadata(line: &str) -> bool {
+    line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("rename from ")
+        || line.starts_with("rename to ")
+}
+
 fn patch_display_lines(detail: &ThreadDetail) -> Vec<Line<'static>> {
     let mut old = 0i64;
     let mut new = 0i64;
     let mut out = Vec::with_capacity(detail.patch.len());
+    let stats: std::collections::HashMap<&str, (usize, usize)> = detail
+        .checkpoint
+        .as_ref()
+        .into_iter()
+        .flat_map(|checkpoint| checkpoint.ready.files.iter())
+        .map(|file| (file.path.as_str(), (file.additions, file.deletions)))
+        .collect();
     for line in &detail.patch {
         if let Some((old_start, new_start)) = parse_hunk(line) {
             old = old_start;
             new = new_start;
             out.push(Line::from(Span::styled(
-                line.clone(),
+                format!("  {line}"),
                 Style::default().fg(CYAN),
             )));
-        } else if line.starts_with("diff --git")
-            || line.starts_with("index ")
-            || line.starts_with("--- ")
-            || line.starts_with("+++ ")
-        {
+        } else if line.starts_with("diff --git ") {
+            if !out.is_empty() {
+                out.push(Line::from(""));
+            }
+            let path = diff_path(line).unwrap_or_else(|| line.clone());
+            let (additions, deletions) = stats.get(path.as_str()).copied().unwrap_or((0, 0));
+            let mut header = vec![
+                Span::styled("▾ ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    path,
+                    Style::default()
+                        .fg(TEXT_BRIGHT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if additions > 0 || deletions > 0 {
+                header.push(Span::styled(
+                    format!("   +{additions}"),
+                    Style::default().fg(GREEN),
+                ));
+                header.push(Span::styled(
+                    format!("  -{deletions}"),
+                    Style::default().fg(RED),
+                ));
+            }
+            out.push(Line::from(header));
+        } else if is_git_metadata(line) {
             out.push(Line::from(Span::styled(
-                line.clone(),
-                Style::default().fg(MUTED),
+                format!("  {line}"),
+                Style::default().fg(DIM),
             )));
         } else if line.starts_with('-') {
             out.push(patch_line(line, old, new, true, false));
@@ -1745,6 +1816,28 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         );
         return;
     };
+    let current_run = detail
+        .run_summary
+        .as_ref()
+        .and_then(|s| s.latest_run_id.as_deref());
+    let checkpoint_from_current =
+        current_run.is_some() && checkpoint.run_id.as_deref() == current_run;
+    let checkpoint_run_label = if checkpoint_from_current {
+        "current run"
+    } else if current_run.is_some() {
+        if area.width < 46 {
+            "previous run"
+        } else {
+            "previous run · current pending"
+        }
+    } else {
+        "current thread"
+    };
+    let checkpoint_run_color = if checkpoint_from_current {
+        GREEN
+    } else {
+        YELLOW
+    };
     let compact = area.height < 30;
     let sections = Layout::vertical([
         Constraint::Length(if compact { 3 } else { 6 }),
@@ -1783,6 +1876,10 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 },
                 Style::default().fg(GREEN),
             )),
+            Line::from(Span::styled(
+                checkpoint_run_label,
+                Style::default().fg(checkpoint_run_color),
+            )),
         ]
     } else {
         vec![
@@ -1820,6 +1917,13 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                         "verified · immutable"
                     },
                     Style::default().fg(GREEN),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Run       ", Style::default().fg(MUTED)),
+                Span::styled(
+                    checkpoint_run_label,
+                    Style::default().fg(checkpoint_run_color),
                 ),
             ]),
         ]
@@ -2119,8 +2223,22 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 }
 
+fn action(label: &str, color: Color) -> Span<'static> {
+    Span::styled(
+        format!("{label:<8}"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn split_title(title: &str) -> (String, String) {
+    match title.split_once(": ") {
+        Some((verb, path)) => (verb.to_string(), path.to_string()),
+        None => (title.to_string(), String::new()),
+    }
+}
+
 fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
-    let seq = Span::styled(
+    let time = Span::styled(
         format!("{}  ", display_time(ev.created_ms)),
         Style::default().fg(DIM),
     );
@@ -2129,50 +2247,79 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
             let p: events::payload::RunStarted =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
-                seq,
-                Span::styled("▶ run ", Style::default().fg(ACCENT)),
-                Span::raw(truncate_chars(&p.goal, 70)),
+                time,
+                action("run", ACCENT),
+                Span::styled(truncate_chars(&p.goal, 70), Style::default().fg(TEXT)),
             ])
         }
         events::K_AGENT_MESSAGE => {
             let p: events::payload::AgentMessage =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
-                seq,
-                Span::styled("msg   ", Style::default().fg(DIM)),
-                Span::raw(truncate_chars(
-                    p.text.lines().next().unwrap_or_default(),
-                    76,
-                )),
+                time,
+                action("msg", MUTED),
+                Span::styled(
+                    truncate_chars(p.text.lines().next().unwrap_or_default(), 76),
+                    Style::default().fg(TEXT),
+                ),
             ])
         }
         events::K_AGENT_TOOL_CALL => {
             let p: events::payload::AgentToolCall =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
-            Line::from(vec![
-                seq,
-                Span::styled("tool  ", Style::default().fg(DIM)),
-                Span::raw(truncate_chars(&p.title, 60)),
-                Span::raw(p.status.map(|s| format!(" [{s}]")).unwrap_or_default()),
-            ])
+            let (verb, path) = split_title(&p.title);
+            let mut spans = vec![
+                time,
+                action("tool", CYAN),
+                Span::styled(truncate_chars(&verb, 28), Style::default().fg(MUTED)),
+            ];
+            if !path.is_empty() {
+                spans.push(Span::styled("  ", Style::default()));
+                spans.push(Span::styled(
+                    truncate_chars(&path, 52),
+                    Style::default().fg(TEXT_BRIGHT),
+                ));
+            }
+            if let Some(status) = p.status.as_deref() {
+                let color = match status {
+                    "completed" => GREEN,
+                    "failed" => RED,
+                    _ => MUTED,
+                };
+                spans.push(Span::styled(
+                    format!("  {status}"),
+                    Style::default().fg(color),
+                ));
+            }
+            Line::from(spans)
         }
         events::K_PERMISSION_REQUESTED => {
             let p: events::payload::PermissionRequested =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
-            Line::from(vec![
-                seq,
-                Span::styled("perm  ", Style::default().fg(DIM)),
-                Span::raw(truncate_chars(&p.title, 70)),
-            ])
+            let (verb, path) = split_title(&p.title);
+            let mut spans = vec![
+                time,
+                action("perm", YELLOW),
+                Span::styled(truncate_chars(&verb, 28), Style::default().fg(MUTED)),
+            ];
+            if !path.is_empty() {
+                spans.push(Span::styled("  ", Style::default()));
+                spans.push(Span::styled(
+                    truncate_chars(&path, 52),
+                    Style::default().fg(TEXT_BRIGHT),
+                ));
+            }
+            Line::from(spans)
         }
         events::K_PERMISSION_RESPONDED => {
             let p: events::payload::PermissionResponded =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
-                seq,
+                time,
+                action("perm", YELLOW),
                 Span::styled(
-                    format!("perm → {} ({}) ", p.option_id, p.policy),
-                    Style::default().fg(DIM),
+                    format!("{}  ({})", p.option_id, p.policy),
+                    Style::default().fg(MUTED),
                 ),
             ])
         }
@@ -2180,13 +2327,12 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
             let p: events::payload::CheckpointPrepared =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
-                seq,
+                time,
+                action("chkpt", MUTED),
+                Span::styled("prepared  ", Style::default().fg(DIM)),
                 Span::styled(
-                    format!(
-                        "… checkpoint preparado {} ",
-                        &p.snapshot_id[..8.min(p.snapshot_id.len())]
-                    ),
-                    Style::default().fg(DIM),
+                    p.snapshot_id[..8.min(p.snapshot_id.len())].to_string(),
+                    Style::default().fg(TEXT),
                 ),
             ])
         }
@@ -2196,26 +2342,32 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
             let adds: usize = p.files.iter().map(|f| f.additions).sum();
             let dels: usize = p.files.iter().map(|f| f.deletions).sum();
             Line::from(vec![
-                seq,
-                Span::styled("checkpoint ", Style::default().fg(YELLOW)),
+                time,
+                action("chkpt", GREEN),
                 Span::styled(
                     p.snapshot_id[..8.min(p.snapshot_id.len())].to_string(),
+                    Style::default().fg(TEXT_BRIGHT),
+                ),
+                Span::styled(
+                    format!("  {} files", p.files.len()),
+                    Style::default().fg(MUTED),
+                ),
+                Span::styled(format!("  +{adds}"), Style::default().fg(GREEN)),
+                Span::styled(format!("  -{dels}"), Style::default().fg(RED)),
+                Span::styled(
+                    if p.recovered { "  recovered" } else { "" },
                     Style::default().fg(YELLOW),
                 ),
-                Span::raw(format!(
-                    " · {} archivo(s) +{adds} −{dels}{}",
-                    p.files.len(),
-                    if p.recovered { " · recuperado" } else { "" }
-                )),
             ])
         }
         events::K_CHECKPOINT_FAILED => {
             let p: events::payload::CheckpointFailed =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
-                seq,
+                time,
+                action("error", RED),
                 Span::styled(
-                    format!("✖ checkpoint falló: {} ", truncate_chars(&p.reason, 60)),
+                    format!("checkpoint failed  {}", truncate_chars(&p.reason, 54)),
                     Style::default().fg(RED),
                 ),
             ])
@@ -2230,27 +2382,36 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
                 .map(|c| c.state.as_str())
                 .unwrap_or("open");
             Line::from(vec![
-                seq,
-                Span::styled("note  ", Style::default().fg(MAGENTA)),
-                Span::raw(format!(
-                    "{}:{}-{} [{state}] ",
-                    p.anchor.path, p.anchor.start_line, p.anchor.end_line
-                )),
-                Span::raw(truncate_chars(&p.text, 40)),
+                time,
+                action("note", MAGENTA),
+                Span::styled(
+                    truncate_chars(&p.anchor.path, 34),
+                    Style::default().fg(TEXT_BRIGHT),
+                ),
+                Span::styled(
+                    format!(
+                        ":{}-{}  [{state}]  ",
+                        p.anchor.start_line, p.anchor.end_line
+                    ),
+                    Style::default().fg(DIM),
+                ),
+                Span::styled(truncate_chars(&p.text, 38), Style::default().fg(TEXT)),
             ])
         }
         events::K_COMMENT_RESOLVED => Line::from(vec![
-            seq,
-            Span::styled("✓ comentario resuelto ", Style::default().fg(GREEN)),
+            time,
+            action("note", GREEN),
+            Span::styled("resolved", Style::default().fg(GREEN)),
         ]),
         events::K_FEEDBACK_SENT => {
             let p: events::payload::FeedbackSent =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
-                seq,
+                time,
+                action("feedback", ACCENT),
                 Span::styled(
-                    format!("feedback enviado ({} comentarios) ", p.comment_ids.len()),
-                    Style::default().fg(ACCENT),
+                    format!("sent  {} comments", p.comment_ids.len()),
+                    Style::default().fg(MUTED),
                 ),
             ])
         }
@@ -2258,9 +2419,10 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
             let p: events::payload::FeedbackDelivered =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
-                seq,
+                time,
+                action("feedback", GREEN),
                 Span::styled(
-                    format!("feedback ENTREGADO ({} comentarios) ", p.comment_ids.len()),
+                    format!("delivered  {} comments", p.comment_ids.len()),
                     Style::default().fg(GREEN),
                 ),
             ])
@@ -2269,12 +2431,10 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
             let p: events::payload::FeedbackFailed =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
-                seq,
+                time,
+                action("error", RED),
                 Span::styled(
-                    format!(
-                        "✖ feedback no entregado: {} ",
-                        truncate_chars(&p.reason, 50)
-                    ),
+                    format!("feedback failed  {}", truncate_chars(&p.reason, 46)),
                     Style::default().fg(RED),
                 ),
             ])
@@ -2287,49 +2447,49 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
                 _ => RED,
             };
             Line::from(vec![
-                seq,
-                Span::styled(
-                    format!("run terminó: {} ", p.state),
-                    Style::default().fg(color),
-                ),
+                time,
+                action("end", color),
+                Span::styled(p.state, Style::default().fg(color)),
             ])
         }
         events::K_WORKSPACE_RECREATED => Line::from(vec![
-            seq,
-            Span::styled("↻ workspace recreado ", Style::default().fg(YELLOW)),
+            time,
+            action("worktree", YELLOW),
+            Span::styled("recreated", Style::default().fg(YELLOW)),
         ]),
         events::K_ENGINE_SESSION => {
             let p: events::payload::EngineSession =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
-                seq,
-                Span::styled("session  ", Style::default().fg(DIM)),
+                time,
+                action("session", MUTED),
                 Span::styled(
-                    format!(
-                        "sesión del motor {} ",
-                        if p.resumed { "reanudada" } else { "nueva" }
-                    ),
+                    if p.resumed { "resumed" } else { "new" },
+                    Style::default().fg(TEXT),
+                ),
+                Span::styled(
+                    if p.verified {
+                        "  context verified"
+                    } else {
+                        "  context unverified"
+                    },
                     Style::default().fg(DIM),
                 ),
             ])
         }
         events::K_INTEGRATION_COMPLETED => Line::from(vec![
-            seq,
-            Span::styled(
-                "⇥ integración fast-forward completada ",
-                Style::default().fg(GREEN),
-            ),
+            time,
+            action("merge", GREEN),
+            Span::styled("fast-forward completed", Style::default().fg(GREEN)),
         ]),
         events::K_INTEGRATION_BLOCKED => {
             let p: events::payload::IntegrationBlocked =
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             Line::from(vec![
-                seq,
+                time,
+                action("error", RED),
                 Span::styled(
-                    format!(
-                        "⇥ integración bloqueada: {} ",
-                        truncate_chars(&p.reason, 60)
-                    ),
+                    format!("merge blocked  {}", truncate_chars(&p.reason, 48)),
                     Style::default().fg(RED),
                 ),
             ])
@@ -2339,15 +2499,20 @@ fn summarize_event(detail: &ThreadDetail, ev: &EventRecord) -> Line<'static> {
                 ev.parse().unwrap_or_else(|_| unreachable_payload());
             let color = if p.exit_code == 0 { GREEN } else { RED };
             Line::from(vec![
-                seq,
+                time,
+                action("test", color),
                 Span::styled(
-                    format!("test  validación exit {} ", p.exit_code),
+                    format!("exit {}  ", p.exit_code),
                     Style::default().fg(color),
                 ),
-                Span::raw(truncate_chars(&p.command, 40)),
+                Span::styled(truncate_chars(&p.command, 42), Style::default().fg(TEXT)),
             ])
         }
-        other => Line::from(vec![seq, Span::raw(truncate_chars(other, 60))]),
+        other => Line::from(vec![
+            time,
+            action("event", DIM),
+            Span::styled(truncate_chars(other, 60), Style::default().fg(MUTED)),
+        ]),
     }
 }
 
@@ -2367,4 +2532,100 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// Firma compatible con `Result<()>` del CLI.
 pub fn run_result(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) -> Result<()> {
     run(data_dir, db_path, backend, t0).map_err(|e| Error::Other(format!("TUI: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_started(seq: i64, run_id: &str, goal: &str) -> EventRecord {
+        EventRecord {
+            id: format!("event-{seq}"),
+            thread_id: "thread".into(),
+            seq,
+            run_id: Some(run_id.into()),
+            kind: events::K_RUN_STARTED.into(),
+            actor: "system".into(),
+            payload_version: 1,
+            payload: serde_json::json!({
+                "backend": "mock",
+                "goal": goal,
+                "workspace_id": format!("ws-{run_id}"),
+                "repo_path": "/tmp/repo",
+                "worktree_path": format!("/tmp/worktree-{run_id}"),
+                "branch": format!("branch-{run_id}"),
+                "base_oid": "0000000000000000000000000000000000000000"
+            }),
+            created_ms: 0,
+        }
+    }
+
+    fn event(seq: i64, run_id: &str, kind: &str) -> EventRecord {
+        EventRecord {
+            id: format!("event-{seq}"),
+            thread_id: "thread".into(),
+            seq,
+            run_id: Some(run_id.into()),
+            kind: kind.into(),
+            actor: "system".into(),
+            payload_version: 1,
+            payload: serde_json::json!({}),
+            created_ms: 0,
+        }
+    }
+
+    fn detail_with_two_runs() -> ThreadDetail {
+        ThreadDetail {
+            thread_id: "thread".into(),
+            title: "two runs".into(),
+            repo_path: "/tmp/repo".into(),
+            events: vec![
+                run_started(0, "run-old", "old goal"),
+                event(1, "run-old", events::K_ENGINE_SESSION),
+                event(2, "run-old", events::K_AGENT_TOOL_CALL),
+                event(3, "run-old", events::K_CHECKPOINT_READY),
+                event(4, "run-old", events::K_RUN_ENDED),
+                run_started(5, "run-new", "new goal"),
+                event(6, "run-new", events::K_ENGINE_SESSION),
+            ],
+            sel: 6,
+            comments: Vec::new(),
+            patch: Vec::new(),
+            patch_scroll: 0,
+            run_summary: Some(ThreadRunSummary {
+                thread_id: "thread".into(),
+                run_count: 2,
+                latest_run_id: Some("run-new".into()),
+                latest_state: Some("running".into()),
+                latest_branch: Some("branch-run-new".into()),
+                started_ms: Some(100),
+                ended_ms: None,
+            }),
+            checkpoint: Some(CheckpointPanel {
+                ready: events::payload::CheckpointReady::default(),
+                run_id: Some("run-old".into()),
+                ordinal: 1,
+                total: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn progress_is_scoped_to_the_latest_run() {
+        let detail = detail_with_two_runs();
+        let steps = checklist(&detail);
+        let step = |text: &str| {
+            steps
+                .iter()
+                .find(|(_, _, label)| label == text)
+                .unwrap_or_else(|| panic!("missing step {text}: {steps:?}"))
+        };
+
+        assert_eq!(step("Goal recorded").0, "✓");
+        assert_eq!(step("Engine session opened").0, "✓");
+        assert_eq!(step("Agent activity captured").0, "●");
+        assert_eq!(step("Checkpoint verified").0, "○");
+        assert_eq!(step("Run finalized").0, "○");
+        assert_eq!(latest_goal(&detail).as_deref(), Some("new goal"));
+    }
 }
