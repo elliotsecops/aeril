@@ -1,0 +1,40 @@
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  Aeril  |  Agent workspace                      workspace  d120x40/repo                         2026-10-19 22:45 UTC │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭───────────────────────────╮╭───────────────────────────────────────────────────╮╭────────────────────────────────────╮
+│  Tasks     1 · 0 active   ││  Run 1 — ejemplo de t…         completed  ·  <1s  ││  Checkpoint                 1 / 1  │
+│                           ││                                                   ││                                    │
+│  ▌ 1  ● ejemplo de tar…   ││  Goal                                             ││  Snapshot  eed170cb                │
+│        completed  ·  <1s  ││  revisá el repo                                   ││  Files     1 changed   +1  -1      │
+│                           ││                                                   ││  OID       66f9a96e                │
+│                           ││                                                   ││  State     verified · immutable    │
+│                           ││    5/5 steps complete                             ││  Run       current run             │
+│                           ││                                                   ││                                    │
+│                           ││  ───────────────────────────────────────────────  ││  ────────────────────────────────  │
+│                           ││   Agent output   Files 1   Reviews 0              ││  Patch  1-9/9                      │
+│                           ││  22:45:44  event   thread.created                 ││  ▾ NOTES.md   +1  -1               │
+│                           ││  22:45:44  run     revisá el repo                 ││    index 5c4a007..609b468 100644   │
+│                           ││  22:45:44  event   backend.spawned                ││    --- a/NOTES.md                  │
+│                           ││  22:45:44  session new  context unverified        ││    +++ b/NOTES.md                  │
+│                           ││  22:45:45  msg     analizando el repositorio      ││    @@ -1,3 +1,3 @@                 │
+│                           ││  22:45:45  tool    write_file  NOTES.md           ││     1    1   # notas               │
+│                           ││  22:45:45  perm    Approve edit  NOTES.md         ││     2    2                         │
+│                           ││  22:45:45  perm    allow_once  (auto_allow_once)  ││     3       -Estado inicial del r  │
+│                           ││  22:45:45  event   permission.transmitted         ││          3  +Actualizado.          │
+│                           ││  22:45:45  tool    tc-000000000001  completed     ││                                    │
+│                           ││  22:45:45  msg     revisión completa              ││                                    │
+│                           ││  22:45:45  chkpt   prepared  eed170cb             ││                                    │
+│                           ││  22:45:45  chkpt   eed170cb  1 files  +1  -1      ││                                    │
+│                           ││  22:45:45  end     completed                      ││                                    │
+│                           ││                                                   ││  ────────────────────────────────  │
+│                           ││                                                   ││  Review notes  0 comment(s)        │
+│                           ││                                                   ││  Select a checkpoint and press c   │
+│                           ││                                                   ││                                    │
+│                           ││                                                   ││                                    │
+│                           ││                                                   ││                                    │
+│                           ││                                                   ││                                    │
+│                           ││                                                   ││                                    │
+│                           ││                                                   ││                                    │
+╰───────────────────────────╯╰───────────────────────────────────────────────────╯╰────────────────────────────────────╯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   n  run    r  refresh    c  comment    x  cancel    ?  help    q  quit                                       ● idle
