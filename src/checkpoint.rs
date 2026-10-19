@@ -557,9 +557,10 @@ pub fn latest_ready(
     store: &Store,
     thread_id: &str,
 ) -> Result<Option<(EventRecord, payload::CheckpointReady)>> {
-    let mut all = events::fetch_by_kind(&store.conn, thread_id, events::K_CHECKPOINT_READY)?;
-    let last = all.pop();
-    match last {
+    // Proyección acotada: el ÚLTIMO `checkpoint.ready` por seq, sin materializar
+    // el historial de checkpoints del thread (mismo resultado que fetch_by_kind
+    // + pop, con memoria constante).
+    match events::fetch_latest_by_kind(&store.conn, thread_id, events::K_CHECKPOINT_READY)? {
         Some(ev) => {
             let parsed: payload::CheckpointReady = ev.parse()?;
             Ok(Some((ev, parsed)))
@@ -573,12 +574,33 @@ pub fn ready_for_snapshot(
     thread_id: &str,
     snapshot_id: &str,
 ) -> Result<Option<(EventRecord, payload::CheckpointReady)>> {
-    let all = events::fetch_by_kind(&store.conn, thread_id, events::K_CHECKPOINT_READY)?;
-    for ev in all.into_iter().rev() {
-        let parsed: payload::CheckpointReady = ev.parse()?;
-        if parsed.snapshot_id == snapshot_id {
-            return Ok(Some((ev, parsed)));
-        }
-    }
-    Ok(None)
+    // Proyección acotada por snapshot (no se materializa el historial):
+    // el ÚLTIMO `checkpoint.ready` de ese snapshot, por seq.
+    let mut stmt = store.conn.prepare(
+        "SELECT id, thread_id, seq, run_id, kind, actor, payload_version, payload, created_ms
+           FROM events
+          WHERE thread_id = ?1
+            AND kind = 'checkpoint.ready'
+            AND json_extract(payload, '$.snapshot_id') = ?2
+          ORDER BY seq DESC
+          LIMIT 1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![thread_id, snapshot_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let payload_text: String = row.get(7)?;
+    let ev = EventRecord {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        seq: row.get(2)?,
+        run_id: row.get(3)?,
+        kind: row.get(4)?,
+        actor: row.get(5)?,
+        payload_version: row.get(6)?,
+        payload: serde_json::from_str(&payload_text).unwrap_or(serde_json::Value::Null),
+        created_ms: row.get(8)?,
+    };
+    let parsed: payload::CheckpointReady = ev.parse()?;
+    Ok(Some((ev, parsed)))
 }

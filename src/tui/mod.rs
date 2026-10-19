@@ -2728,6 +2728,122 @@ mod tests {
         assert_eq!(latest_goal(&detail).as_deref(), Some("new goal"));
     }
 
+    /// Detail mínimo con un run en un estado dado (para la semántica del
+    /// checklist: activo vs terminal).
+    fn detail_with_state(
+        state: &str,
+        progress: events::RunProgress,
+        checkpoint: Option<CheckpointPanel>,
+    ) -> ThreadDetail {
+        ThreadDetail {
+            thread_id: "thread".into(),
+            title: "state".into(),
+            repo_path: "/tmp/repo".into(),
+            events: vec![run_started(0, "run-x", "goal")],
+            sel: 0,
+            comments: Vec::new(),
+            patch: Vec::new(),
+            patch_scroll: 0,
+            run_summary: Some(ThreadRunSummary {
+                thread_id: "thread".into(),
+                run_count: 1,
+                latest_run_id: Some("run-x".into()),
+                latest_state: Some(state.into()),
+                latest_branch: Some("branch-run-x".into()),
+                started_ms: Some(100),
+                ended_ms: None,
+            }),
+            progress,
+            checkpoint,
+        }
+    }
+
+    fn step_icon(detail: &ThreadDetail, text: &str) -> String {
+        let steps = checklist(detail);
+        steps
+            .iter()
+            .find(|(_, _, label)| label == text)
+            .unwrap_or_else(|| panic!("missing step {text}: {steps:?}"))
+            .0
+            .clone()
+    }
+
+    #[test]
+    fn active_run_without_checkpoint_keeps_checkpoint_step_pending() {
+        let detail = detail_with_state(
+            "running",
+            events::RunProgress {
+                goal: Some("goal".into()),
+                has_session: true,
+                has_activity: true,
+                has_checkpoint: false,
+            },
+            None,
+        );
+        // Run activo sin checkpoint: el hito es el PASO EN CURSO (●) y el
+        // run no está finalizado (○). No se marca fallido porque el run
+        // sigue activo (el ✕ es solo para runs terminales sin checkpoint).
+        assert_eq!(step_icon(&detail, "Checkpoint verified"), "●");
+        assert_eq!(step_icon(&detail, "Run finalized"), "○");
+        assert_eq!(step_icon(&detail, "Agent activity captured"), "✓");
+        assert!(detail.checkpoint.is_none(), "no hay panel de checkpoint");
+    }
+
+    #[test]
+    fn completed_run_without_checkpoint_marks_checkpoint_step_failed() {
+        let detail = detail_with_state(
+            "completed",
+            events::RunProgress {
+                goal: Some("goal".into()),
+                has_session: true,
+                has_activity: true,
+                has_checkpoint: false,
+            },
+            None,
+        );
+        // Run terminal sin checkpoint verificado: el hito se marca FALLIDO.
+        assert_eq!(step_icon(&detail, "Checkpoint verified"), "✕");
+        assert_eq!(step_icon(&detail, "Run finalized"), "✓");
+    }
+
+    #[test]
+    fn failed_run_marks_run_finalized() {
+        let detail = detail_with_state(
+            "failed",
+            events::RunProgress {
+                goal: Some("goal".into()),
+                has_session: true,
+                has_activity: false,
+                has_checkpoint: false,
+            },
+            None,
+        );
+        assert_eq!(step_icon(&detail, "Run finalized"), "✓");
+        assert_eq!(step_icon(&detail, "Checkpoint verified"), "✕");
+    }
+
+    #[test]
+    fn historical_checkpoint_is_shown_while_a_newer_run_is_active() {
+        let detail = detail_with_two_runs();
+        // El checkpoint verificado pertenece al run viejo; el run nuevo sigue activo.
+        assert_eq!(
+            detail
+                .run_summary
+                .as_ref()
+                .unwrap()
+                .latest_run_id
+                .as_deref(),
+            Some("run-new")
+        );
+        assert_eq!(
+            detail.checkpoint.as_ref().and_then(|c| c.run_id.as_deref()),
+            Some("run-old"),
+            "la selección de checkpoint es histórica y estable"
+        );
+        assert_eq!(step_icon(&detail, "Checkpoint verified"), "○");
+        assert_eq!(step_icon(&detail, "Run finalized"), "○");
+    }
+
     #[test]
     fn long_history_does_not_hide_current_run_progress() {
         for total_events in [150usize, 1000] {
