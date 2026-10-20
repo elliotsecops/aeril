@@ -12,7 +12,60 @@ pub mod threads;
 use crate::error::Result;
 use rusqlite::Connection;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const WAL_BUSY_RETRY_SLICE: Duration = Duration::from_millis(25);
+const WAL_BUSY_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(1);
+const WAL_BUSY_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(25);
+
+fn is_retryable_sqlite_lock(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy) | Some(rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Switch this connection to WAL, retrying only transient lock errors.
+/// SQLite may skip its busy handler when a lock upgrade could deadlock; a
+/// failed journal_mode change is retry-safe and leaves the prior mode intact.
+/// The retries share the existing five-second open deadline and use short
+/// busy-handler slices so one SQLITE_BUSY does not consume a fresh timeout.
+fn journal_mode_wal(conn: &Connection) -> rusqlite::Result<String> {
+    let deadline = Instant::now() + STORE_BUSY_TIMEOUT;
+    let mut backoff = WAL_BUSY_RETRY_INITIAL_BACKOFF;
+    let mut last_busy: Option<rusqlite::Error> = None;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(last_busy.unwrap_or_else(|| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    Some("journal_mode=WAL retry deadline elapsed".into()),
+                )
+            }));
+        }
+
+        conn.busy_timeout(remaining.min(WAL_BUSY_RETRY_SLICE))?;
+        match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0)) {
+            Ok(mode) => {
+                conn.busy_timeout(STORE_BUSY_TIMEOUT)?;
+                return Ok(mode);
+            }
+            Err(error) if is_retryable_sqlite_lock(&error) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                last_busy = Some(error);
+                std::thread::sleep(backoff.min(remaining));
+                backoff = (backoff * 2).min(WAL_BUSY_RETRY_MAX_BACKOFF);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 pub struct Store {
     pub conn: Connection,
@@ -25,9 +78,14 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let mut conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(STORE_BUSY_TIMEOUT)?;
         // journal_mode devuelve una fila ("wal"): query_row, no pragma_update.
-        let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        let mode = journal_mode_wal(&conn)?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(crate::error::Error::unsupported(format!(
+                "SQLite journal_mode=WAL returned {mode:?}; expected `wal`"
+            )));
+        }
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Caché de páginas acotada (2 MiB) — parte del presupuesto de RSS idle.
