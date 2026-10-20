@@ -574,33 +574,37 @@ pub fn ready_for_snapshot(
     thread_id: &str,
     snapshot_id: &str,
 ) -> Result<Option<(EventRecord, payload::CheckpointReady)>> {
-    // Proyección acotada por snapshot (no se materializa el historial):
-    // el ÚLTIMO `checkpoint.ready` de ese snapshot, por seq.
+    // Cursor en streaming (seq DESC): NO se materializa el historial.
+    //
+    // Semántica CERTIFICADA (`main@3a28af2`): se deserializa y valida CADA
+    // `checkpoint.ready` ANTES de comparar su snapshot_id, y los errores de
+    // validación se PROPAGAN. Filtrar por `json_extract` en SQL saltaría los
+    // registros inválidos y admitiría una operación que antes fallaba
+    // (P2-REMEDIATION: regresión semántica detectada en auditoría).
     let mut stmt = store.conn.prepare(
         "SELECT id, thread_id, seq, run_id, kind, actor, payload_version, payload, created_ms
            FROM events
-          WHERE thread_id = ?1
-            AND kind = 'checkpoint.ready'
-            AND json_extract(payload, '$.snapshot_id') = ?2
-          ORDER BY seq DESC
-          LIMIT 1",
+          WHERE thread_id = ?1 AND kind = 'checkpoint.ready'
+          ORDER BY seq DESC",
     )?;
-    let mut rows = stmt.query(rusqlite::params![thread_id, snapshot_id])?;
-    let Some(row) = rows.next()? else {
-        return Ok(None);
-    };
-    let payload_text: String = row.get(7)?;
-    let ev = EventRecord {
-        id: row.get(0)?,
-        thread_id: row.get(1)?,
-        seq: row.get(2)?,
-        run_id: row.get(3)?,
-        kind: row.get(4)?,
-        actor: row.get(5)?,
-        payload_version: row.get(6)?,
-        payload: serde_json::from_str(&payload_text).unwrap_or(serde_json::Value::Null),
-        created_ms: row.get(8)?,
-    };
-    let parsed: payload::CheckpointReady = ev.parse()?;
-    Ok(Some((ev, parsed)))
+    let mut rows = stmt.query(rusqlite::params![thread_id])?;
+    while let Some(row) = rows.next()? {
+        let payload_text: String = row.get(7)?;
+        let ev = EventRecord {
+            id: row.get(0)?,
+            thread_id: row.get(1)?,
+            seq: row.get(2)?,
+            run_id: row.get(3)?,
+            kind: row.get(4)?,
+            actor: row.get(5)?,
+            payload_version: row.get(6)?,
+            payload: serde_json::from_str(&payload_text).unwrap_or(serde_json::Value::Null),
+            created_ms: row.get(8)?,
+        };
+        let parsed: payload::CheckpointReady = ev.parse()?;
+        if parsed.snapshot_id == snapshot_id {
+            return Ok(Some((ev, parsed)));
+        }
+    }
+    Ok(None)
 }

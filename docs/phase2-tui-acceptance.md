@@ -55,12 +55,18 @@ memoria.** Por eso se asertan (a) ventana acotada y (b) memoria estable.
 
 **Hallazgo de la verificación (acotado en este paquete):** la selección de
 checkpoint materializaba **todos** los `checkpoint.ready` del thread
-(`fetch_by_kind` + `pop`). Se acotó a una proyección de una fila
-(`ORDER BY seq DESC LIMIT 1`, y `json_extract(payload,'$.snapshot_id')` para la
-búsqueda por snapshot). Semántica idéntica, memoria constante. El camino de
-*comentarios* (`review::list_comment_summaries`) sigue cargando el historial de
-comentarios del thread: no se toca aquí (volumen acotado por actividad humana, no
-por eventos de agente) y queda reportado como limitación conocida (§7).
+(`fetch_by_kind` + `pop`). Se acotó manteniendo la **semántica certificada**:
+cursor en streaming ordenado por `seq DESC`, deserializando y **validando cada
+registro antes** de comparar su `snapshot_id`, y propagando los errores de
+validación (memoria constante, sin materializar el historial). Una variante
+intermedia que filtraba por `json_extract(payload,'$.snapshot_id')` en SQL era
+más rápida pero **cambió la semántica** (se saltaba checkpoints
+estructuralmente inválidos y admitía operaciones que antes fallaban); esa
+regresión fue detectada en la auditoría y está cerrada aquí — ver §10 (P2
+remediation) con evidencia RED/GREEN determinista. El camino de *comentarios*
+(`review::list_comment_summaries`) sigue cargando el historial de comentarios del
+thread: no se toca (volumen acotado por actividad humana, no por eventos de
+agente) y queda reportado como limitación conocida (§7).
 
 ## 3. Regresión y comandos
 
@@ -210,7 +216,40 @@ misión y en `git ls-remote origin refs/heads/feat/tui-workbench-redesign`.
 **Main sin tocar:** `3a28af2b5acb7efa94540d15e4fe068af89259e1` (sin merge, sin
 tag, sin release).
 
-## 10. Recomendación para aceptación final independiente
+## 10. P2 remediation — semántica de `ready_for_snapshot` (cierre del HOLD)
+
+**Regresión (HOLD de auditoría):** la variante con `json_extract` filtraba por
+`snapshot_id` **en SQL**, por lo que nunca deserializaba los registros que no
+coincidían; un `checkpoint.ready` más nuevo y estructuralmente inválido quedaba
+sin detectar y la operación que antes fallaba ahora tenía éxito.
+
+**Corrección (commit único, alcance mínimo):** `checkpoint::ready_for_snapshot`
+vuelve a la semántica certificada — cursor en streaming `seq DESC`,
+deserialización y **validación de cada registro antes** de comparar el
+`snapshot_id`, y **propagación** de los errores de validación — manteniendo la
+memoria acotada. `latest_ready()` (optimización aceptada) queda intacto.
+
+**Evidencia determinista:**
+`docs/phase2-tui-acceptance/evidence/red-checkpoint-semantics.txt` (RED: 3/8
+fallan, `prod=Ok("ok:snap-ok")` vs `cert=Err("json: missing field
+\`snapshot_id\`")`) → `green-checkpoint-semantics.txt` (GREEN: 8/8).
+
+**Matriz obligatoria cubierta** (`tests/phase2_tui_checkpoint_semantics.rs`,
+8 tests): snapshot válido existente · múltiples snapshots y snapshot_ids
+duplicados (gana el más nuevo) · checkpoint más nuevo no relacionado
+estructuralmente inválido (debe propagar) · campos obligatorios faltantes y
+tipos incorrectos · snapshot pedido inexistente · historiales de 1.000 y 50.000
+checkpoints · **paridad con el algoritmo certificado** (comparación directa
+contra una reimplementación local del algoritmo de `main@3a28af2`).
+
+**Latencia del lookup (peor caso: snapshot más viejo ⇒ recorrido completo):**
+
+| Checkpoints | Streaming (nuevo) | Certificado (`main`, materializa) |
+|---|---|---|
+| 1.000 | 38.0 ms | 49.6 ms |
+| 50.000 | 1.981 ms | 2.432 ms |
+
+## 11. Recomendación para aceptación final independiente
 
 **Recomendación: aceptar el TUI (rama `feat/tui-workbench-redesign`) para
 integración**, con estas condiciones:

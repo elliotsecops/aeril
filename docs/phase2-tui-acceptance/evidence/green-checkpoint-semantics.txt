@@ -1,0 +1,16 @@
+   Compiling aeril v0.1.0 (/home/elliot/aeril-tui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.16s
+     Running tests/phase2_tui_checkpoint_semantics.rs (target/debug/deps/phase2_tui_checkpoint_semantics-dfd97a0602252de3)
+
+running 8 tests
+test requested_snapshot_exists_and_is_valid ... ok
+test newer_unrelated_invalid_checkpoint_must_propagate_error ... ok
+test multiple_snapshots_and_duplicate_ids_pick_newest_valid ... ok
+test requested_snapshot_absent_returns_none ... ok
+test invalid_payload_shapes_propagate_errors ... ok
+test mixed_matrix_matches_certified_algorithm ... ok
+test large_history_lookup_latency ... ok
+test large_histories_are_answered_with_bounded_memory ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.36s
+
