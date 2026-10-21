@@ -708,6 +708,9 @@ fn cmd_recover(_p: &Parsed, db_path: &Path) -> Result<i32> {
             checkpoint::RecoveryOutcome::RepoUnavailable { snapshot_id, repo_path } => {
                 json!({"action": "repo_unavailable", "snapshot_id": snapshot_id, "repo_path": repo_path})
             }
+            checkpoint::RecoveryOutcome::Deferred { snapshot_id, detail } => {
+                json!({"action": "deferred", "snapshot_id": snapshot_id, "detail": detail})
+            }
             checkpoint::RecoveryOutcome::Failed { snapshot_id, detail } => {
                 json!({"action": "failed", "snapshot_id": snapshot_id, "detail": detail})
             }

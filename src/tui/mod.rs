@@ -819,6 +819,10 @@ fn summarize_recovery(
             checkpoint::RecoveryOutcome::RepoUnavailable { repo_path, .. } => {
                 problems.push(format!("repo no disponible: {repo_path}"))
             }
+            checkpoint::RecoveryOutcome::Deferred { snapshot_id, .. } => problems.push(format!(
+                "recuperación diferida por lock de ref en snapshot {}",
+                &snapshot_id[..8.min(snapshot_id.len())]
+            )),
             checkpoint::RecoveryOutcome::Failed { detail, .. } => problems.push(detail.clone()),
         }
     }

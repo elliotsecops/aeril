@@ -93,8 +93,12 @@ pub fn capture(
     )?;
     crash::point("prepared");
 
-    // 3. Publicar la ref con estado esperado.
+    // 3. Publicar la ref con estado esperado. La contención transitoria del
+    // ref.lock deja el `prepared` recuperable: no se marca failed terminal.
     if let Err(e) = git::snapshot::publish_ref_cas(repo, &ref_name, &captured.commit_oid) {
+        if git::snapshot::is_transient_ref_lock(&e) {
+            return Err(e);
+        }
         let failed = payload::CheckpointFailed {
             snapshot_id: snapshot_id.clone(),
             git_ref: Some(ref_name.clone()),
@@ -273,6 +277,9 @@ pub enum RecoveryOutcome {
         snapshot_id: String,
         repo_path: String,
     },
+    /// Contención transitoria del lock de la ref: sigue pendiente y se
+    /// reintenta en la próxima recuperación, sin `checkpoint.failed`.
+    Deferred { snapshot_id: String, detail: String },
     /// Otro fallo de integridad reportado como terminal.
     Failed { snapshot_id: String, detail: String },
 }
@@ -411,6 +418,32 @@ pub fn recover_pending(
                         Ok(_) => {
                             ref_recreated = true;
                             true
+                        }
+                        Err(e) if git::snapshot::is_transient_ref_lock(&e) => {
+                            // El lock sigue tomado por otro proceso. No hay
+                            // conflicto demostrado ni fallo irreversible: se
+                            // deja pendiente para la próxima recuperación.
+                            outcomes.push(RecoveryOutcome::Deferred {
+                                snapshot_id: prepared.snapshot_id.clone(),
+                                detail: e.to_string(),
+                            });
+                            continue;
+                        }
+                        Err(e) if matches!(e, Error::Conflict(_)) => {
+                            let detail = e.to_string();
+                            append_failed(
+                                store,
+                                &p.thread_id,
+                                prepared,
+                                "ref_conflict",
+                                &detail,
+                                true,
+                            )?;
+                            outcomes.push(RecoveryOutcome::RefConflict {
+                                snapshot_id: prepared.snapshot_id.clone(),
+                                detail,
+                            });
+                            continue;
                         }
                         Err(e) => {
                             append_failed(
