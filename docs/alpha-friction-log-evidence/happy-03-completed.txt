@@ -1,0 +1,50 @@
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  Aeril  |  Agent workspace                                                                            workspace  alpha-happy-8fad9e9f/proyecto              2026-10-21 23:05 UTC │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─────────────────────────────────────────╮╭─────────────────────────────────────────────────────────────────────────────╮╭────────────────────────────────────────────────────────╮
+│  Tasks          1 total  ·  1 running   ││  Run 1 — Demo alpha                                         running  ·  2s  ││  Checkpoint                                     1 / 1  │
+│                                         ││                                                                             ││                                                        │
+│  ▌ 1  ● Demo alpha                      ││  Goal                                                                       ││  Snapshot  2f395624                                    │
+│        running  ·  2s  ↳ aeril/ws/f55c  ││  revisá el repo y actualizá NOTES.md                                        ││  Files     1 changed   +2  -0                          │
+│                                         ││                                                                             ││  OID       2c598b33                                    │
+│                                         ││                                                                             ││  State     verified · immutable                        │
+│                                         ││    ✓  Goal recorded                                                         ││  Run       current run                                 │
+│                                         ││    ✓  Engine session opened                                                 ││                                                        │
+│                                         ││    ✓  Agent activity captured                                               ││  ────────────────────────────────────────────────────  │
+│                                         ││    ✓  Checkpoint verified                                                   ││  Patch  ·  lines 1-10 of 10  ·  PgUp/PgDn              │
+│                                         ││    ●  Run finalized                                                         ││  ▾ NOTES.md   +2  -0                                   │
+│                                         ││                                                                             ││    index f8b3f26..014d254 100644                       │
+│                                         ││                                                                             ││    --- a/NOTES.md                                      │
+│                                         ││  ─────────────────────────────────────────────────────────────────────────  ││    +++ b/NOTES.md                                      │
+│                                         ││   Agent output   Files 1   Reviews 0                                        ││    @@ -1,3 +1,5 @@                                     │
+│                                         ││  23:05:22  event   thread.created                                           ││     1    1   # Notas del proyecto                      │
+│                                         ││  23:05:24  run     revisá el repo y actualizá NOTES.md                      ││     2    2                                             │
+│                                         ││  23:05:24  event   backend.spawned                                          ││     3    3   Estado inicial.                           │
+│                                         ││  23:05:24  session new  context unverified                                  ││          4  +                                          │
+│                                         ││  23:05:27  msg     trabajando                                               ││          5  +- avance del agente                       │
+│                                         ││  23:05:27  tool    write_file  NOTES.md                                     ││                                                        │
+│                                         ││  23:05:27  perm    Approve edit  NOTES.md                                   ││                                                        │
+│                                         ││  23:05:27  perm    allow_once  (auto_allow_once)                            ││                                                        │
+│                                         ││  23:05:27  event   permission.transmitted                                   ││                                                        │
+│                                         ││  23:05:27  tool    tc-000000000001  completed                               ││                                                        │
+│                                         ││  23:05:27  msg     listo                                                    ││                                                        │
+│                                         ││  23:05:27  chkpt   prepared  2f395624                                       ││                                                        │
+│                                         ││  23:05:27  chkpt   2f395624  1 files  +2  -0                                ││                                                        │
+│                                         ││  23:05:27  end     completed                                                ││                                                        │
+│                                         ││                                                                             ││                                                        │
+│                                         ││                                                                             ││                                                        │
+│                                         ││                                                                             ││                                                        │
+│                                         ││                                                                             ││                                                        │
+│                                         ││                                                                             ││  ────────────────────────────────────────────────────  │
+│                                         ││                                                                             ││  Review notes  0 comment(s)                            │
+│                                         ││                                                                             ││  Select a checkpoint and press c to add one.           │
+│                                         ││                                                                             ││                                                        │
+│                                         ││                                                                             ││                                                        │
+│                                         ││                                                                             ││                                                        │
+│                                         ││                                                                             ││                                                        │
+│                                         ││                                                                             ││                                                        │
+│                                         ││                                                                             ││                                                        │
+╰─────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────────────────╯╰────────────────────────────────────────────────────────╯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   n  new run    r  refresh    c  comment    i  integrate    x  cancel    ?  help    q  quit                                   ● 1 run(s) active  ·  alpha-happy-8fad9e9f/proyecto
+  ▶ run lanzado · revisá el repo y actualizá NOTES.md · thread fa42b7
