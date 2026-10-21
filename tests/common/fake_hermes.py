@@ -11,7 +11,7 @@
 #   not-signed | logged-out | no-credentials | other-provider |
 #   contradictory | malformed | empty
 # Sin `fake-auth-mode`: positive si existe `fake-auth`, si no logged-out.
-import json, os, signal, sys, time
+import json, os, select, signal, sys, time
 
 args = sys.argv[1:]
 home = os.environ.get("HERMES_HOME") or ""
@@ -24,6 +24,16 @@ def proc_start(pid):
         return int(tail[19])
     except (OSError, IndexError, ValueError):
         return 0
+
+
+def process_alive(pid, start):
+    """True only for the same live (non-zombie) process identity."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            tail = f.read().rsplit(b")", 1)[1].split()
+        return tail[0] != b"Z" and int(tail[19]) == start
+    except (OSError, IndexError, ValueError):
+        return False
 
 
 def read_opt(name, default=""):
@@ -319,16 +329,85 @@ if args and args[0] == "acp":
                 "modes": {"currentModeId": "default", "availableModes": []}}}), flush=True)
         elif method == "session/prompt":
             if mode == "escape-on-turn":
+                if not home:
+                    print(
+                        "fake hermes: escape-on-turn requires HERMES_HOME",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    sys.exit(2)
+                read_fd, write_fd = os.pipe()
                 pid = os.fork()
                 if pid == 0:
-                    os.setsid()
+                    os.close(read_fd)
                     try:
-                        with open(os.path.join(home, "fake-escaped-pid"), "w") as f:
-                            f.write(f"{os.getpid()} {proc_start(os.getpid())}\n")
-                    except OSError:
-                        pass
+                        os.setsid()
+                        start = proc_start(os.getpid())
+                        if start == 0:
+                            raise RuntimeError("no se pudo leer el starttime del hijo")
+                        identity = f"{os.getpid()} {start}\n"
+                        evidence = os.path.join(home, "fake-escaped-pid")
+                        with open(evidence, "w") as f:
+                            f.write(identity)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        with open(evidence) as f:
+                            if f.read() != identity:
+                                raise RuntimeError("evidencia incompleta del hijo escapado")
+                        if not process_alive(os.getpid(), start):
+                            raise RuntimeError("el hijo escapado no está vivo")
+                        os.write(write_fd, b"1")
+                        os.close(write_fd)
+                    except BaseException as exc:
+                        try:
+                            os.write(write_fd, b"0")
+                        except OSError:
+                            pass
+                        try:
+                            os.close(write_fd)
+                        except OSError:
+                            pass
+                        print(
+                            f"fake hermes: escape-on-turn child failed: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        os._exit(1)
                     time.sleep(600)
                     os._exit(0)
+                os.close(write_fd)
+                try:
+                    ready, _, _ = select.select([read_fd], [], [], 5.0)
+                    signal_byte = os.read(read_fd, 1) if ready else b""
+                finally:
+                    os.close(read_fd)
+                valid = False
+                if signal_byte == b"1":
+                    try:
+                        with open(os.path.join(home, "fake-escaped-pid")) as f:
+                            parts = f.read().split()
+                        if len(parts) == 2:
+                            child_pid, start = int(parts[0]), int(parts[1])
+                            valid = (
+                                child_pid == pid
+                                and start > 0
+                                and proc_start(pid) == start
+                                and process_alive(pid, start)
+                                and os.getsid(pid) == pid
+                            )
+                    except (OSError, ValueError):
+                        valid = False
+                if not valid:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    print(
+                        "fake hermes: escape-on-turn readiness not established; refusing end_turn",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    sys.exit(1)
             if mode == "linger":
                 if home:
                     try:
