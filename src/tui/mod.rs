@@ -17,7 +17,9 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Layout, Margin};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -64,6 +66,13 @@ pub enum Mode {
         buf: String,
     },
     Help,
+    /// Diálogo modal de bloqueo: explica por qué una acción no se ejecutó.
+    /// Mientras está abierto, NINGUNA letra dispara atajos globales; solo
+    /// Esc/Enter lo cierran.
+    Blocked {
+        title: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -311,16 +320,38 @@ impl App {
             .cloned()
     }
 
+    /// Abre el diálogo modal de comentario bloqueado (fail-closed, explícito).
+    fn block_comment(&mut self, message: &str) {
+        self.mode = Mode::Blocked {
+            title: "Comentario bloqueado".into(),
+            message: message.to_string(),
+        };
+    }
+
     fn start_comment(&mut self) -> Result<()> {
         let Some(ev) = self.selected_event() else {
-            self.status = "seleccioná un checkpoint listo para comentar".into();
+            self.block_comment(
+                "No hay un evento seleccionado en el timeline.\n\n                 Seleccioná un checkpoint verificado (chkpt) y volvé a presionar c.\n                 No se envió nada.",
+            );
             return Ok(());
         };
         if ev.kind != events::K_CHECKPOINT_READY {
-            self.status = "solo se comenta sobre eventos `checkpoint.ready`".into();
+            self.block_comment(&format!(
+                "El evento seleccionado es `{}`, no un checkpoint verificado (chkpt).\n\n                 Movete con ↑↓ hasta la fila `chkpt` del timeline y volvé a presionar c.\n                 No se envió nada.",
+                ev.kind
+            ));
             return Ok(());
         }
-        let ready: events::payload::CheckpointReady = ev.parse()?;
+        let ready: events::payload::CheckpointReady = match ev.parse() {
+            Ok(r) => r,
+            Err(e) => {
+                // Fail-closed: un checkpoint ilegible no se comenta en silencio.
+                self.block_comment(&format!(
+                    "El checkpoint seleccionado no se pudo validar:\n{e}\n\nNo se envió nada."
+                ));
+                return Ok(());
+            }
+        };
         // Ancla por defecto: primer archivo con lado nuevo y su primer hunk.
         let mut anchor: Option<(String, u64, u64)> = None;
         for f in &ready.files {
@@ -346,7 +377,9 @@ impl App {
             break;
         }
         let Some((path, start, end)) = anchor else {
-            self.status = "el checkpoint no tiene archivos anclables (lado nuevo)".into();
+            self.block_comment(
+                "El checkpoint no tiene archivos anclables (lado nuevo).\n\nNo se envió nada.",
+            );
             return Ok(());
         };
         let desc = format!(
@@ -715,6 +748,13 @@ impl App {
             },
             Mode::Help => {
                 self.mode = Mode::Normal;
+            }
+            Mode::Blocked { .. } => {
+                // El modal es dueño del teclado: ninguna letra activa atajos
+                // (i/q/f/...). Solo Esc o Enter lo cierran.
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                    self.mode = Mode::Normal;
+                }
             }
             Mode::Normal => match key.code {
                 KeyCode::Tab => {
@@ -1126,6 +1166,49 @@ fn render(f: &mut Frame, app: &mut App) {
         render_checkpoint(f, app, body[2]);
     }
     render_footer(f, app, chunks[2]);
+
+    if let Mode::Blocked { title, message } = &app.mode {
+        render_blocked(f, title, message);
+    }
+}
+
+/// Modal de bloqueo: overlay centrado, inequívoco, sin atajos activos.
+fn render_blocked(f: &mut Frame, title: &str, message: &str) {
+    let area = f.area();
+    let width = area.width.saturating_sub(8).clamp(40, 96);
+    let height = 10u16.min(area.height.saturating_sub(2)).max(6);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let rect = ratatui::layout::Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(RED))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(PANEL_BG).fg(TEXT));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let lines = vec![
+        Line::from(Span::styled(message.to_string(), Style::default().fg(TEXT))),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Esc / Enter para cerrar",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -2169,6 +2252,22 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     }
                 ),
                 Style::default().fg(TEXT_BRIGHT),
+            )),
+        ),
+        Mode::Blocked { title, .. } => (
+            Line::from(vec![
+                Span::styled(
+                    format!("{title} "),
+                    Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "· Esc / Enter para cerrar · atajos bloqueados",
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "El diálogo tiene el foco: ninguna letra ejecuta acciones.",
+                Style::default().fg(MUTED),
             )),
         ),
         Mode::Help => (
