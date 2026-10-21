@@ -1,0 +1,24 @@
+╭──────────────────────────────────────────────────────────────────────────────╮
+│  Aeril  |  Agent workspace                              2026-10-19 22:46 UTC │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭───────────────────────────╮╭─────────────────────────────────────────────────╮
+│  Tasks     1 · 0 active   ││  Run 1 — ejemplo de…         completed  ·  <1s  │
+│                           ││                                                 │
+│  ▌ 1  ● ejemplo de tar…   ││  Goal                                           │
+│        completed  ·  <1s  ││  revisá el repo                                 │
+│                           ││                                                 │
+│                           ││                                                 │
+│                           ││    5/5 steps complete                           │
+│                           ││                                                 │
+│                           ││  ─────────────────────────────────────────────  │
+│                           ││   Agent output   Files 1   Reviews 0            │
+│                           ││  22:45:55  event   thread.created               │
+│                           ││  22:45:55  run     revisá el repo               │
+│                           ││  22:45:55  event   backend.spawned              │
+│                           ││  22:45:55  session new  context unverified      │
+│                           ││  22:45:56  msg     analizando el repositorio    │
+│                           ││  22:45:56  tool    write_file  NOTES.md         │
+│                           ││  22:45:56  perm    Approve edit  NOTES.md       │
+╰───────────────────────────╯╰─────────────────────────────────────────────────╯
+────────────────────────────────────────────────────────────────────────────────
+   n  run    r  refresh    c  comment    Tab  review                   ● idle

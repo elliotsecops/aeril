@@ -288,7 +288,7 @@ impl<'a> Tui<'a> {
     fn launch(env: &'a TestEnv, backend: &str, extra_env: &[(&str, &str)]) -> Tui<'a> {
         let mut pty = TuiPty::spawn(env, &["--backend", backend], extra_env);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !pty.output_contains("Fase 1") {
+        while !pty.output_contains("Aeril") {
             assert!(
                 Instant::now() < deadline,
                 "la TUI no dibujó el primer frame"

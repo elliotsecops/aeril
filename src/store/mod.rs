@@ -172,6 +172,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn run_summaries_returns_latest_run_without_n_plus_one() {
+        let mut store = Store::open_in_memory().unwrap();
+        let idle = threads::create(&mut store.conn, "idle", "/tmp/repo", "r1").unwrap();
+        let busy = threads::create(&mut store.conn, "busy", "/tmp/repo", "r1").unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO runs (id, thread_id, branch, backend, state, started_ms, ended_ms)
+                 VALUES ('run-old', ?1, 'old', 'mock', 'failed', 10, 20)",
+                rusqlite::params![busy.id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO runs (id, thread_id, branch, backend, state, started_ms, ended_ms)
+                 VALUES ('run-new', ?1, 'new', 'mock', 'completed', 30, 45)",
+                rusqlite::params![busy.id],
+            )
+            .unwrap();
+
+        let summaries = threads::run_summaries(&store.conn, 10).unwrap();
+        let idle_summary = summaries.get(&idle.id).unwrap();
+        assert_eq!(idle_summary.run_count, 0);
+        assert_eq!(idle_summary.latest_run_id, None);
+        assert_eq!(idle_summary.latest_state, None);
+        let busy_summary = summaries.get(&busy.id).unwrap();
+        assert_eq!(busy_summary.run_count, 2);
+        assert_eq!(busy_summary.latest_run_id.as_deref(), Some("run-new"));
+        assert_eq!(busy_summary.latest_state.as_deref(), Some("completed"));
+        assert_eq!(busy_summary.latest_branch.as_deref(), Some("new"));
+        assert_eq!(busy_summary.started_ms, Some(30));
+        assert_eq!(busy_summary.ended_ms, Some(45));
+    }
+
+    #[test]
     fn fk_habilitadas_y_esquema() {
         let store = Store::open_in_memory().unwrap();
         // FK activas: insertar un evento de un thread inexistente debe fallar.

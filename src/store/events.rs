@@ -387,6 +387,14 @@ pub struct EventRecord {
     pub created_ms: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RunProgress {
+    pub goal: Option<String>,
+    pub has_session: bool,
+    pub has_activity: bool,
+    pub has_checkpoint: bool,
+}
+
 impl EventRecord {
     pub fn parse<T: DeserializeOwned>(&self) -> Result<T> {
         Ok(serde_json::from_value(self.payload.clone())?)
@@ -532,6 +540,82 @@ pub fn fetch_by_kind(conn: &Connection, thread_id: &str, kind: &str) -> Result<V
     ))?;
     let rows = stmt.query_map(params![thread_id, kind], row_to_event)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Último evento de un kind sin cargar el historial completo.
+pub fn fetch_latest_by_kind(
+    conn: &Connection,
+    thread_id: &str,
+    kind: &str,
+) -> Result<Option<EventRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "{SELECT_COLS} WHERE thread_id = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1"
+    ))?;
+    let mut rows = stmt.query_map(params![thread_id, kind], row_to_event)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+/// Cantidad de eventos de un kind, sin cargar sus payloads.
+pub fn count_by_kind(conn: &Connection, thread_id: &str, kind: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE thread_id = ?1 AND kind = ?2",
+        params![thread_id, kind],
+        |row| row.get(0),
+    )?)
+}
+
+/// Posición ordinal (1-based) de un evento dentro de su kind.
+pub fn count_by_kind_until(
+    conn: &Connection,
+    thread_id: &str,
+    kind: &str,
+    seq: i64,
+) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE thread_id = ?1 AND kind = ?2 AND seq <= ?3",
+        params![thread_id, kind, seq],
+        |row| row.get(0),
+    )?)
+}
+
+/// Proyección acotada de hitos de un run concreto.
+///
+/// No lee el historial a memoria: solo agrega existencia y recupera el goal
+/// del `run.started` durable del run solicitado. `run_id` aísla los hitos de
+/// runs anteriores aunque compartan thread.
+pub fn run_progress(conn: &Connection, thread_id: &str, run_id: &str) -> Result<RunProgress> {
+    let (goal, has_session, has_activity, has_checkpoint) = conn.query_row(
+        "SELECT
+           (SELECT json_extract(payload, '$.goal')
+              FROM events
+             WHERE thread_id = ?1 AND run_id = ?2 AND kind = 'run.started'
+             ORDER BY seq DESC LIMIT 1),
+           EXISTS(SELECT 1 FROM events
+                   WHERE thread_id = ?1 AND run_id = ?2 AND kind = 'engine.session'),
+           EXISTS(SELECT 1 FROM events
+                   WHERE thread_id = ?1 AND run_id = ?2
+                     AND kind IN ('agent.tool_call', 'permission.requested')),
+           EXISTS(SELECT 1 FROM events
+                   WHERE thread_id = ?1 AND run_id = ?2 AND kind = 'checkpoint.ready')",
+        params![thread_id, run_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, i64>(3)? != 0,
+            ))
+        },
+    )?;
+    Ok(RunProgress {
+        goal,
+        has_session,
+        has_activity,
+        has_checkpoint,
+    })
 }
 
 pub fn count(conn: &Connection, thread_id: &str) -> Result<i64> {
