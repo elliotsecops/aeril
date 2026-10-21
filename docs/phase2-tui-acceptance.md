@@ -72,7 +72,7 @@ El fallo histórico `full-1` de 229/230 no se borra; está preservado en la evid
 
 - SQLite `r2_h4_concurrent_migration_is_serialized`: **100/100 aislado + 100/100 bajo carga**; `Barrier::new(24)` intacta; migración interrumpida 2/2.
 - WAL: deadline **5,000 ms**; fallo no migra el esquema; errores no transitorios se propagan.
-- B3 `b3_recuperacion_concurrente_no_duplica_ready`: **300/300 aislado + 300/300 bajo carga**; 8 ciclos de workers sin fallos; 6/6 pruebas B3 dirigidas.
+- B3 `b3_recuperacion_concurrente_no_duplica_ready`: **300/300 aislado + 300/300 bajo carga**; 16 ciclos totales de workers (8 por worker) sin fallos; 6/6 pruebas B3 dirigidas.
 - P2-S1 R3 owner tests: **4/4** dirigidos; el test escapado corrige la sincronización sin debilitar seguridad.
 - TUI: checkpoint semantics **8/8**, history **7/7**. Latencias del gate: lookup 1,000 **34.2 ms streaming / 38.5 ms certificado**; 50,000 **3,573.5 ms / 2,222.2 ms**. Son informativas; no hay threshold de lookup.
 - `ready_for_snapshot()` conserva `seq DESC`, validación de cada registro antes de comparar `snapshot_id` y propagación de errores. `latest_ready()` conserva su proyección acotada. RED/GREEN histórico intacto: 7 tests/3 fallos → 8/8.
