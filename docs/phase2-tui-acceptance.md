@@ -1,270 +1,153 @@
-# Aceptación TUI — workbench de tres paneles (fase de aceptación final)
+# Aceptación TUI — integración final con hotfixes SQLite y B3
 
-**Rama:** `feat/tui-workbench-redesign` · **Base:** `main @ 3a28af2b5acb7efa94540d15e4fe068af89259e1`
-**Tip de código auditado:** `6255957c4e6048f866be910fea2052f343667b39`
-**Tip de la rama al cierre de este paquete:** ver §9 (push posterior a esta entrega)
-**PR:** ninguno abierto para el TUI; el trabajo vive en la rama de feature (sin merge, sin tag, sin release).
+**Veredicto de este gate: HOLD.** El primer intento de suite completa falló en un test P2-S1 preexistente y ajeno al merge: `r3_p2_1_escaped_backend_prevents_owner_cleanup` observó `completed` donde exige `failed`. Los intentos 2 y 3 pasaron, pero no borran el fallo del intento 1 ni permiten declarar PASS.
 
-> **Alcance:** verificación de aceptación (historias largas, regresión, presupuestos,
-> capturas, higiene de procesos). **No** es un cambio de producto: el código de
-> producción solo cambia en dos lecturas acotadas (`checkpoint::latest_ready`,
-> `checkpoint::ready_for_snapshot`) con **misma semántica** y memoria constante.
-> Sin P2-S2, sin tocar los invariantes de seguridad del subsistema de perfiles, sin
-> credenciales reales, sin perfiles de producción.
-
----
-
-## 1. Provenance: qué es `6255957` y por qué faltaba en el remoto
-
-Auditoría de refs (locales + remoto) antes de actuar:
-
-| Dato | Valor |
+| Componente | Identidad |
 |---|---|
-| SHA completo | `6255957c4e6048f866be910fea2052f343667b39` |
-| Padre | `253307171aa870c8a85f27c8d9a01a25a5c1b926` (**exactamente** el HEAD remoto declarado) |
-| Rama / worktree | `feat/tui-workbench-redesign` · `/home/elliot/aeril-tui` (limpio, `ahead 1`) |
-| Estado remoto antes | `refs/heads/feat/tui-workbench-redesign = 2533071` (el commit **no** estaba pusheado) |
-| Diff vs `2533071` | 2 archivos: `src/store/events.rs` (+45), `src/tui/mod.rs` (+182/−29) — sin tests en archivos aparte |
-| Contenido | fix de **historia acotada**: `events::run_progress` (proyección SQL: `EXISTS` + `ORDER BY seq DESC LIMIT 1`) y la TUI consume el progreso del run **fuera** de la ventana de 100 eventos; test in-crate `long_history_does_not_hide_current_run_progress` (150 y 1.000 eventos) |
+| Certified main remoto | `080992cc51641a483107ffa30e2c4da48d7933ea` |
+| Hotfix SQLite (PR #2) | `b2184fd41ac24cc81f890aeeeb816af255683e99` |
+| Hotfix B3 Git recovery (PR #3) | `05774024a959757feadb27e9024eca4641cab751` |
+| Candidato TUI fuente | `18d6910a19324e954cb89b2bce4502755c8e37fb` |
+| Merge local de aceptación | `a0a55b093fcfd3fee770c5d3c9f35c51801b988d` |
+| Git tree combinado probado | `752f3b8b3f89de92785ce247cf02d8253e0ee1a5` |
+| Padres del merge | `080992cc51641a483107ffa30e2c4da48d7933ea` + `18d6910a19324e954cb89b2bce4502755c8e37fb` |
+| Rama local | `integration/tui-r2-final-acceptance` — no publicada |
 
-**Veredicto:** descendiente directo válido del HEAD remoto declarado, con el fix
-esperado y su test, alcance acotado y worktree limpio ⇒ **publicado** como
-fast-forward `2533071..6255957` (sin merge, sin tag).
+El merge fue normal, no fast-forward, de dos padres. No hubo conflictos textuales. `src/checkpoint.rs`, `src/store/mod.rs` y `src/tui/mod.rs` se auto-mezclaron y fueron revisados para confirmar que ambos lados sobreviven. No se modificó `main`, la rama TUI, ni ningún presupuesto.
 
-```bash
-git ls-remote origin refs/heads/feat/tui-workbench-redesign
-# 6255957c4e6048f866be910fea2052f343667b39
-```
+> **Alcance:** aceptación de integración, no rediseño. El diseño visual aprobado (90/100) queda congelado. No se reabre P2-S1 ni se implementa P2-S2. No se usan credenciales ni perfiles de producción. P2-S2 permanece HOLD.
 
-## 2. Verificación de historias largas (matriz completa)
+## 1. Entorno y procedencia
 
-Criterio: **la verificación no puede resolverse cargando el historial completo en
-memoria.** Por eso se asertan (a) ventana acotada y (b) memoria estable.
+- Worktree: `/home/elliot/.local/share/aeril-tui-final-acceptance-20261021/integration`.
+- Target nuevo, inicialmente ausente; no se reutilizó el target de desarrollo.
+- Ubuntu 26.04.1 LTS; Linux `7.0.0-38-generic` x86_64; Intel i7-8550U, 8 CPU lógicas, 15.4 GiB RAM, ext4.
+- Rust/Cargo `1.93.0`; Git `2.53.0`.
+- Builds y tests con `--locked --offline`; no hubo fallback de red ni cambio de lockfile.
+- `origin/main` y `origin/feat/tui-workbench-redesign` coincidieron con los SHAs declarados. SQLite `b2184fd` y B3 `0577402` son ancestros de main; el candidato TUI desciende del main previo `3a28af2`.
 
-| Escenario | Evidencia | Resultado |
-|---|---|---|
-| 150 eventos en un run | `one_run_with_150_events_keeps_progress_and_bounded_window` | ✅ ventana = 100; `run.started` fuera de la ventana; progreso completo (goal/sesión/actividad/checkpoint) |
-| 1.000 eventos en un run | `one_run_with_1000_events_keeps_progress_and_bounded_window` | ✅ idéntico |
-| Dos runs secuenciales + checkpoint verificado antiguo | `two_sequential_runs_keep_historical_checkpoint_selection` | ✅ `run_progress` aislado por run; la selección de checkpoint sigue siendo la **histórica** (`snap-old`, run viejo) |
-| Eventos recientes sin `run.started` | `recent_window_without_run_started_keeps_durable_goal` | ✅ el goal sigue disponible (hecho durable, no de la ventana) |
-| Run activo sin checkpoint | `active_run_without_checkpoint_does_not_invent_one` | ✅ `has_checkpoint=false`; `latest_ready` = `None`; no se inventa checkpoint |
-| Run completed / failed | `completed_and_failed_runs_expose_terminal_state` | ✅ estado terminal expuesto; hitos por run; checkpoint del run completado preservado |
-| Selección de checkpoint histórico con run más nuevo activo | test in-crate `historical_checkpoint_is_shown_while_a_newer_run_is_active` | ✅ el panel muestra el checkpoint del run viejo; el run nuevo sigue activo |
-| Semántica de hitos (TUI) | tests in-crate: run activo sin checkpoint → paso **en curso** `●`; run terminal sin checkpoint → `✕`; run fallido → `Run finalized ✓` | ✅ |
-| Memoria estable (1.500 eventos + 500 checkpoints) | `tui_refresh_path_does_not_materialize_full_history` | ✅ delta RSS < 24 MiB tras 20 ciclos de refresh (ventana + proyección + checkpoint) |
+Estado inicial registrado: `main` local estaba en `3a28af2` con los dos `.audit/` no rastreados preexistentes; la rama TUI estaba limpia. No se modificaron. La rama de integración no se publicó.
 
-**Hallazgo de la verificación (acotado en este paquete):** la selección de
-checkpoint materializaba **todos** los `checkpoint.ready` del thread
-(`fetch_by_kind` + `pop`). Se acotó manteniendo la **semántica certificada**:
-cursor en streaming ordenado por `seq DESC`, deserializando y **validando cada
-registro antes** de comparar su `snapshot_id`, y propagando los errores de
-validación (memoria constante, sin materializar el historial). Una variante
-intermedia que filtraba por `json_extract(payload,'$.snapshot_id')` en SQL era
-más rápida pero **cambió la semántica** (se saltaba checkpoints
-estructuralmente inválidos y admitía operaciones que antes fallaban); esa
-regresión fue detectada en la auditoría y está cerrada aquí — ver §10 (P2
-remediation) con evidencia RED/GREEN determinista. El camino de *comentarios*
-(`review::list_comment_summaries`) sigue cargando el historial de comentarios del
-thread: no se toca (volumen acotado por actividad humana, no por eventos de
-agente) y queda reportado como limitación conocida (§7).
+## 2. Merge y resolución
 
-## 3. Regresión y comandos
+- Commit: `a0a55b093fcfd3fee770c5d3c9f35c51801b988d`; tree `752f3b8b3f89de92785ce247cf02d8253e0ee1a5`.
+- Padres exactos: main `080992c…` y TUI `18d6910a…`.
+- Resultado: **auto-merge limpio; cero conflictos textuales**.
+- Auto-mezclados: `src/checkpoint.rs`, `src/store/mod.rs`, `src/tui/mod.rs`.
+- `src/checkpoint.rs` conserva B3 (`Locked` retry, `Deferred`, conflicto terminal) **y** TUI (`latest_ready` acotado, `ready_for_snapshot` reverse-stream con validación por registro).
+- `src/tui/mod.rs` conserva el rediseño aceptado; su único delta frente a la rama TUI es el brazo de resumen para `RecoveryOutcome::Deferred`.
+- `src/store/mod.rs` conserva el retry WAL de SQLite junto al test TUI de `run_summaries`.
+- El diff contra main contiene solo los 21 archivos TUI aprobados; no toca Cargo, Makefile, scripts, thresholds, perfiles ni migraciones.
+- El diff contra la rama TUI contiene solo los cambios de main: SQLite, B3 y sus tests; no se perdió ningún hunk.
 
-```bash
-cd <worktree de la rama TUI>
-cargo test --no-fail-fast                 # 25 binarios
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo build --release                     # forzar: el target $(BIN) del Makefile
-                                           # no depende de las fuentes (§7)
-make budget && make budget-two && make budget-scale
-```
+Revisión independiente del merge: **APPROVE WITH FINDINGS**, sin bloqueo. Confirmó que ambos parches parentales sobreviven y que no hay override semántico.
+
+## 3. Gate de regresión completa
+
+Inventario real: **27 targets / 230 tests**. Se ejecutaron tres suites consecutivas con `--jobs 2 --no-fail-fast`:
+
+| Intento | Resultado | Exit | Estado |
+|---|---:|---:|---|
+| `full-1` | **229 passed, 1 failed** | 101 | **FAIL** — `phase2_s1_r2::r3_p2_1_escaped_backend_prevents_owner_cleanup` |
+| `full-2` | **230 passed, 0 failed** | 0 | PASS |
+| `full-3` | **230 passed, 0 failed** | 0 | PASS |
+
+El fallo de `full-1` está preservado en `logs/full-1.{stdout,stderr}.log`: el run devolvió `state=completed` donde el test exige `failed` para un backend escapado. El test y `src/profile.rs`/`src/session.rs` son idénticos a main; el diff TUI no los toca. En aislamiento pasó **50/50** repeticiones (`artifacts/owner-cleanup-repeat-summary.json`) y también pasó en `full-2`/`full-3`. Es un fallo intermitente de timing del fixture P2-S1, no una regresión demostrada del TUI/B3/SQLite, pero **sigue siendo un fallo del gate**.
+
+Bajo el criterio estricto de tres suites consecutivas, el candidato no es PASS. La remediación estrecha es estabilizar la sincronización del fixture `escape-on-turn`/detección del descendiente escapado (test-only, con revisión) y repetir el gate completo; no se autoriza cambiar producción ni relajar la aserción.
+
+Otros gates:
 
 | Gate | Resultado |
 |---|---|
-| Suite completa | **218/218**, EXIT=0 (25 binarios; 207 previos + 11 nuevos) |
-| `cargo fmt --check` | limpio |
-| `cargo clippy --all-targets -- -D warnings` | limpio |
-| Perfiles (P2-S1) | `tests/phase2_s1_{profiles,r1,r2}.rs` verdes (sin cambios en este paquete) |
+| `cargo build --release --locked --offline` | PASS |
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --locked --offline --jobs 2 --all-targets -- -D warnings` | PASS |
+| Tests TUI dirigidos | **15/15** — semantics 8/8; history 7/7 |
+| `make budget`, `budget-two`, `budget-scale` | PASS, sin cambios de umbral |
 
-## 4. Binario release y recursos (SHA de código auditado + este paquete)
+## 4. SQLite / P2-S1
 
-```text
-budget-size : 5,920,624 bytes (5.9 MB) ≤ 30 MB                        → PASS
-budget-deps : PASS (solo ABI base del OS + zlib del sistema)
-budget-mem  : idle 7.0 MB · thread abierto 7.9 MB · delta 0.89 MiB  → PASS
-budget-start: p95 31.1 ms ≤ 300 ms                                    → PASS
-budget-two  : TUI 9,120 KB (8.9 MB) · mocks 4,756/4,656 KB
-              combinado 18,532 KB (18.1 MB) · arranque 2 activos 52.8 ms
-              consultas avg 7.9 ms / max 11.2 ms                      → PASS
-budget-scale: app 10.2 MB (gate 500 MB) · agentes 23.0 MB · total 33.1 MB → PASS
-```
+- El test original `r2_h4_concurrent_migration_is_serialized` conserva `Barrier::new(24)`, 24 aperturas concurrentes, `user_version == 4` y `profile IS NULL`.
+- Stress: **100/100 aislado + 100/100 bajo carga** de dos workers Wave B. Cero fallos.
+- `r2_h4_interrupted_v4_ddl_is_idempotent`: PASS; DDL y `user_version` se aplican en una transacción `IMMEDIATE`.
+- `sqlite_wal_retry`: PASS; deadline observado **5,000 ms**, `DatabaseBusy`, `user_version=0` y journal mode previo intacto tras fallar WAL.
+- La contención SQLite no produjo migraciones parciales ni duplicadas.
 
-### Comparación contra el baseline certificado anterior (Fase 1)
+Evidencia: `artifacts/sqlite-stress-overview.json`, `artifacts/sqlite-stress-*.jsonl`, `logs/target-wal-deadline.stdout.log`, `logs/target-sqlite.stdout.log`.
 
-| Métrica | Baseline Fase 1 | Actual (rama TUI) | Δ | Gate |
-|---|---|---|---|---|
-| TUI RSS (2 runs) | 8.1–8.3 MB | 8.9 MB | +0.7 MB (+8%) | informativo |
-| RSS mock (c/u) | 4.0 MB | 4.5–4.6 MB | +0.5 MB | informativo |
-| RSS combinado | ~16.6 MB | 18.1 MB | +1.5 MB | informativo |
-| Startup p95 | 12.7–13.9 ms | 31.1 ms | ×2.3 | ≤300 ms ✅ |
-| Latencia de consulta | ~3.1 ms | 7.9 ms (avg) | ×2.5 | informativo |
-| RSS idle | 6.8 MB | 7.0 MB | +0.2 MB | ≤50 MB ✅ |
-| Delta por thread | 0.79–0.86 MiB | 0.89 MiB | +0.04 | ≤10 MiB ✅ |
-| Binario | 5.6 MB | 5.9 MB | +0.3 MB | ≤30 MB ✅ |
-| scale: app | ~9.8 MB | 10.2 MB | +0.4 MB | ≤500 MB ✅ |
+## 5. B3 Git recovery
 
-**Lectura:** el rediseño de TUI **no rompe ningún gate**; la deriva es real pero
-acotada (+8% RSS de TUI, ×2.3 latencia de arranque绝对 dentro de un budget de
-300 ms). Queda como riesgo operativo vigilado (§7), no como bloqueo.
+- Pruebas dirigidas: **6/6**.
+- Stress del test original: **300/300 aislado + 300/300 bajo carga**; dos workers completaron 14 ciclos de Wave B sin fallos.
+- `Locked` se reintenta; mismo OID es idempotente; OID distinto es conflicto terminal; no hay force-overwrite; refs simbólicas se rechazan.
+- Agotamiento transitorio produce `Deferred`, no `checkpoint.failed`; una recuperación posterior produce exactamente un `checkpoint.ready`.
+- `append_resolution` conserva la transacción `IMMEDIATE` y la idempotencia.
+- El test B3 original no fue modificado; los tres tests nuevos de la corrección están presentes.
+- No quedaron `.lock` de refs.
 
-## 5. Aceptación visual
+Evidencia: `artifacts/b3-stress-overview.json`, `artifacts/b3-stress-*.jsonl`, `logs/target-b3.stdout.log`.
 
-**Resultado de aceptación visual: 90/100** (proporcionado por el brief de
-aceptación; la captura independiente de este paquete corrobora las tres
-geometrías pedidas).
+## 6. TUI
 
-Capturas en `docs/phase2-tui-acceptance/screenshots/` (visor de terminal
-reconstruido desde un pty real con `TIOCSWINSZ`, más el flujo ANSI crudo):
+Ejecución dirigida del árbol combinado:
 
-| Geometría | Artefactos | Contenido verificado |
-|---|---|---|
-| 180×50 | `tui-180x50.png` · `.txt` · `.ansi` | tres paneles; el panel central muestra el run (goal, pasos 5/5), el derecho el checkpoint verificado (snapshot, OID, ficheros) |
-| 120×40 | `tui-120x40.png` · `.txt` · `.ansi` | degradación por truncado (`.txt` con el nombre de tarea acortado) sin solapes ni pérdida de estructura |
-| 80×24 | `tui-80x24.png` · `.txt` · `.ansi` | panel de checkpoint colapsado (sin panel visible); el detalle del run conserva goal, pasos y timeline |
+- `phase2_tui_checkpoint_semantics`: **8/8**.
+- `phase2_tui_history`: **7/7**.
+- Progreso run-scoped con 150 y 1,000 eventos; goal durable fuera de la ventana; aislamiento entre runs; selección histórica; estados active/completed/failed; memoria acotada; lookup con 1,000 y 50,000 registros.
+- Latencias medidas en este gate: streaming **42.3 ms / 2,185.0 ms**; referencia certificada materializada **39.3 ms / 2,081.1 ms**. Son informativas; no hay un threshold de latencia de lookup.
+- `ready_for_snapshot()` conserva cursor `seq DESC`, deserializa y valida **cada** registro antes de comparar `snapshot_id`, y propaga errores. No usa `json_extract` para saltarse inválidos.
+- `latest_ready()` conserva la consulta acotada aceptada. El hallazgo de selección tardía de un `ready` antiguo sigue como follow-up separado; este gate no lo redefine.
 
-Higiene de las capturas: **sin rutas del host, sin correos, sin tokens** (scan
-automático; las únicas coincidencias son cabeceras de hunk `@@ -1,3 +1,3 @@` de un
-diff, no datos sensibles). Los fixtures de captura son desechables en `/tmp`.
+RED/GREEN histórico preservado sin reescribir: RED = **7 tests, 3 fallos**; GREEN = **8/8**, al añadirse el test de latencia.
 
-## 6. Limpieza de procesos (hallazgo histórico de PTY/TUI)
+## 7. Release y recursos
 
-**Histórico.** El 17-oct quedaron **8 TUIs huérfanas** (`aeril --backend
-mock:/tmp/aeril-test-s3-t*`) en busy-loop a ~80% CPU cada una (~6.5 núcleos),
-reparentadas a `systemd` porque su harness de tests murió por señal (sin
-`Drop`). Se limpiaron por identidad (cmdline + cwd) sin tocar procesos ajenos.
+Binario: **5,928,496 bytes**, SHA-256 `64ed48a52a558e216bc400ab550759e30936bc3e77dab53226ce5eab71f3618c`.
 
-**Reproducción controlada (fixture desechable, marcador único en
-`AERIL_DATA_DIR`, identidad por pid+starttime+environ):**
+| Medida | TUI integración previa | Combinado actual | Δ | Umbral |
+|---|---:|---:|---:|---:|
+| Binario | 5,923,632 B | 5,928,496 B | +4,864 B / +0.08% | ≤30 MB PASS |
+| RSS idle / thread abierto | 6,992 / 7,984 KiB | 6,816 / 7,864 KiB | −2.5% / −1.5% | ≤50 MB PASS |
+| Delta por thread | 0.97 MiB | 1.02 MiB | +5.2% | ≤10 MiB PASS |
+| Startup p95 | 21.61 ms | 24.05 ms | +11.3% | ≤300 ms PASS |
+| TUI RSS, 2 runs | 8,932 KiB | 8,924 KiB | −0.1% | app ≤500 MB PASS |
+| RSS combinado, 2 runs | 17,944 KiB | 17,428 KiB | −2.9% | informativo |
+| Arranque con 2 activos | 51.66 ms | 51.58 ms | −0.2% | informativo |
+| Query avg / max | 5.82 / 9.24 ms | 5.72 / 8.14 ms | −1.7% / −11.9% | informativo |
+| Scale app / agentes / total | 10.06 / 21.83 / 31.89 MiB | 9.84 / 21.06 / 30.90 MiB | −2.2% / −3.5% / −3.1% | app ≤500 MB PASS |
 
-| Escenario | Resultado |
-|---|---|
-| A) operación normal (fin de suite) | **0 procesos de test vivos** tras la suite completa (218/218) |
-| B) holder muere por SIGTERM (caída ordenada) | TUI **muere** con el holder; 0 huérfanos |
-| C) holder muere por SIGKILL (sin `Drop`), TUI ociosa | TUI **muere** (EOF de pty) ✅ |
-| D) holder muere por SIGKILL, TUI con **run activo** | TUI **muere** ✅ |
-| E) holder muere por SIGKILL, TUI con **flood** de eventos | TUI **muere** ✅ |
-| F) A/B con el binario **pre-rediseño** (`main`) | también muere ✅ |
+La diferencia de hash es esperada por los dos hotfixes. El aumento de tamaño es 0.08%. Los mocks no predicen consumo de Hermes real. No se cambiaron límites.
 
-**Conclusión:** con el código actual **no se reproduce** la fuga de huérfanos
-(operación normal e interrumpida). La severidad residual es **P3 (higiene del
-harness)**: si un árbol de tests completo muere por señal, la TUI puede quedar
- viva hasta que el pty le avise; no hay impacto en producción (la TUI de
-producción no es hija de un harness killed y sale con EOF de pty).
+## 8. Seguridad y alcance
 
-**Riesgo residual (no bloqueante):** no existe `PR_SET_PDEATHSIG` en el spawn
-del harness PTY, así que la dependencia del EOF de pty es implícita.
-**Recomendación (fuera de este paquete):** `pre_exec` con `PDEATHSIG=SIGKILL`
-en `tests/common/pty.rs` + un barrido de huérfanos por marcador al final de la
-suite. Nada de esto afecta al producto.
+- Diseño visual aprobado intacto; capturas y evidencia histórica sin modificar.
+- D7: solo dos literales de espera de primer frame `"Fase 1"` → `"Aeril"` en `tests/phase1_concurrency.rs` y `tests/phase1_s3.rs`; asserts, deadlines y conteos intactos.
+- Managed profiles permanece default-off; single-Hermes sigue enforced; no se usan credenciales reales.
+- Sin migraciones nuevas por el TUI; sin implementación P2-S2.
+- D5 sigue retirado por inválido: main y TUI ya reconocen prefijos `hermes:`.
+- Follow-ups no bloqueantes: selección tardía en `latest_ready`; un fallo transitorio de captura en vivo puede marcar el run `failed` aunque el checkpoint siga recuperable (comportamiento heredado de main PR #3); tie-break de listas TUI con más de 200 threads.
 
-**Leftovers históricos identificados (NO se tocaron):** un proceso
-`/home/elliot/aeril/target/debug/aeril run start --thread 047e8cc6…` vivo desde
-el 17-oct 19:45 (≈2 días) en el worktree de `main` — ajeno a este trabajo y a
-esta rama; y dos fakes dormidos de la auditoría
-(`p2s1-audit-scratch4/5`, 0% CPU). Se dejan intactos: la auditoría decide.
+## 9. Procesos y filesystem
 
-## 7. Limitaciones conocidas de la terminal
+Barrido final por identidad de gate/fixture: **0** procesos Aeril/mock/PTY, **0** procesos fake-Hermes, **0** lockfiles de test o del checkout, **0** directorios temporales de test. No se enviaron señales ni se usó limpieza por nombre. Procesos históricos ajenos preservados. PDEATHSIG sigue como follow-up P3.
 
-1. **80×24**: el panel de checkpoint no cabe y se colapsa (sin checkpoint visible
-   en la vista de lista). Comportamiento deliberado de degradación, no pérdida
-   de datos (el detalle sí lo muestra).
-2. **Truncado con elipsis** en nombres largos de tarea (`ejemplo de tar…`) a
-   120/80 columnas.
-3. **Sin terminal (sin tty):** la TUI hace panic de inicialización de ratatui
-   (`failed to initialize terminal: No such device or address`, exit 101) en vez
-   de un mensaje de error limpio. Comportamiento **preexistente** (no de este
-   rediseño) y fuera del alcance de aceptación; candidato a endurecer.
-4. **Rutas absolutas en la cabecera** (workspace path) se muestran en la TUI; en
-   las capturas del paquete fueron saneadas, pero la TUI real las muestra.
-5. **El target `$(BIN)` del Makefile no depende de las fuentes:** `make budget`
-   puede reutilizar un binario release viejo. Hay que forzar
-   `cargo build --release` antes de medir (documentado en §3 y en el closeout P2-S1).
+Evidencia: `artifacts/process-and-lock-cleanup.json`.
 
-## 8. Riesgos operativos restantes
+## 10. Cierre documental y D1–D7
 
-| Riesgo | Nivel | Estado |
-|---|---|---|
-| Deriva de latencia/RSS de la TUI (+8% RSS, ×2.3 startup) | Bajo | gates en verde; vigilar en la próxima iteración |
-| `PDEATHSIG` ausente en el harness PTY (P3) | Bajo | no reproducible con el código actual; recomendación §6 |
-| TUI sin tty → panic en vez de error limpio | Bajo | preexistente, fuera de alcance |
-| `review::list_comment_summaries` carga el historial de comentarios del thread | Bajo | acotado por volumen humano; no tocado en este paquete |
-| TUI ↔ subsistema de perfiles | Nulo | la TUI no referencia `profile::` ni el flag; el gate single-Hermes sigue vigente (`is_hermes_backend`, extendido a prefijos `hermes:`) |
+- **D1:** código probado `a0a55b093fcfd3fee770c5d3c9f35c51801b988d`, tree `752f3b8b3f89de92785ce247cf02d8253e0ee1a5`.
+- **D2/D6:** **230 tests / 27 targets**; intentos 229/230, 230/230, 230/230. El primer intento es FAIL y el veredicto es HOLD.
+- **D3:** semántica de checkpoint corregida y verificada 8/8; streaming reverse-seq con validación por registro.
+- **D4:** recursos del árbol actual medidos y comparados con la integración TUI previa; no se reutilizan como si fueran actuales.
+- **D5:** inválido, retirado.
+- **D7:** dos cambios de literal, sin debilitamiento de aserciones.
+- RED/GREEN histórico: 7/3 y 8/8, preservados.
 
-## 9. Commits de esta rama y HEAD remoto
+Este documento se transfirió manualmente desde el cierre anterior `ef0d937…`; no se cherry-pickeó el merge antiguo. El commit documental final y la prueba de que solo cambia documentación se registran en `artifacts/documentation-provenance.json` fuera del checkout.
 
-| SHA | Asunto |
-|---|---|
-| `6255957c4e6048f866be910fea2052f343667b39` | fix(tui): make run progress independent of recent-event window (publicado en esta misión) |
-| `8b5ba89ff34ee79cc39a978a6cb82d6dadf74d2d` | test(tui): verificar historias largas y acotar la búsqueda de checkpoints (este paquete) |
-| (este commit) | docs(tui): paquete de aceptación TUI (este paquete) |
+### Recomendación final: **HOLD**
 
-**HEAD remoto exacto de `feat/tui-workbench-redesign` al cierre:** el tip publicado de
-la rama (commit de este paquete) — el SHA exacto se registra en el handoff de la
-misión y en `git ls-remote origin refs/heads/feat/tui-workbench-redesign`.
+El merge, SQLite, B3, TUI y budgets son correctos, pero el requisito estricto de tres suites completas consecutivas no se cumple por el flake P2-S1 de `full-1`. Se requiere una corrección test-only revisada de la sincronización del fixture, o una decisión humana explícita sobre ese fallo, y repetir las tres suites completas. No se autoriza merge, tag ni release.
 
-**Main sin tocar:** `3a28af2b5acb7efa94540d15e4fe068af89259e1` (sin merge, sin
-tag, sin release).
-
-## 10. P2 remediation — semántica de `ready_for_snapshot` (cierre del HOLD)
-
-**Regresión (HOLD de auditoría):** la variante con `json_extract` filtraba por
-`snapshot_id` **en SQL**, por lo que nunca deserializaba los registros que no
-coincidían; un `checkpoint.ready` más nuevo y estructuralmente inválido quedaba
-sin detectar y la operación que antes fallaba ahora tenía éxito.
-
-**Corrección (commit único, alcance mínimo):** `checkpoint::ready_for_snapshot`
-vuelve a la semántica certificada — cursor en streaming `seq DESC`,
-deserialización y **validación de cada registro antes** de comparar el
-`snapshot_id`, y **propagación** de los errores de validación — manteniendo la
-memoria acotada. `latest_ready()` (optimización aceptada) queda intacto.
-
-**Evidencia determinista:**
-`docs/phase2-tui-acceptance/evidence/red-checkpoint-semantics.txt` (RED: 3/8
-fallan, `prod=Ok("ok:snap-ok")` vs `cert=Err("json: missing field
-\`snapshot_id\`")`) → `green-checkpoint-semantics.txt` (GREEN: 8/8).
-
-**Matriz obligatoria cubierta** (`tests/phase2_tui_checkpoint_semantics.rs`,
-8 tests): snapshot válido existente · múltiples snapshots y snapshot_ids
-duplicados (gana el más nuevo) · checkpoint más nuevo no relacionado
-estructuralmente inválido (debe propagar) · campos obligatorios faltantes y
-tipos incorrectos · snapshot pedido inexistente · historiales de 1.000 y 50.000
-checkpoints · **paridad con el algoritmo certificado** (comparación directa
-contra una reimplementación local del algoritmo de `main@3a28af2`).
-
-**Latencia del lookup (peor caso: snapshot más viejo ⇒ recorrido completo):**
-
-| Checkpoints | Streaming (nuevo) | Certificado (`main`, materializa) |
-|---|---|---|
-| 1.000 | 38.0 ms | 49.6 ms |
-| 50.000 | 1.981 ms | 2.432 ms |
-
-## 11. Recomendación para aceptación final independiente
-
-**Recomendación: aceptar el TUI (rama `feat/tui-workbench-redesign`) para
-integración**, con estas condiciones:
-
-1. Revisión de los dos cambios de acotado (`checkpoint::latest_ready`,
-   `checkpoint::ready_for_snapshot`): semántica idéntica verificada por los
-   tests de historial largo y los de la suite completa (218/218).
-2. Re-auditoría de la deriva de TUI (RSS +8%, startup ×2.3) contra el presupuesto
-   por sesión que se defina para P2-S2.
-3. `PDEATHSIG` en el harness PTY como hardening del P3 (no bloquea la
-   integración; es deuda del harness).
-4. Tras la integración autorizada: actualizar el GIF de la demo pública
-   (`docs/public-status-demo`) para mostrar exactamente esta implementación
-   (paso pendiente, condicionado a la autorización de merge).
-
-**Bloqueos para la aceptación:** ninguno en el código. **Pendiente de
-decisión humana:** autorización explícita de merge de la rama TUI (y la
-actualización del GIF de la demo, que hoy muestra una implementación anterior).
+**P2-S2 sigue HOLD.**
