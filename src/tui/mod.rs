@@ -1205,10 +1205,7 @@ fn render_blocked(f: &mut Frame, title: &str, message: &str) {
             Style::default().fg(MUTED),
         )),
     ];
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        inner,
-    );
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {

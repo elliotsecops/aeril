@@ -15,6 +15,20 @@ import json, os, select, signal, sys, time
 
 args = sys.argv[1:]
 home = os.environ.get("HERMES_HOME") or ""
+FAILED_TURN_NOTICE = (
+    "Your request was not processed. Send it again if you still want me to carry it out."
+)
+PARTIAL_FAILED_TURN_NOTICE = (
+    "This turn did not complete. Some actions may already have run; verify their effects "
+    "before resending."
+)
+
+
+def send_chunk(text):
+    print(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "update": {"sessionUpdate": "agent_message_chunk",
+                   "content": {"type": "text", "text": text},
+                   "messageId": "m1"}}}), flush=True)
 
 
 def proc_start(pid):
@@ -47,11 +61,11 @@ def read_opt(name, default=""):
 
 
 if args and args[0] == "--version":
-    print("hermes 0.0.0-fake")
+    print(os.environ.get("FAKE_VERSION", "hermes 0.0.0-fake"))
     sys.exit(0)
 
 if len(args) >= 2 and args[0] == "acp" and args[1] == "--version":
-    print("hermes 0.0.0-fake")
+    print(os.environ.get("FAKE_VERSION", "hermes 0.0.0-fake"))
     sys.exit(0)
 
 if args and args[0] == "auth":
@@ -417,10 +431,23 @@ if args and args[0] == "acp":
                         pass
                 time.sleep(600)
                 continue
-            print(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {
-                "update": {"sessionUpdate": "agent_message_chunk",
-                           "content": {"type": "text", "text": "hecho (fake)"},
-                           "messageId": "m1"}}}), flush=True)
+            if mode == "failed-turn":
+                send_chunk(FAILED_TURN_NOTICE)
+            elif mode == "failed-turn-partial":
+                send_chunk(PARTIAL_FAILED_TURN_NOTICE)
+            elif mode == "failed-turn-split":
+                half = len(FAILED_TURN_NOTICE) // 2
+                send_chunk(FAILED_TURN_NOTICE[:half])
+                time.sleep(0.05)
+                send_chunk(FAILED_TURN_NOTICE[half:])
+            elif mode == "quoted-notice":
+                send_chunk(
+                    "Contexto: el motor dijo '"
+                    + FAILED_TURN_NOTICE
+                    + "' pero el trabajo terminó correctamente."
+                )
+            else:
+                send_chunk("hecho (fake)")
             print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}}), flush=True)
         elif mid is not None:
             print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)

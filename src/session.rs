@@ -560,6 +560,13 @@ impl Runner {
         let lease_lost = lease_guard.as_ref().map(|g| g.lost()).unwrap_or(false);
         let delivered = turn.feedback_delivered;
         let (mut state, mut detail, stop_reason) = match turn {
+            // G1: aviso terminal de turno fallido con `end_turn` ⇒ NUNCA completed.
+            TurnResult {
+                stop_reason: Some(s),
+                detail,
+                failed_turn_notice: true,
+                ..
+            } if s == "end_turn" => ("failed", detail, Some(s)),
             TurnResult {
                 stop_reason: Some(s),
                 detail,
@@ -738,6 +745,7 @@ impl Runner {
                 stop_reason: None,
                 detail: Some(format!("no se pudo habilitar el lock para el backend: {e}")),
                 feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                failed_turn_notice: false,
             };
         }
         let mut client = match AcpClient::spawn(spec, worktree).await {
@@ -747,6 +755,7 @@ impl Runner {
                     stop_reason: None,
                     detail: Some(format!("no se pudo lanzar el backend: {e}")),
                     feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                    failed_turn_notice: false,
                 };
             }
         };
@@ -763,6 +772,7 @@ impl Runner {
                     stop_reason: None,
                     detail: Some(format!("no se pudo persistir el backend owner: {e}")),
                     feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                    failed_turn_notice: false,
                 };
             }
         }
@@ -791,6 +801,7 @@ impl Runner {
                         "no se pudo registrar la evidencia del backend: {e}"
                     )),
                     feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                    failed_turn_notice: false,
                 };
             }
         }
@@ -803,6 +814,7 @@ impl Runner {
                 stop_reason: None,
                 detail: Some(format!("initialize falló: {e}")),
                 feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                failed_turn_notice: false,
             };
         }
 
@@ -839,6 +851,7 @@ impl Runner {
                                         .feedback_comment_ids
                                         .as_ref()
                                         .map(|_| false),
+                                    failed_turn_notice: false,
                                 };
                             }
                         }
@@ -856,6 +869,7 @@ impl Runner {
                         stop_reason: None,
                         detail: Some(format!("session/new falló: {e}")),
                         feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                        failed_turn_notice: false,
                     };
                 }
             },
@@ -874,6 +888,7 @@ impl Runner {
                 stop_reason: None,
                 detail: Some(format!("no se pudo persistir la sesión del motor: {e}")),
                 feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                failed_turn_notice: false,
             };
         }
         // La sesión quedó establecida: el run está corriendo (si el proceso
@@ -884,6 +899,7 @@ impl Runner {
                 stop_reason: None,
                 detail: Some(format!("no se pudo marcar el run como running: {e}")),
                 feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                failed_turn_notice: false,
             };
         }
 
@@ -896,6 +912,7 @@ impl Runner {
                 stop_reason: None,
                 detail: Some(format!("no se pudo fijar el modelo `{model}`: {e}")),
                 feedback_delivered: opts.feedback_comment_ids.as_ref().map(|_| false),
+                failed_turn_notice: false,
             };
         }
 
@@ -912,6 +929,7 @@ impl Runner {
                 feedback_pending: opts.feedback_comment_ids.clone().map(|ids| (ids, false)),
                 turn_started: false,
                 tools: HashMap::new(),
+                turn_agent_text: String::new(),
             };
             let res = client.prompt(prompt, &mut observer, effective_cancel).await;
             // El último mensaje acumulado del turno se persiste SIEMPRE,
@@ -923,12 +941,14 @@ impl Runner {
                 .feedback_pending
                 .as_ref()
                 .map(|(_, delivered)| *delivered);
+            let turn_agent_text = std::mem::take(&mut observer.turn_agent_text);
             drop(observer);
             if let Err(e) = flush {
                 return TurnResult {
                     stop_reason: None,
                     detail: Some(format!("no se pudo persistir el mensaje final: {e}")),
                     feedback_delivered: delivered,
+                    failed_turn_notice: false,
                 };
             }
             match res {
@@ -939,16 +959,31 @@ impl Runner {
                             .into(),
                     ),
                     feedback_delivered: delivered,
+                    failed_turn_notice: false,
                 },
-                Ok(c) => TurnResult {
-                    stop_reason: Some(c.stop_reason),
-                    detail: None,
-                    feedback_delivered: delivered,
-                },
+                Ok(c) => {
+                    // G1: el ACP puede responder `end_turn` aunque el proveedor
+                    // haya fallado el turno. Solo se clasifica con el aviso
+                    // TERMINAL exacto y una versión de Hermes soportada.
+                    let failed_notice = c.stop_reason == "end_turn"
+                        && hermes_failed_turn_notice(&turn_agent_text, &spec.name, &spec.version);
+                    TurnResult {
+                        stop_reason: Some(c.stop_reason),
+                        detail: failed_notice.then(|| {
+                            format!(
+                                "el proveedor reportó un turno fallido (aviso terminal de Hermes {}); no se captura checkpoint",
+                                spec.version
+                            )
+                        }),
+                        feedback_delivered: delivered,
+                        failed_turn_notice: failed_notice,
+                    }
+                }
                 Err(e) => TurnResult {
                     stop_reason: None,
                     detail: Some(e.to_string()),
                     feedback_delivered: delivered,
+                    failed_turn_notice: false,
                 },
             }
         };
@@ -957,12 +992,43 @@ impl Runner {
     }
 }
 
+/// Avisos TERMINALES de turno fallido de Hermes (verificados en 0.21.x; el ACP
+/// igual responde `end_turn`). El match es por igualdad EXACTA del mensaje
+/// completo: una respuesta que los cite dentro de un texto mayor NO califica.
+const HERMES_FAILED_TURN_NOTICES: [&str; 2] = [
+    "Your request was not processed. Send it again if you still want me to carry it out.",
+    "This turn did not complete. Some actions may already have run; verify their effects before resending.",
+];
+
+/// ¿La versión de Hermes pertenece a la familia soportada para estos avisos?
+/// Se compara por token (`0.21.…`), no por substring, para no aceptar `10.21.…`.
+fn hermes_version_supports_failed_turn_notice(version: &str) -> bool {
+    version
+        .split(|c: char| {
+            !(c.is_ascii_alphanumeric() || c == '.' || c == '+' || c == '-' || c == '_')
+        })
+        .any(|token| token.starts_with("0.21."))
+}
+
+/// Clasificación conservadora (G1): solo backend Hermes, solo versión
+/// soportada y solo si el texto COMPLETO del turno es uno de los avisos.
+fn hermes_failed_turn_notice(text: &str, backend: &str, version: &str) -> bool {
+    if backend != "hermes" || !hermes_version_supports_failed_turn_notice(version) {
+        return false;
+    }
+    let trimmed = text.trim();
+    HERMES_FAILED_TURN_NOTICES.contains(&trimmed)
+}
+
 struct TurnResult {
     stop_reason: Option<String>,
     detail: Option<String>,
     /// `None` = este run no envía feedback; `Some(true)` = el motor dio
     /// evidencia de procesarlo; `Some(false)` = quedó sin ack.
     feedback_delivered: Option<bool>,
+    /// El turno terminó con `end_turn` pero el proveedor reportó un turno
+    /// fallido (aviso terminal de Hermes). El run DEBE cerrarse `failed`.
+    failed_turn_notice: bool,
 }
 
 /// Guard del lease de workspace: renueva en un thread propio, ABORTA si
@@ -1160,6 +1226,10 @@ struct PersistingObserver<'a> {
     /// `toolCallId → (título, último estado visto)`: los updates de Hermes no
     /// repiten el título, así que se arrastra desde el `tool_call` inicial.
     tools: HashMap<String, (String, String)>,
+    /// Texto completo del turno (solo `agent_message_chunk`), acotado. Se usa
+    /// para detectar el aviso terminal de turno fallido de Hermes (G1); el
+    /// match es EXACTO sobre el mensaje completo, nunca por substring.
+    turn_agent_text: String,
 }
 
 impl PersistingObserver<'_> {
@@ -1216,6 +1286,8 @@ impl PersistingObserver<'_> {
 impl TurnObserver for PersistingObserver<'_> {
     fn on_turn_started(&mut self) {
         self.turn_started = true;
+        // Delimita el texto del turno NUEVO (pings/replay previos no cuentan).
+        self.turn_agent_text.clear();
     }
 
     fn on_update(&mut self, update: &Value) -> Result<()> {
@@ -1228,6 +1300,11 @@ impl TurnObserver for PersistingObserver<'_> {
         }
         if let Some((label, text, mid)) = acpmod::chunk_text(update) {
             if label == "agent_message_chunk" {
+                // Acumulación acotada: el aviso de turno fallido es corto; un
+                // texto enorme no puede ser el aviso y no se acumula sin límite.
+                if self.turn_agent_text.len() < 64 * 1024 {
+                    self.turn_agent_text.push_str(&text);
+                }
                 match &mut self.current_message {
                     Some((existing_mid, buf)) if *existing_mid == mid => buf.push_str(&text),
                     Some((_, _)) => {
@@ -1876,4 +1953,56 @@ pub fn validate(
     )?;
     drop(checkout); // limpieza explícita (además del Drop)
     Ok(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOTICE: &str = HERMES_FAILED_TURN_NOTICES[0];
+    const PARTIAL: &str = HERMES_FAILED_TURN_NOTICES[1];
+    const OK: &str = "hermes 0.21.5+8877.g865ba90";
+
+    #[test]
+    fn failed_turn_notice_requires_the_exact_terminal_message() {
+        assert!(hermes_failed_turn_notice(NOTICE, "hermes", OK));
+        assert!(hermes_failed_turn_notice(PARTIAL, "hermes", OK));
+        // Espacios alrededor no cambian el mensaje terminal.
+        assert!(hermes_failed_turn_notice(
+            &format!("  {NOTICE}\n"),
+            "hermes",
+            OK
+        ));
+        // Citas o texto adicional NO califican (evita falsos positivos).
+        assert!(!hermes_failed_turn_notice(
+            &format!("Contexto: el motor dijo '{NOTICE}' pero terminó."),
+            "hermes",
+            OK
+        ));
+        assert!(!hermes_failed_turn_notice(
+            &format!("{NOTICE} Además, revisá el diff."),
+            "hermes",
+            OK
+        ));
+        // Texto normal.
+        assert!(!hermes_failed_turn_notice("hecho (fake)", "hermes", OK));
+    }
+
+    #[test]
+    fn failed_turn_notice_is_version_gated() {
+        // Familia soportada (0.21.x), incluso con prefijo/sufijo de versión.
+        assert!(hermes_failed_turn_notice(NOTICE, "hermes", "0.21.9+test"));
+        assert!(hermes_failed_turn_notice(NOTICE, "hermes", "hermes 0.21.0"));
+        // Otras versiones: sin fallback textual (re-validar antes de habilitar).
+        assert!(!hermes_failed_turn_notice(NOTICE, "hermes", "0.22.0+test"));
+        assert!(!hermes_failed_turn_notice(NOTICE, "hermes", "unknown"));
+        // Token exacto: `10.21.3` no es `0.21.x`.
+        assert!(!hermes_failed_turn_notice(NOTICE, "hermes", "10.21.3"));
+    }
+
+    #[test]
+    fn failed_turn_notice_is_hermes_only() {
+        assert!(!hermes_failed_turn_notice(NOTICE, "mock", OK));
+        assert!(!hermes_failed_turn_notice(NOTICE, "", OK));
+    }
 }

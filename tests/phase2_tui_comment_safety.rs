@@ -158,7 +158,10 @@ fn comment_on_non_checkpoint_shows_blocking_dialog_and_keeps_shortcuts_inactive(
     tui.pump(400);
     assert!(tui.alive(), "las teclas del diálogo no deben cerrar la TUI");
     assert_eq!(env.head_oid(), head_before, "no debe integrar");
-    assert!(comments(&env, &thread).is_empty(), "no debe crear comentarios");
+    assert!(
+        comments(&env, &thread).is_empty(),
+        "no debe crear comentarios"
+    );
     assert_eq!(run_count(&env, &thread), 1, "no debe lanzar runs");
 
     // Esc cierra el diálogo y la TUI vuelve a aceptar atajos normales.
