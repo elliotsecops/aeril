@@ -4,6 +4,7 @@ mod common;
 use common::*;
 use serde_json::Value;
 use std::process::Command;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 fn events_of(env: &TestEnv, thread: &str, kind: &str) -> Vec<Value> {
@@ -231,6 +232,170 @@ fn b3_creacion_concurrente_de_otro_oid_es_conflicto() {
         other,
         "la ref del otro proceso queda intacta"
     );
+}
+
+#[test]
+fn b3_publicadores_concurrentes_mismo_oid_convergen_sin_lockfiles() {
+    let env = TestEnv::new("rc1-b3-publishers");
+    let base = env.head_oid();
+    let source = {
+        let tree = env.rev_parse(&format!("{base}^{{tree}}"));
+        git_out(
+            &env.repo,
+            &["commit-tree", &tree, "-p", &base, "-m", "origen"],
+        )
+    };
+    let refname = "refs/aeril/checkpoints/race-publishers";
+    let barrier = Arc::new(Barrier::new(16));
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let repo_path = env.repo.clone();
+        let refname = refname.to_string();
+        let source = source.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let repo = aeril::git::open(&repo_path).unwrap();
+            barrier.wait();
+            aeril::git::snapshot::publish_ref_cas(&repo, &refname, &source)
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .expect("publisher")
+            .expect("el mismo OID converge");
+    }
+    assert_eq!(env.rev_parse(refname), source);
+    let lock = env.repo.join(".git").join(format!("{refname}.lock"));
+    assert!(!lock.exists(), "lockfile residual: {}", lock.display());
+}
+
+#[test]
+fn b3_lock_transitorio_en_publicacion_se_reintenta() {
+    let env = TestEnv::new("rc1-b3-lock-retry");
+    let repo = aeril::git::open(&env.repo).unwrap();
+    let base = env.head_oid();
+    let source = {
+        let tree = env.rev_parse(&format!("{base}^{{tree}}"));
+        git_out(
+            &env.repo,
+            &["commit-tree", &tree, "-p", &base, "-m", "origen"],
+        )
+    };
+    let refname = "refs/aeril/checkpoints/race-lock-retry";
+    let lock = repo.path().join(format!("{refname}.lock"));
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+
+    let lock_to_remove = lock.clone();
+    let remover = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        std::fs::remove_file(lock_to_remove).expect("liberar lock de prueba");
+    });
+
+    let started = Instant::now();
+    let outcome = aeril::git::snapshot::publish_ref_cas(&repo, refname, &source)
+        .expect("un lock transitorio debe reintentarse");
+    remover.join().unwrap();
+    assert_eq!(outcome, aeril::git::snapshot::PublishOutcome::Created);
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "no se esperó al lock transitorio"
+    );
+    assert_eq!(env.rev_parse(refname), source);
+    assert!(!lock.exists(), "lockfile residual: {}", lock.display());
+}
+
+#[test]
+fn b3_agotamiento_de_lock_no_marca_failed_terminal() {
+    let env = TestEnv::new("rc1-b3-lock-exhausted");
+    let thread = env.thread_new("b3-lock");
+    let script = env.script("s", mock_edit("NOTES.md", "# v2\n\nrecuperable\n", "x"));
+    let out = env.aeril_env(
+        &[
+            "run",
+            "start",
+            "--thread",
+            &thread,
+            "--prompt",
+            "x",
+            "--backend",
+            &format!("mock:{}", script.display()),
+        ],
+        &[("AERIL_CRASH_AFTER", "prepared")],
+    );
+    assert_eq!(signal_of(&out.status), Some(9));
+
+    let prepared = env
+        .checkpoint_list(&thread)
+        .into_iter()
+        .find(|c| c["state"] == "prepared")
+        .expect("checkpoint prepared");
+    let sid = prepared["snapshot_id"].as_str().unwrap().to_string();
+    let git_ref = prepared["git_ref"].as_str().unwrap().to_string();
+    let repo = aeril::git::open(&env.repo).unwrap();
+    let lock = repo.path().join(format!("{git_ref}.lock"));
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+
+    let started = Instant::now();
+    let rec = env.aeril(&["recover"]);
+    let elapsed = started.elapsed();
+    assert!(rec.status.success(), "recover debe informar el diferido");
+    assert!(
+        elapsed >= Duration::from_millis(4_500) && elapsed < Duration::from_millis(6_500),
+        "el reintento debe respetar el deadline acotado: {} ms",
+        elapsed.as_millis()
+    );
+    let entries = parse_json(&rec.stdout);
+    assert_eq!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"] == "deferred" && e["snapshot_id"] == sid.as_str())
+            .count(),
+        1,
+        "un lock agotado queda pendiente, no terminal: {entries}"
+    );
+    assert!(
+        events_of(&env, &thread, "checkpoint.failed").is_empty(),
+        "la contención transitoria no puede fabricar un failed terminal"
+    );
+    let still = env.checkpoint_list(&thread);
+    let state = still
+        .iter()
+        .find(|c| c["snapshot_id"] == sid.as_str())
+        .unwrap();
+    assert_eq!(state["state"], "prepared");
+    assert!(
+        repo.find_reference(&git_ref).is_err(),
+        "la ref no debe publicarse mientras el lock sigue tomado"
+    );
+
+    std::fs::remove_file(&lock).unwrap();
+    let rec2 = env.aeril_ok(&["recover"]);
+    assert!(
+        rec2.as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "completed_ready" && e["snapshot_id"] == sid.as_str()),
+        "la recuperación posterior debe completar: {rec2}"
+    );
+    let ready = events_of(&env, &thread, "checkpoint.ready");
+    assert_eq!(ready.len(), 1, "exactamente un ready: {ready:?}");
+    assert_eq!(ready[0]["payload"]["recovered"], true);
+    let rec3 = env.aeril_ok(&["recover"]);
+    assert!(
+        !rec3
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "deferred" || e["action"] == "completed_ready"),
+        "idempotente tras resolver: {rec3}"
+    );
+    assert_eq!(events_of(&env, &thread, "checkpoint.ready").len(), 1);
+    assert!(!lock.exists(), "lockfile residual: {}", lock.display());
 }
 
 #[test]

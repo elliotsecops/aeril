@@ -9,9 +9,24 @@ use crate::error::{Error, Result};
 use crate::store::events::payload::FileSummary;
 use git2::{Oid, Repository, Signature, StatusOptions, Statuses};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// Límite defensivo de archivo individual en v0 (textual): 16 MiB.
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Una publicación CAS compite con otros procesos por el mismo `ref.lock`.
+/// El deadline es monotónico y compartido por todos los reintentos.
+const REF_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(5);
+const REF_LOCK_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(1);
+const REF_LOCK_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(25);
+
+/// Contención transitoria del lock de una ref. No incluye conflictos de OID.
+pub fn is_transient_ref_lock(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Git(git_error) if git_error.code() == git2::ErrorCode::Locked
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct Captured {
@@ -277,8 +292,34 @@ pub fn publish_ref_cas(
     publish_ref_cas_with_hook(repo, ref_name, expected_oid, None)
 }
 
+/// Inspecciona la ref sin modificarla. `Ok(None)` significa ausente.
+fn inspect_ref(repo: &Repository, ref_name: &str, expected: Oid) -> Result<Option<PublishOutcome>> {
+    match repo.find_reference(ref_name) {
+        Ok(existing) => {
+            let target = existing.target().ok_or_else(|| {
+                Error::integrity(format!("{ref_name} es simbólica; se esperaba directa"))
+            })?;
+            if target == expected {
+                Ok(Some(PublishOutcome::AlreadyExists))
+            } else {
+                Err(Error::conflict(format!(
+                    "{ref_name} ya apunta a {target} y se esperaba {expected}: conflicto de integridad; no se sobrescribe"
+                )))
+            }
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Igual que [`publish_ref_cas`] con un `hook` que corre tras observar que la
 /// ref no existe y antes de crearla. Solo para tests deterministas de carrera.
+///
+/// Si libgit2 devuelve `Locked` (otro proceso tiene el `ref.lock`), se
+/// reinspecciona la ref y se reintenta hasta un deadline monotónico de cinco
+/// segundos. Un lock agotado se devuelve como error transitorio para que el
+/// llamador no lo convierta en un fallo terminal: el checkpoint sigue
+/// pendiente y puede recuperarse después.
 pub fn publish_ref_cas_with_hook(
     repo: &Repository,
     ref_name: &str,
@@ -286,49 +327,65 @@ pub fn publish_ref_cas_with_hook(
     hook: Option<&dyn Fn()>,
 ) -> Result<PublishOutcome> {
     let expected = Oid::from_str(expected_oid)?;
-    match repo.find_reference(ref_name) {
-        Ok(existing) => {
-            let target = existing.target().ok_or_else(|| {
-                Error::integrity(format!("{ref_name} es simbólica; se esperaba directa"))
-            })?;
-            if target == expected {
-                Ok(PublishOutcome::AlreadyExists)
-            } else {
-                Err(Error::conflict(format!(
-                    "{ref_name} ya apunta a {target} y se esperaba {expected}: conflicto de integridad; no se sobrescribe"
-                )))
+    let deadline = Instant::now() + REF_LOCK_RETRY_DEADLINE;
+    let mut backoff = REF_LOCK_RETRY_INITIAL_BACKOFF;
+    let mut last_lock_error: Option<Error> = None;
+    let mut hook_called = false;
+
+    loop {
+        match inspect_ref(repo, ref_name, expected) {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {}
+            Err(error) if is_transient_ref_lock(&error) => {
+                last_lock_error = Some(error);
             }
+            Err(error) => return Err(error),
         }
-        Err(_) => {
+
+        if deadline.saturating_duration_since(Instant::now()).is_zero()
+            && let Some(error) = last_lock_error.take()
+        {
+            return Err(error);
+        }
+
+        if !hook_called {
             if let Some(h) = hook {
                 h();
             }
-            if let Err(create_err) = repo.reference(ref_name, expected, false, "aeril: checkpoint")
-            {
+            hook_called = true;
+        }
+
+        match repo.reference(ref_name, expected, false, "aeril: checkpoint") {
+            Ok(_) => {
+                let check = repo.find_reference(ref_name)?;
+                if check.target() != Some(expected) {
+                    return Err(Error::integrity(format!(
+                        "{ref_name} no quedó en {expected} tras publicarla"
+                    )));
+                }
+                return Ok(PublishOutcome::Created);
+            }
+            Err(create_error) if create_error.code() == git2::ErrorCode::Locked => {
+                last_lock_error = Some(create_error.into());
+            }
+            Err(create_error) => {
                 // Otro proceso pudo crear la ref en paralelo: misma
                 // (name, oid) = éxito idempotente; otro OID = conflicto.
-                return match repo.find_reference(ref_name) {
-                    Ok(existing) => {
-                        let target = existing.target().unwrap_or(Oid::ZERO_SHA1);
-                        if target == expected {
-                            Ok(PublishOutcome::AlreadyExists)
-                        } else {
-                            Err(Error::conflict(format!(
-                                "{ref_name} fue creada en paralelo apuntando a {target} y se esperaba {expected}: conflicto de integridad"
-                            )))
-                        }
-                    }
-                    Err(_) => Err(create_err.into()),
+                return match inspect_ref(repo, ref_name, expected)? {
+                    Some(outcome) => Ok(outcome),
+                    None => Err(create_error.into()),
                 };
             }
-            let check = repo.find_reference(ref_name)?;
-            if check.target() != Some(expected) {
-                return Err(Error::integrity(format!(
-                    "{ref_name} no quedó en {expected} tras publicarla"
-                )));
-            }
-            Ok(PublishOutcome::Created)
         }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(last_lock_error.unwrap_or_else(|| {
+                Error::Other(format!("deadline agotado esperando el lock de {ref_name}"))
+            }));
+        }
+        std::thread::sleep(backoff.min(remaining));
+        backoff = (backoff * 2).min(REF_LOCK_RETRY_MAX_BACKOFF);
     }
 }
 
