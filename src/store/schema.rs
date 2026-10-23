@@ -65,7 +65,15 @@ pub const SCHEMA_V4: &str = r#"
 ALTER TABLE runs ADD COLUMN profile TEXT;
 "#;
 
-pub const SCHEMA_VERSION: i64 = 4;
+/// v5 (P2-R1): índice de expresión para relacionar `checkpoint.ready` con su
+/// `checkpoint.prepared` original. Sin este índice, la selección por orden
+/// lógico degrada a un join O(n²) sobre historiales grandes.
+pub const SCHEMA_V5: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_events_checkpoint_snapshot
+  ON events(thread_id, kind, json_extract(payload, '$.snapshot_id'));
+"#;
+
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// v2: lease de workspace activo (exclusión entre procesos de Aeril).
 /// Tabla pequeña y dedicada: el `INSERT ... ON CONFLICT` dentro de una
@@ -128,6 +136,9 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     // advance the version atomically.
     if current < 4 && !column_exists(&tx, "runs", "profile")? {
         tx.execute_batch(SCHEMA_V4)?;
+    }
+    if current < 5 {
+        tx.execute_batch(SCHEMA_V5)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;

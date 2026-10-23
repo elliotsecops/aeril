@@ -585,21 +585,72 @@ fn append_failed(
 
 // ── consultas para revisión ──────────────────────────────────────────────────
 
-/// Último checkpoint `ready` de un thread.
+/// Último checkpoint `ready` de un thread, ordenado por el `seq` del
+/// `checkpoint.prepared` original.
+///
+/// El `seq` del `ready` mide cuándo terminó la recuperación, no cuándo se
+/// capturó el trabajo. Un `ready` recuperado tarde no debe desplazar a un
+/// checkpoint más nuevo. Para bases históricas sin `prepared` asociado se
+/// conserva el fallback por `ready.seq`; si el `prepared` aparece después del
+/// `ready`, o el `run_id` contradice el del ready, se devuelve error de
+/// integridad en lugar de elegir silenciosamente un snapshot.
 pub fn latest_ready(
     store: &Store,
     thread_id: &str,
 ) -> Result<Option<(EventRecord, payload::CheckpointReady)>> {
-    // Proyección acotada: el ÚLTIMO `checkpoint.ready` por seq, sin materializar
-    // el historial de checkpoints del thread (mismo resultado que fetch_by_kind
-    // + pop, con memoria constante).
-    match events::fetch_latest_by_kind(&store.conn, thread_id, events::K_CHECKPOINT_READY)? {
-        Some(ev) => {
-            let parsed: payload::CheckpointReady = ev.parse()?;
-            Ok(Some((ev, parsed)))
+    let mut stmt = store.conn.prepare(
+        "SELECT r.id, r.thread_id, r.seq, r.run_id, r.kind, r.actor,
+                r.payload_version, r.payload, r.created_ms, p.seq, p.run_id
+           FROM events r
+           LEFT JOIN events p
+             ON p.thread_id = r.thread_id
+            AND p.kind = ?2
+            AND json_extract(p.payload, '$.snapshot_id') =
+                json_extract(r.payload, '$.snapshot_id')
+          WHERE r.thread_id = ?1 AND r.kind = ?3
+          ORDER BY COALESCE(p.seq, r.seq) DESC, r.seq DESC
+          LIMIT 1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![
+        thread_id,
+        events::K_CHECKPOINT_PREPARED,
+        events::K_CHECKPOINT_READY
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let ready_seq: i64 = row.get(2)?;
+    let ready_run: Option<String> = row.get(3)?;
+    let prepared_seq: Option<i64> = row.get(9)?;
+    let prepared_run: Option<String> = row.get(10)?;
+    if let Some(prepared_seq) = prepared_seq {
+        if prepared_seq >= ready_seq {
+            return Err(Error::integrity(format!(
+                "checkpoint.ready seq {ready_seq} no puede preceder a su prepared seq {prepared_seq} (thread {thread_id})"
+            )));
         }
-        None => Ok(None),
+        if let (Some(a), Some(b)) = (ready_run.as_deref(), prepared_run.as_deref())
+            && a != b
+        {
+            return Err(Error::integrity(format!(
+                "checkpoint.ready run {a} contradice prepared run {b} (thread {thread_id})"
+            )));
+        }
     }
+    let payload_text: String = row.get(7)?;
+    let ev = EventRecord {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        seq: ready_seq,
+        run_id: ready_run,
+        kind: row.get(4)?,
+        actor: row.get(5)?,
+        payload_version: row.get(6)?,
+        payload: serde_json::from_str(&payload_text).unwrap_or(serde_json::Value::Null),
+        created_ms: row.get(8)?,
+    };
+    let parsed: payload::CheckpointReady = ev.parse()?;
+    Ok(Some((ev, parsed)))
 }
 
 pub fn ready_for_snapshot(

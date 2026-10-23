@@ -1107,7 +1107,7 @@ fn r2_h4_concurrent_migration_is_serialized() {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get(0))
                     .unwrap();
-                assert_eq!(v, 4);
+                assert_eq!(v, aeril::store::schema::SCHEMA_VERSION);
                 let profile: Option<String> = store
                     .conn
                     .query_row("SELECT profile FROM runs WHERE id='run-old'", [], |r| {
@@ -1134,7 +1134,7 @@ fn r2_h4_interrupted_v4_ddl_is_idempotent() {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, aeril::store::schema::SCHEMA_VERSION);
     }
 
     let dir = std::env::temp_dir().join(format!("aeril-r2-migpart-{}", aeril::ids::new_id()));
@@ -1152,7 +1152,7 @@ fn r2_h4_interrupted_v4_ddl_is_idempotent() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 4);
+    assert_eq!(v, aeril::store::schema::SCHEMA_VERSION);
 }
 
 // ── P2-H5: partial removal recovery ─────────────────────────────────────────
