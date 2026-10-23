@@ -154,16 +154,40 @@ pub fn capture(
         recovered: false,
     };
     let ready_value = serde_json::to_value(&ready)?;
-    let ready_event_id = match append_fenced(
+    let ready_event_id = match append_ready_fenced(
         store,
         workspace_id,
         &run.id,
         &run.thread_id,
-        Some(&run.id),
-        events::K_CHECKPOINT_READY,
+        &run.id,
+        &snapshot_id,
         &ready_value,
     ) {
-        Ok(id) => id,
+        Ok(ReadyAppend::Appended(id)) => id,
+        Ok(ReadyAppend::AlreadyResolved) => {
+            // La recuperación concurrente pudo publicar y verificar el mismo
+            // snapshot antes de que la captura viva confirmara su ready. No
+            // se duplica la resolución: se devuelve la evidencia ready ya
+            // durable, validando que corresponda al OID/ref de esta captura.
+            let Some((ev, parsed)) = ready_for_snapshot(store, &run.thread_id, &snapshot_id)?
+            else {
+                return Err(Error::integrity(format!(
+                    "checkpoint {snapshot_id} ya está resuelto sin un ready verificable"
+                )));
+            };
+            if parsed.oid != captured.commit_oid || parsed.git_ref != ref_name {
+                return Err(Error::integrity(format!(
+                    "checkpoint {snapshot_id} resuelto con identidad divergente"
+                )));
+            }
+            return Ok(Some(CaptureOutcome {
+                snapshot_id,
+                event_id: ev.id,
+                oid: parsed.oid,
+                files: parsed.files,
+                patch_len: parsed.patch.len(),
+            }));
+        }
         Err(e) if matches!(e, Error::LeaseLost(_)) => {
             // La ref ya está publicada (objetos inmutables, jamás se borra),
             // pero este checkpoint NO puede volverse ready. Marcador terminal
@@ -287,6 +311,43 @@ pub fn has_pending_for_run(store: &Store, thread_id: &str, run_id: &str) -> Resu
     Ok(exists == 1)
 }
 
+/// `checkpoint.ready` ya durable para un run, si una recuperación concurrente
+/// resolvió el prepared antes de que la captura viva confirmara su append.
+pub fn ready_for_run(
+    store: &Store,
+    thread_id: &str,
+    run_id: &str,
+) -> Result<Option<(EventRecord, payload::CheckpointReady)>> {
+    let mut stmt = store.conn.prepare(
+        "SELECT id, thread_id, seq, run_id, kind, actor, payload_version, payload, created_ms
+           FROM events
+          WHERE thread_id = ?1 AND kind = ?2 AND run_id = ?3
+          ORDER BY seq DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![
+        thread_id,
+        events::K_CHECKPOINT_READY,
+        run_id
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let payload_text: String = row.get(7)?;
+    let ev = EventRecord {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        seq: row.get(2)?,
+        run_id: row.get(3)?,
+        kind: row.get(4)?,
+        actor: row.get(5)?,
+        payload_version: row.get(6)?,
+        payload: serde_json::from_str(&payload_text).unwrap_or(serde_json::Value::Null),
+        created_ms: row.get(8)?,
+    };
+    let parsed: payload::CheckpointReady = ev.parse()?;
+    Ok(Some((ev, parsed)))
+}
+
 #[derive(Debug)]
 pub enum RecoveryOutcome {
     /// Ref y objetos verificados (re-creando la ref si hacía falta).
@@ -346,6 +407,56 @@ fn append_fenced(
     let (id, _seq) = events::append_tx(&tx, thread_id, run_id, kind, "system", payload, now_ms())?;
     tx.commit()?;
     Ok(id)
+}
+
+enum ReadyAppend {
+    Appended(String),
+    AlreadyResolved,
+}
+
+/// Append de `checkpoint.ready` para la captura viva, idempotente frente a
+/// una recuperación concurrente y bajo el mismo fence de lease que `prepared`.
+fn append_ready_fenced(
+    store: &mut Store,
+    workspace_id: &str,
+    owner_run_id: &str,
+    thread_id: &str,
+    run_id: &str,
+    snapshot_id: &str,
+    payload: &serde_json::Value,
+) -> Result<ReadyAppend> {
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let holder: Option<String> = tx
+        .query_row(
+            "SELECT run_id FROM leases WHERE workspace_id = ?1",
+            rusqlite::params![workspace_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if holder.as_deref() != Some(owner_run_id) {
+        tx.rollback()?;
+        return Err(Error::LeaseLost(format!(
+            "el workspace {workspace_id} ya no pertenece al run {owner_run_id} (holder: {}); \"checkpoint.ready\" no se persiste",
+            holder.unwrap_or_else(|| "ninguno".into())
+        )));
+    }
+    if resolution_exists(&tx, thread_id, snapshot_id)? {
+        tx.rollback()?;
+        return Ok(ReadyAppend::AlreadyResolved);
+    }
+    let (id, _seq) = events::append_tx(
+        &tx,
+        thread_id,
+        Some(run_id),
+        events::K_CHECKPOINT_READY,
+        "system",
+        payload,
+        now_ms(),
+    )?;
+    tx.commit()?;
+    Ok(ReadyAppend::Appended(id))
 }
 
 /// ¿Existe ya una resolución (`ready`/`failed`) para este snapshot?

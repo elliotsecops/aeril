@@ -663,8 +663,27 @@ impl Runner {
                     // queda pendiente de recuperación. Cualquier fallo sin
                     // evidencia durable, o una pérdida de lease, sigue siendo
                     // terminal y fail-closed.
+                    let ready = checkpoint::ready_for_run(store, thread_id, &run.id);
                     let pending = checkpoint::has_pending_for_run(store, thread_id, &run.id);
-                    if !matches!(e, Error::LeaseLost(_)) && matches!(pending, Ok(true)) {
+                    if !matches!(e, Error::LeaseLost(_))
+                        && let Ok(Some((ready_ev, ready_payload))) = ready
+                    {
+                        // Una recuperación concurrente pudo publicar/verificar
+                        // el checkpoint mientras la captura viva fallaba al
+                        // confirmar su propio ready. La resolución durable ya
+                        // existe: no se degrada el turno ni se duplica ready.
+                        snapshot = Some(checkpoint::CaptureOutcome {
+                            snapshot_id: ready_payload.snapshot_id.clone(),
+                            event_id: ready_ev.id,
+                            oid: ready_payload.oid,
+                            files: ready_payload.files,
+                            patch_len: ready_payload.patch.len(),
+                        });
+                        detail = Some(
+                            "turno completado; checkpoint resuelto por recuperación concurrente"
+                                .into(),
+                        );
+                    } else if !matches!(e, Error::LeaseLost(_)) && matches!(pending, Ok(true)) {
                         detail = Some(format!(
                             "turno completado; checkpoint pendiente de recuperación: {e}"
                         ));
