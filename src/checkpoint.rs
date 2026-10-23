@@ -258,6 +258,35 @@ pub fn pending_checkpoints(store: &Store) -> Result<Vec<Pending>> {
     Ok(out)
 }
 
+/// ¿Queda un `prepared` recuperable para este run? Es la evidencia durable que
+/// permite distinguir un checkpoint pendiente de un fallo terminal de captura.
+pub fn has_pending_for_run(store: &Store, thread_id: &str, run_id: &str) -> Result<bool> {
+    let exists: i64 = store.conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events p
+            WHERE p.thread_id = ?1
+              AND p.kind = ?2
+              AND p.run_id = ?3
+              AND NOT EXISTS (
+                SELECT 1 FROM events d
+                WHERE d.thread_id = p.thread_id
+                  AND d.kind IN (?4, ?5)
+                  AND json_extract(d.payload, '$.snapshot_id') =
+                      json_extract(p.payload, '$.snapshot_id')
+              )
+        )",
+        rusqlite::params![
+            thread_id,
+            events::K_CHECKPOINT_PREPARED,
+            run_id,
+            events::K_CHECKPOINT_READY,
+            events::K_CHECKPOINT_FAILED
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
 #[derive(Debug)]
 pub enum RecoveryOutcome {
     /// Ref y objetos verificados (re-creando la ref si hacía falta).

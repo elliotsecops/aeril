@@ -656,24 +656,44 @@ impl Runner {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    if matches!(e, Error::LeaseLost(_)) {
-                        // Pérdida de ownership detectada por el fence: evento
-                        // durable (best-effort; el fence ya rechazó el hecho).
-                        let _ = events::append_typed(
-                            &mut store.conn,
-                            thread_id,
-                            Some(&run.id),
-                            events::K_WORKSPACE_LEASE_LOST,
-                            "system",
-                            &payload::WorkspaceLeaseLost {
-                                workspace_id: target.workspace_id.clone(),
-                                run_id: run.id.clone(),
-                                reason: e.to_string(),
-                            },
-                        );
+                    // Un fallo transitorio después de persistir `prepared`
+                    // deja un checkpoint recuperable. No convierte un turno
+                    // completado del agente en `failed`: el estado del run
+                    // describe el turno, y `detail` declara que el checkpoint
+                    // queda pendiente de recuperación. Cualquier fallo sin
+                    // evidencia durable, o una pérdida de lease, sigue siendo
+                    // terminal y fail-closed.
+                    let pending = checkpoint::has_pending_for_run(store, thread_id, &run.id);
+                    if !matches!(e, Error::LeaseLost(_)) && matches!(pending, Ok(true)) {
+                        detail = Some(format!(
+                            "turno completado; checkpoint pendiente de recuperación: {e}"
+                        ));
+                    } else {
+                        if matches!(e, Error::LeaseLost(_)) {
+                            // Pérdida de ownership detectada por el fence:
+                            // evento durable (best-effort; el fence ya rechazó
+                            // el hecho).
+                            let _ = events::append_typed(
+                                &mut store.conn,
+                                thread_id,
+                                Some(&run.id),
+                                events::K_WORKSPACE_LEASE_LOST,
+                                "system",
+                                &payload::WorkspaceLeaseLost {
+                                    workspace_id: target.workspace_id.clone(),
+                                    run_id: run.id.clone(),
+                                    reason: e.to_string(),
+                                },
+                            );
+                        }
+                        state = "failed";
+                        detail = Some(match pending {
+                            Err(scan) => format!(
+                                "captura de checkpoint falló: {e}; no se pudo confirmar recuperabilidad: {scan}"
+                            ),
+                            _ => format!("captura de checkpoint falló: {e}"),
+                        });
                     }
-                    state = "failed";
-                    detail = Some(format!("captura de checkpoint falló: {e}"));
                 }
             }
         }
