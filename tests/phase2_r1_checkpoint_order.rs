@@ -368,10 +368,10 @@ fn r1_b7_large_history_keeps_logical_order() {
          WHERE r.thread_id = ?1 AND r.kind = 'checkpoint.ready'
          ORDER BY COALESCE(p.seq, r.seq) DESC, r.seq DESC LIMIT 1",
     );
-    if let Ok(mut stmt) = plan {
-        if let Ok(rows) = stmt.query_map(rusqlite::params![thread], |row| row.get::<_, String>(3)) {
-            let lines: Vec<String> = rows.filter_map(Result::ok).collect();
-            println!("QUERY_PLAN {}", lines.join(" | "));
-        }
+    if let Ok(mut stmt) = plan
+        && let Ok(rows) = stmt.query_map(rusqlite::params![thread], |row| row.get::<_, String>(3))
+    {
+        let lines: Vec<String> = rows.filter_map(Result::ok).collect();
+        println!("QUERY_PLAN {}", lines.join(" | "));
     }
 }
