@@ -282,43 +282,25 @@ pub fn pending_checkpoints(store: &Store) -> Result<Vec<Pending>> {
     Ok(out)
 }
 
-/// ¿Queda un `prepared` recuperable para este run? Es la evidencia durable que
-/// permite distinguir un checkpoint pendiente de un fallo terminal de captura.
-pub fn has_pending_for_run(store: &Store, thread_id: &str, run_id: &str) -> Result<bool> {
-    let exists: i64 = store.conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM events p
-            WHERE p.thread_id = ?1
-              AND p.kind = ?2
-              AND p.run_id = ?3
-              AND NOT EXISTS (
-                SELECT 1 FROM events d
-                WHERE d.thread_id = p.thread_id
-                  AND d.kind IN (?4, ?5)
-                  AND json_extract(d.payload, '$.snapshot_id') =
-                      json_extract(p.payload, '$.snapshot_id')
-              )
-        )",
-        rusqlite::params![
-            thread_id,
-            events::K_CHECKPOINT_PREPARED,
-            run_id,
-            events::K_CHECKPOINT_READY,
-            events::K_CHECKPOINT_FAILED
-        ],
-        |row| row.get(0),
-    )?;
-    Ok(exists == 1)
+/// Estado durable del checkpoint de un run en el instante de la consulta.
+#[derive(Debug)]
+pub enum RunCheckpointState {
+    /// Existe un `ready` verificado para el run (posiblemente escrito por una
+    /// recuperación concurrente).
+    Ready(Box<(EventRecord, payload::CheckpointReady)>),
+    /// Queda al menos un `prepared` sin resolución: recuperable.
+    Pending,
+    /// No hay checkpoint pendiente ni `ready` para el run (fallo terminal o
+    /// ausencia de evidencia durable).
+    None,
 }
 
-/// `checkpoint.ready` ya durable para un run, si una recuperación concurrente
-/// resolvió el prepared antes de que la captura viva confirmara su append.
-pub fn ready_for_run(
-    store: &Store,
+fn ready_for_run_conn(
+    conn: &rusqlite::Connection,
     thread_id: &str,
     run_id: &str,
 ) -> Result<Option<(EventRecord, payload::CheckpointReady)>> {
-    let mut stmt = store.conn.prepare(
+    let mut stmt = conn.prepare(
         "SELECT id, thread_id, seq, run_id, kind, actor, payload_version, payload, created_ms
            FROM events
           WHERE thread_id = ?1 AND kind = ?2 AND run_id = ?3
@@ -346,6 +328,61 @@ pub fn ready_for_run(
     };
     let parsed: payload::CheckpointReady = ev.parse()?;
     Ok(Some((ev, parsed)))
+}
+
+fn has_pending_for_run_conn(
+    conn: &rusqlite::Connection,
+    thread_id: &str,
+    run_id: &str,
+) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events p
+            WHERE p.thread_id = ?1
+              AND p.kind = ?2
+              AND p.run_id = ?3
+              AND NOT EXISTS (
+                SELECT 1 FROM events d
+                WHERE d.thread_id = p.thread_id
+                  AND d.kind IN (?4, ?5)
+                  AND json_extract(d.payload, '$.snapshot_id') =
+                      json_extract(p.payload, '$.snapshot_id')
+              )
+        )",
+        rusqlite::params![
+            thread_id,
+            events::K_CHECKPOINT_PREPARED,
+            run_id,
+            events::K_CHECKPOINT_READY,
+            events::K_CHECKPOINT_FAILED
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
+/// Clasifica el estado durable de checkpoint de un run leyendo `ready` y
+/// `pending` bajo el MISMO snapshot SQLite.
+///
+/// Dos lecturas separadas dejarían una ventana: si la recuperación confirma
+/// `ready` entre ambas, `ready` sería `None` y `pending` `false`, y el turno
+/// completado se degradaría falsamente a `failed`. La transacción diferida
+/// garantiza que solo se elige `None` cuando en ese mismo instante no había ni
+/// `ready` ni `prepared` recuperable.
+pub fn run_checkpoint_state(
+    store: &Store,
+    thread_id: &str,
+    run_id: &str,
+) -> Result<RunCheckpointState> {
+    let tx = store.conn.unchecked_transaction()?;
+    let ready = ready_for_run_conn(&tx, thread_id, run_id)?;
+    let pending = has_pending_for_run_conn(&tx, thread_id, run_id)?;
+    tx.commit()?;
+    Ok(match ready {
+        Some((ev, parsed)) => RunCheckpointState::Ready(Box::new((ev, parsed))),
+        None if pending => RunCheckpointState::Pending,
+        None => RunCheckpointState::None,
+    })
 }
 
 #[derive(Debug)]

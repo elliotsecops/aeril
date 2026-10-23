@@ -663,55 +663,62 @@ impl Runner {
                     // queda pendiente de recuperación. Cualquier fallo sin
                     // evidencia durable, o una pérdida de lease, sigue siendo
                     // terminal y fail-closed.
-                    let ready = checkpoint::ready_for_run(store, thread_id, &run.id);
-                    let pending = checkpoint::has_pending_for_run(store, thread_id, &run.id);
-                    if !matches!(e, Error::LeaseLost(_))
-                        && let Ok(Some((ready_ev, ready_payload))) = ready
-                    {
-                        // Una recuperación concurrente pudo publicar/verificar
-                        // el checkpoint mientras la captura viva fallaba al
-                        // confirmar su propio ready. La resolución durable ya
-                        // existe: no se degrada el turno ni se duplica ready.
-                        snapshot = Some(checkpoint::CaptureOutcome {
-                            snapshot_id: ready_payload.snapshot_id.clone(),
-                            event_id: ready_ev.id,
-                            oid: ready_payload.oid,
-                            files: ready_payload.files,
-                            patch_len: ready_payload.patch.len(),
-                        });
-                        detail = Some(
-                            "turno completado; checkpoint resuelto por recuperación concurrente"
-                                .into(),
-                        );
-                    } else if !matches!(e, Error::LeaseLost(_)) && matches!(pending, Ok(true)) {
-                        detail = Some(format!(
-                            "turno completado; checkpoint pendiente de recuperación: {e}"
-                        ));
-                    } else {
-                        if matches!(e, Error::LeaseLost(_)) {
-                            // Pérdida de ownership detectada por el fence:
-                            // evento durable (best-effort; el fence ya rechazó
-                            // el hecho).
-                            let _ = events::append_typed(
-                                &mut store.conn,
-                                thread_id,
-                                Some(&run.id),
-                                events::K_WORKSPACE_LEASE_LOST,
-                                "system",
-                                &payload::WorkspaceLeaseLost {
-                                    workspace_id: target.workspace_id.clone(),
-                                    run_id: run.id.clone(),
-                                    reason: e.to_string(),
-                                },
+                    let lease_lost = matches!(e, Error::LeaseLost(_));
+                    // Una sola instantánea SQLite: `ready` y `pending` no
+                    // pueden contradecirse si la recuperación confirma entre
+                    // medio. Si hay ready, el checkpoint ya es verificable; si
+                    // hay pending, el turno queda completado con recuperación
+                    // diferida. `None` solo se elige con evidencia terminal.
+                    match checkpoint::run_checkpoint_state(store, thread_id, &run.id) {
+                        Ok(checkpoint::RunCheckpointState::Ready(ready)) if !lease_lost => {
+                            // Una recuperación concurrente pudo publicar/verificar
+                            // el checkpoint mientras la captura viva fallaba al
+                            // confirmar su propio ready. La resolución durable ya
+                            // existe: no se degrada el turno ni se duplica ready.
+                            let (ready_ev, ready_payload) = *ready;
+                            snapshot = Some(checkpoint::CaptureOutcome {
+                                snapshot_id: ready_payload.snapshot_id.clone(),
+                                event_id: ready_ev.id,
+                                oid: ready_payload.oid,
+                                files: ready_payload.files,
+                                patch_len: ready_payload.patch.len(),
+                            });
+                            detail = Some(
+                                "turno completado; checkpoint resuelto por recuperación concurrente"
+                                    .into(),
                             );
                         }
-                        state = "failed";
-                        detail = Some(match pending {
-                            Err(scan) => format!(
-                                "captura de checkpoint falló: {e}; no se pudo confirmar recuperabilidad: {scan}"
-                            ),
-                            _ => format!("captura de checkpoint falló: {e}"),
-                        });
+                        Ok(checkpoint::RunCheckpointState::Pending) if !lease_lost => {
+                            detail = Some(format!(
+                                "turno completado; checkpoint pendiente de recuperación: {e}"
+                            ));
+                        }
+                        other => {
+                            if lease_lost {
+                                // Pérdida de ownership detectada por el fence:
+                                // evento durable (best-effort; el fence ya rechazó
+                                // el hecho).
+                                let _ = events::append_typed(
+                                    &mut store.conn,
+                                    thread_id,
+                                    Some(&run.id),
+                                    events::K_WORKSPACE_LEASE_LOST,
+                                    "system",
+                                    &payload::WorkspaceLeaseLost {
+                                        workspace_id: target.workspace_id.clone(),
+                                        run_id: run.id.clone(),
+                                        reason: e.to_string(),
+                                    },
+                                );
+                            }
+                            state = "failed";
+                            detail = Some(match other {
+                                Err(scan) => format!(
+                                    "captura de checkpoint falló: {e}; no se pudo confirmar recuperabilidad: {scan}"
+                                ),
+                                _ => format!("captura de checkpoint falló: {e}"),
+                            });
+                        }
                     }
                 }
             }

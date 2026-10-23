@@ -375,3 +375,87 @@ fn r1_b7_large_history_keeps_logical_order() {
         println!("QUERY_PLAN {}", lines.join(" | "));
     }
 }
+
+fn run_state(store: &Store, thread_id: &str, run_id: &str) -> checkpoint::RunCheckpointState {
+    checkpoint::run_checkpoint_state(store, thread_id, run_id).unwrap()
+}
+
+#[test]
+fn r1_c_state_ready_is_visible_and_wins_over_unrelated_pending() {
+    let (mut store, thread) = store_thread();
+    add_run(&store, &thread, "run-1");
+    append(
+        &mut store,
+        &thread,
+        events::K_CHECKPOINT_PREPARED,
+        Some("run-1"),
+        &prepared("a", Some("run-1")),
+    );
+    append(
+        &mut store,
+        &thread,
+        events::K_CHECKPOINT_READY,
+        Some("run-1"),
+        &ready("a", Some("run-1")),
+    );
+    append(
+        &mut store,
+        &thread,
+        events::K_CHECKPOINT_PREPARED,
+        Some("run-1"),
+        &prepared("b", Some("run-1")),
+    );
+    match run_state(&store, &thread, "run-1") {
+        checkpoint::RunCheckpointState::Ready(ready) => {
+            let (ev, ready) = *ready;
+            assert_eq!(ready.snapshot_id, "a");
+            assert_eq!(ev.run_id.as_deref(), Some("run-1"));
+        }
+        other => panic!("se esperaba Ready(a), se obtuvo {other:?}"),
+    }
+}
+
+#[test]
+fn r1_c_state_pending_requires_durable_prepared() {
+    let (mut store, thread) = store_thread();
+    add_run(&store, &thread, "run-1");
+    assert!(matches!(
+        run_state(&store, &thread, "run-1"),
+        checkpoint::RunCheckpointState::None
+    ));
+    append(
+        &mut store,
+        &thread,
+        events::K_CHECKPOINT_PREPARED,
+        Some("run-1"),
+        &prepared("a", Some("run-1")),
+    );
+    assert!(matches!(
+        run_state(&store, &thread, "run-1"),
+        checkpoint::RunCheckpointState::Pending
+    ));
+}
+
+#[test]
+fn r1_c_state_terminal_failure_is_none() {
+    let (mut store, thread) = store_thread();
+    add_run(&store, &thread, "run-1");
+    append(
+        &mut store,
+        &thread,
+        events::K_CHECKPOINT_PREPARED,
+        Some("run-1"),
+        &prepared("a", Some("run-1")),
+    );
+    append(
+        &mut store,
+        &thread,
+        events::K_CHECKPOINT_FAILED,
+        Some("run-1"),
+        &json!({"snapshot_id":"a","reason":"test","terminal":true}),
+    );
+    assert!(matches!(
+        run_state(&store, &thread, "run-1"),
+        checkpoint::RunCheckpointState::None
+    ));
+}
