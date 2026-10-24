@@ -261,11 +261,7 @@ impl App {
         {
             Some(ev)
         } else {
-            events::fetch_latest_by_kind(
-                &self.store.conn,
-                &detail.thread_id,
-                events::K_CHECKPOINT_READY,
-            )?
+            checkpoint::latest_ready(&self.store, &detail.thread_id)?.map(|(ev, _)| ev)
         };
         if let Some(ev) = selected_ready
             && let Ok(ready) = ev.parse::<events::payload::CheckpointReady>()

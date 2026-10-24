@@ -26,6 +26,14 @@ pub struct CaptureOutcome {
     pub patch_len: usize,
 }
 
+/// Resultado de un intento de captura, incluido el `snapshot_id` generado
+/// aunque la captura falle. El llamador debe clasificar el fallo contra ESE
+/// snapshot, no contra cualquier checkpoint histórico del run.
+pub struct CaptureAttempt {
+    pub snapshot_id: String,
+    pub result: Result<Option<CaptureOutcome>>,
+}
+
 /// Captura y publica un checkpoint del estado actual del worktree del run.
 /// Devuelve `Ok(None)` si no hay cambios respecto de la base del run.
 pub fn capture(
@@ -33,6 +41,30 @@ pub fn capture(
     repo: &Repository,
     run: &RunRow,
     reason: &str,
+) -> Result<Option<CaptureOutcome>> {
+    capture_attempt(store, repo, run, reason).result
+}
+
+pub fn capture_attempt(
+    store: &mut Store,
+    repo: &Repository,
+    run: &RunRow,
+    reason: &str,
+) -> CaptureAttempt {
+    let snapshot_id = new_id();
+    let result = capture_inner(store, repo, run, reason, snapshot_id.clone());
+    CaptureAttempt {
+        snapshot_id,
+        result,
+    }
+}
+
+fn capture_inner(
+    store: &mut Store,
+    repo: &Repository,
+    run: &RunRow,
+    reason: &str,
+    snapshot_id: String,
 ) -> Result<Option<CaptureOutcome>> {
     let workspace_id = run
         .workspace_id
@@ -44,7 +76,6 @@ pub fn capture(
         .ok_or_else(|| Error::invalid("el run no tiene base_oid"))?;
     let wt_repo = git::worktree::open_worktree(repo, workspace_id)?;
 
-    let snapshot_id = new_id();
     let ref_name = checkpoint_ref(&snapshot_id);
     let message = format!("checkpoint {snapshot_id} ({reason}; run {})", run.id);
 
@@ -107,13 +138,15 @@ pub fn capture(
             reason: e.to_string(),
             terminal: true,
         };
-        events::append_typed(
-            &mut store.conn,
+        // Misma guarda anti-duplicado que `ready`: si la recuperación ya
+        // resolvió este snapshot, no se agrega un segundo `failed`.
+        append_resolution(
+            store,
             &run.thread_id,
             Some(&run.id),
+            &snapshot_id,
             events::K_CHECKPOINT_FAILED,
-            "system",
-            &failed,
+            &serde_json::to_value(&failed)?,
         )?;
         return Err(e);
     }
@@ -131,13 +164,13 @@ pub fn capture(
             reason: e.to_string(),
             terminal: true,
         };
-        events::append_typed(
-            &mut store.conn,
+        append_resolution(
+            store,
             &run.thread_id,
             Some(&run.id),
+            &snapshot_id,
             events::K_CHECKPOINT_FAILED,
-            "system",
-            &failed,
+            &serde_json::to_value(&failed)?,
         )?;
         return Err(e);
     }
@@ -154,16 +187,40 @@ pub fn capture(
         recovered: false,
     };
     let ready_value = serde_json::to_value(&ready)?;
-    let ready_event_id = match append_fenced(
+    let ready_event_id = match append_ready_fenced(
         store,
         workspace_id,
         &run.id,
         &run.thread_id,
-        Some(&run.id),
-        events::K_CHECKPOINT_READY,
+        &run.id,
+        &snapshot_id,
         &ready_value,
     ) {
-        Ok(id) => id,
+        Ok(ReadyAppend::Appended(id)) => id,
+        Ok(ReadyAppend::AlreadyResolved) => {
+            // La recuperación concurrente pudo publicar y verificar el mismo
+            // snapshot antes de que la captura viva confirmara su ready. No
+            // se duplica la resolución: se devuelve la evidencia ready ya
+            // durable, validando que corresponda al OID/ref de esta captura.
+            let Some((ev, parsed)) = ready_for_snapshot(store, &run.thread_id, &snapshot_id)?
+            else {
+                return Err(Error::integrity(format!(
+                    "checkpoint {snapshot_id} ya está resuelto sin un ready verificable"
+                )));
+            };
+            if parsed.oid != captured.commit_oid || parsed.git_ref != ref_name {
+                return Err(Error::integrity(format!(
+                    "checkpoint {snapshot_id} resuelto con identidad divergente"
+                )));
+            }
+            return Ok(Some(CaptureOutcome {
+                snapshot_id,
+                event_id: ev.id,
+                oid: parsed.oid,
+                files: parsed.files,
+                patch_len: parsed.patch.len(),
+            }));
+        }
         Err(e) if matches!(e, Error::LeaseLost(_)) => {
             // La ref ya está publicada (objetos inmutables, jamás se borra),
             // pero este checkpoint NO puede volverse ready. Marcador terminal
@@ -258,6 +315,176 @@ pub fn pending_checkpoints(store: &Store) -> Result<Vec<Pending>> {
     Ok(out)
 }
 
+/// Estado durable del checkpoint de un run en el instante de la consulta.
+#[derive(Debug)]
+pub enum RunCheckpointState {
+    /// Existe un `ready` verificado para el run (posiblemente escrito por una
+    /// recuperación concurrente).
+    Ready(Box<(EventRecord, payload::CheckpointReady)>),
+    /// Queda al menos un `prepared` sin resolución: recuperable.
+    Pending,
+    /// No hay checkpoint pendiente ni `ready` para el run (fallo terminal o
+    /// ausencia de evidencia durable).
+    None,
+}
+
+fn ready_for_snapshot_run_conn(
+    conn: &rusqlite::Connection,
+    thread_id: &str,
+    run_id: &str,
+    snapshot_id: &str,
+) -> Result<Option<(EventRecord, payload::CheckpointReady)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, thread_id, seq, run_id, kind, actor, payload_version, payload, created_ms
+           FROM events
+          WHERE thread_id = ?1 AND kind = ?2
+            AND json_extract(payload, '$.snapshot_id') = ?3
+          ORDER BY seq DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![
+        thread_id,
+        events::K_CHECKPOINT_READY,
+        snapshot_id
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let payload_text: String = row.get(7)?;
+    let ev = EventRecord {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        seq: row.get(2)?,
+        run_id: row.get(3)?,
+        kind: row.get(4)?,
+        actor: row.get(5)?,
+        payload_version: row.get(6)?,
+        payload: serde_json::from_str(&payload_text).unwrap_or(serde_json::Value::Null),
+        created_ms: row.get(8)?,
+    };
+    if let Some(ready_run) = ev.run_id.as_deref()
+        && ready_run != run_id
+    {
+        return Err(Error::integrity(format!(
+            "checkpoint.ready {snapshot_id} pertenece al run {ready_run}, no a {run_id}"
+        )));
+    }
+    let parsed: payload::CheckpointReady = ev.parse()?;
+    if parsed.snapshot_id != snapshot_id {
+        return Err(Error::integrity(format!(
+            "checkpoint.ready seleccionado no corresponde al snapshot {snapshot_id}"
+        )));
+    }
+    Ok(Some((ev, parsed)))
+}
+
+fn prepared_for_snapshot_conn(
+    conn: &rusqlite::Connection,
+    thread_id: &str,
+    snapshot_id: &str,
+) -> Result<Option<(Option<String>, payload::CheckpointPrepared)>> {
+    let row: Option<(Option<String>, String)> = conn
+        .query_row(
+            "SELECT run_id, payload FROM events
+              WHERE thread_id = ?1 AND kind = ?2
+                AND json_extract(payload, '$.snapshot_id') = ?3
+              ORDER BY seq DESC LIMIT 1",
+            rusqlite::params![thread_id, events::K_CHECKPOINT_PREPARED, snapshot_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some((run_id, payload_text)) => {
+            let prepared: payload::CheckpointPrepared = serde_json::from_str(&payload_text)?;
+            Ok(Some((run_id, prepared)))
+        }
+    }
+}
+
+fn has_pending_snapshot_conn(
+    conn: &rusqlite::Connection,
+    thread_id: &str,
+    snapshot_id: &str,
+) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events p
+            WHERE p.thread_id = ?1
+              AND p.kind = ?2
+              AND json_extract(p.payload, '$.snapshot_id') = ?3
+              AND NOT EXISTS (
+                SELECT 1 FROM events d
+                WHERE d.thread_id = p.thread_id
+                  AND d.kind IN (?4, ?5)
+                  AND json_extract(d.payload, '$.snapshot_id') = ?3
+              )
+        )",
+        rusqlite::params![
+            thread_id,
+            events::K_CHECKPOINT_PREPARED,
+            snapshot_id,
+            events::K_CHECKPOINT_READY,
+            events::K_CHECKPOINT_FAILED
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
+/// Clasifica el estado durable del snapshot EXACTO que intentó capturar el
+/// run, leyendo `ready` y `pending` bajo el MISMO snapshot SQLite.
+///
+/// Dos lecturas separadas dejarían una ventana: si la recuperación confirma
+/// `ready` entre ambas, `ready` sería `None` y `pending` `false`, y el turno
+/// completado se degradaría falsamente a `failed`. La transacción diferida
+/// garantiza que solo se elige `None` cuando en ese mismo instante no había ni
+/// `ready` ni `prepared` recuperable para ese snapshot.
+///
+/// No se acepta un `ready` de otro snapshot del mismo run: enmascararía una
+/// divergencia de OID o un pending más nuevo. Un `prepared`/`ready` legacy sin
+/// `run_id` sigue siendo válido (el snapshot_id es la identidad primaria).
+pub fn run_checkpoint_state(
+    store: &Store,
+    thread_id: &str,
+    run_id: &str,
+    snapshot_id: &str,
+) -> Result<RunCheckpointState> {
+    let tx = store.conn.unchecked_transaction()?;
+    let prepared = prepared_for_snapshot_conn(&tx, thread_id, snapshot_id)?;
+    if let Some((event_run, prepared)) = &prepared {
+        for candidate in [event_run.as_deref(), prepared.run_id.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if candidate != run_id {
+                return Err(Error::integrity(format!(
+                    "checkpoint.prepared {snapshot_id} pertenece al run {candidate}, no a {run_id}"
+                )));
+            }
+        }
+    }
+    let ready = ready_for_snapshot_run_conn(&tx, thread_id, run_id, snapshot_id)?;
+    if let Some((_, ready)) = &ready {
+        let Some((_, prepared)) = &prepared else {
+            return Err(Error::integrity(format!(
+                "checkpoint.ready {snapshot_id} existe sin checkpoint.prepared verificable"
+            )));
+        };
+        if ready.oid != prepared.expected_oid || ready.git_ref != prepared.git_ref {
+            return Err(Error::integrity(format!(
+                "checkpoint.ready {snapshot_id} tiene OID/ref divergente del prepared"
+            )));
+        }
+    }
+    let pending = has_pending_snapshot_conn(&tx, thread_id, snapshot_id)?;
+    tx.commit()?;
+    Ok(match ready {
+        Some((ev, parsed)) => RunCheckpointState::Ready(Box::new((ev, parsed))),
+        None if pending => RunCheckpointState::Pending,
+        None => RunCheckpointState::None,
+    })
+}
+
 #[derive(Debug)]
 pub enum RecoveryOutcome {
     /// Ref y objetos verificados (re-creando la ref si hacía falta).
@@ -317,6 +544,56 @@ fn append_fenced(
     let (id, _seq) = events::append_tx(&tx, thread_id, run_id, kind, "system", payload, now_ms())?;
     tx.commit()?;
     Ok(id)
+}
+
+enum ReadyAppend {
+    Appended(String),
+    AlreadyResolved,
+}
+
+/// Append de `checkpoint.ready` para la captura viva, idempotente frente a
+/// una recuperación concurrente y bajo el mismo fence de lease que `prepared`.
+fn append_ready_fenced(
+    store: &mut Store,
+    workspace_id: &str,
+    owner_run_id: &str,
+    thread_id: &str,
+    run_id: &str,
+    snapshot_id: &str,
+    payload: &serde_json::Value,
+) -> Result<ReadyAppend> {
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let holder: Option<String> = tx
+        .query_row(
+            "SELECT run_id FROM leases WHERE workspace_id = ?1",
+            rusqlite::params![workspace_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if holder.as_deref() != Some(owner_run_id) {
+        tx.rollback()?;
+        return Err(Error::LeaseLost(format!(
+            "el workspace {workspace_id} ya no pertenece al run {owner_run_id} (holder: {}); \"checkpoint.ready\" no se persiste",
+            holder.unwrap_or_else(|| "ninguno".into())
+        )));
+    }
+    if resolution_exists(&tx, thread_id, snapshot_id)? {
+        tx.rollback()?;
+        return Ok(ReadyAppend::AlreadyResolved);
+    }
+    let (id, _seq) = events::append_tx(
+        &tx,
+        thread_id,
+        Some(run_id),
+        events::K_CHECKPOINT_READY,
+        "system",
+        payload,
+        now_ms(),
+    )?;
+    tx.commit()?;
+    Ok(ReadyAppend::Appended(id))
 }
 
 /// ¿Existe ya una resolución (`ready`/`failed`) para este snapshot?
@@ -585,21 +862,75 @@ fn append_failed(
 
 // ── consultas para revisión ──────────────────────────────────────────────────
 
-/// Último checkpoint `ready` de un thread.
+/// Último checkpoint `ready` de un thread, ordenado por el `seq` del
+/// `checkpoint.prepared` original.
+///
+/// El `seq` del `ready` mide cuándo terminó la recuperación, no cuándo se
+/// capturó el trabajo. Un `ready` recuperado tarde no debe desplazar a un
+/// checkpoint más nuevo. Para bases históricas sin `prepared` asociado se
+/// conserva el fallback por `ready.seq`; si el `prepared` aparece después del
+/// `ready`, o el `run_id` contradice el del ready, se devuelve error de
+/// integridad en lugar de elegir silenciosamente un snapshot.
 pub fn latest_ready(
     store: &Store,
     thread_id: &str,
 ) -> Result<Option<(EventRecord, payload::CheckpointReady)>> {
-    // Proyección acotada: el ÚLTIMO `checkpoint.ready` por seq, sin materializar
-    // el historial de checkpoints del thread (mismo resultado que fetch_by_kind
-    // + pop, con memoria constante).
-    match events::fetch_latest_by_kind(&store.conn, thread_id, events::K_CHECKPOINT_READY)? {
-        Some(ev) => {
-            let parsed: payload::CheckpointReady = ev.parse()?;
-            Ok(Some((ev, parsed)))
-        }
-        None => Ok(None),
+    // Fase 1: elegir solo `id`/`seq` (columnas pequeñas). Así el ORDER BY no
+    // materializa el patch de cada ready; en historiales con patches grandes
+    // el pico de memoria queda acotado. La fila ganadora se carga después.
+    // Ambas fases comparten un snapshot de lectura: si otro worker agrega un
+    // ready lógico más nuevo entre la selección y la carga, esta llamada no
+    // puede devolver el anterior como si siguiera siendo el último.
+    let tx = store.conn.unchecked_transaction()?;
+    let mut stmt = tx.prepare(
+        "SELECT r.id, p.seq, p.run_id, r.seq
+           FROM events r
+           LEFT JOIN events p
+             ON p.thread_id = r.thread_id
+            AND p.kind = ?2
+            AND json_extract(p.payload, '$.snapshot_id') =
+                json_extract(r.payload, '$.snapshot_id')
+          WHERE r.thread_id = ?1 AND r.kind = ?3
+          ORDER BY COALESCE(p.seq, r.seq) DESC, r.seq DESC
+          LIMIT 1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![
+        thread_id,
+        events::K_CHECKPOINT_PREPARED,
+        events::K_CHECKPOINT_READY
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let ready_id: String = row.get(0)?;
+    let prepared_seq: Option<i64> = row.get(1)?;
+    let prepared_run: Option<String> = row.get(2)?;
+    let ready_seq: i64 = row.get(3)?;
+    if let Some(prepared_seq) = prepared_seq
+        && prepared_seq >= ready_seq
+    {
+        return Err(Error::integrity(format!(
+            "checkpoint.ready seq {ready_seq} no puede preceder a su prepared seq {prepared_seq} (thread {thread_id})"
+        )));
     }
+    // Fase 2: cargar únicamente la fila ganadora, en el mismo snapshot.
+    let ev = events::fetch_by_id(&tx, thread_id, &ready_id)?.ok_or_else(|| {
+        Error::integrity(format!(
+            "checkpoint.ready {ready_id} desapareció entre selección y lectura (thread {thread_id})"
+        ))
+    })?;
+    if let (Some(a), Some(b)) = (ev.run_id.as_deref(), prepared_run.as_deref())
+        && a != b
+    {
+        return Err(Error::integrity(format!(
+            "checkpoint.ready run {a} contradice prepared run {b} (thread {thread_id})"
+        )));
+    }
+    let parsed: payload::CheckpointReady = ev.parse()?;
+    drop(rows);
+    drop(stmt);
+    tx.commit()?;
+    Ok(Some((ev, parsed)))
 }
 
 pub fn ready_for_snapshot(

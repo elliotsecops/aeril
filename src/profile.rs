@@ -492,7 +492,56 @@ fn fds_point_into(dir: &Path, home: &Path) -> bool {
     false
 }
 
-fn processes_using_home_in(home: &Path, proc_root: &Path) -> Result<Vec<i64>> {
+/// Un proceso que desaparece puede devolver `ENOENT` o, en una carrera de
+/// `/proc`, `ESRCH`. Solo estos errores se someten a la revalidación de
+/// identidad; un `EACCES` es una condición distinta y no autoriza a ignorar
+/// un posible superviviente.
+fn proc_entry_gone(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Lee el starttime de una entrada de `/proc` inyectable. `None` significa que
+/// la entrada desapareció; los errores de formato o de acceso se propagan.
+fn proc_start_at(dir: &Path) -> std::io::Result<Option<u64>> {
+    // `comm` puede contener bytes no UTF-8 (hasta 16 bytes arbitrarios). Se
+    // parsea el stat como bytes y solo se exige UTF-8 a los campos numéricos;
+    // un proceso ajeno con `comm` binario no debe bloquear el escaneo.
+    let stat = match std::fs::read(dir.join("stat")) {
+        Ok(stat) => stat,
+        Err(err) if proc_entry_gone(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(close) = stat.iter().rposition(|b| *b == b')') else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stat sin ')'",
+        ));
+    };
+    let fields: Vec<&[u8]> = stat[close + 1..]
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|f| !f.is_empty())
+        .collect();
+    let raw = fields.get(19).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "stat sin starttime")
+    })?;
+    let text = std::str::from_utf8(raw).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "starttime no es ASCII numérico",
+        )
+    })?;
+    // starttime 0 es un valor válido (ticks desde el boot); no se filtra.
+    let start = text
+        .parse::<u64>()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "starttime inválido"))?;
+    Ok(Some(start))
+}
+
+/// Variante con lectura de `environ` inyectable para tests deterministas.
+fn processes_using_home_with<F>(home: &Path, proc_root: &Path, read_environ: F) -> Result<Vec<i64>>
+where
+    F: Fn(&Path) -> std::io::Result<Vec<u8>>,
+{
     let needle = format!("HERMES_HOME={}", home.display());
     let euid = unsafe { libc::geteuid() };
     let entries = std::fs::read_dir(proc_root).map_err(|e| {
@@ -502,7 +551,17 @@ fn processes_using_home_in(home: &Path, proc_root: &Path) -> Result<Vec<i64>> {
         ))
     })?;
     let mut pids = Vec::new();
-    for e in entries.flatten() {
+    for entry in entries {
+        let e = match entry {
+            Ok(e) => e,
+            Err(err) if proc_entry_gone(&err) => continue,
+            Err(err) => {
+                return Err(Error::conflict(format!(
+                    "no se pudo leer una entrada de {} ({err}) — fail-closed",
+                    proc_root.display()
+                )));
+            }
+        };
         let name = e.file_name();
         let Some(pid) = name.to_str().and_then(|s| s.parse::<i64>().ok()) else {
             continue;
@@ -510,7 +569,7 @@ fn processes_using_home_in(home: &Path, proc_root: &Path) -> Result<Vec<i64>> {
         let dir = e.path();
         let meta = match std::fs::symlink_metadata(&dir) {
             Ok(m) => m,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) if proc_entry_gone(&err) => continue,
             Err(err) => {
                 return Err(Error::conflict(format!(
                     "no se pudo inspeccionar {} ({err}) — fail-closed",
@@ -522,12 +581,43 @@ fn processes_using_home_in(home: &Path, proc_root: &Path) -> Result<Vec<i64>> {
             // Otro usuario no puede ser dueño de este perfil (dirs 0700).
             continue;
         }
-        match std::fs::read(dir.join("environ")) {
+        // La identidad se toma antes de leer environ: si la lectura devuelve
+        // ESRCH, el starttime permite distinguir desaparición de reutilización.
+        let start = match proc_start_at(&dir) {
+            Ok(Some(start)) => start,
+            Ok(None) => continue,
+            Err(err) => {
+                return Err(Error::conflict(format!(
+                    "no se pudo leer la identidad de pid {pid} ({err}) — fail-closed"
+                )));
+            }
+        };
+        match read_environ(&dir) {
             Ok(buf) => {
                 if buf.split(|b| *b == 0).any(|c| c == needle.as_bytes())
                     && is_auth_probe(&dir) != Some(true)
                 {
                     pids.push(pid);
+                }
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {
+                // Otro hilo/daemon pudo salir entre la enumeración y la lectura
+                // de environ. Solo se omite si la identidad previa ya no existe
+                // o fue reemplazada; si el mismo proceso sigue vivo, es una
+                // inspección no concluyente y debe seguir siendo fail-closed.
+                match proc_start_at(&dir) {
+                    Ok(None) => continue,
+                    Ok(Some(after)) if after != start => continue,
+                    Ok(Some(_)) => {
+                        return Err(Error::conflict(format!(
+                            "inspección de procesos no concluyente (pid {pid}: ESRCH con identidad aún viva) — fail-closed"
+                        )));
+                    }
+                    Err(recheck) => {
+                        return Err(Error::conflict(format!(
+                            "inspección de procesos falló al revalidar pid {pid} ({recheck}) — fail-closed"
+                        )));
+                    }
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -551,6 +641,10 @@ fn processes_using_home_in(home: &Path, proc_root: &Path) -> Result<Vec<i64>> {
         }
     }
     Ok(pids)
+}
+
+fn processes_using_home_in(home: &Path, proc_root: &Path) -> Result<Vec<i64>> {
+    processes_using_home_with(home, proc_root, |dir| std::fs::read(dir.join("environ")))
 }
 
 // ── escrituras atómicas (H2) ─────────────────────────────────────────────────
@@ -2550,6 +2644,26 @@ pub fn remove(
 mod tests {
     use super::*;
 
+    fn fake_proc_stat(pid: i64, start: u64) -> String {
+        format!("{pid} (fake) S 1 {pid} {pid} 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0\n")
+    }
+
+    fn write_fake_proc_entry(
+        proc: &Path,
+        pid: i64,
+        start: u64,
+        environ: &[u8],
+        cmdline: Option<&[u8]>,
+    ) {
+        let dir = proc.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), fake_proc_stat(pid, start)).unwrap();
+        std::fs::write(dir.join("environ"), environ).unwrap();
+        if let Some(cmdline) = cmdline {
+            std::fs::write(dir.join("cmdline"), cmdline).unwrap();
+        }
+    }
+
     #[test]
     fn agent_id_validation() {
         for ok in ["a", "agent-1", "a_b-c9", "x".repeat(32).as_str()] {
@@ -2760,17 +2874,20 @@ mod tests {
         let proc = dir.join("proc");
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(proc.join("1234")).unwrap();
         let needle = format!("PATH=/usr/bin\0HERMES_HOME={}\0", home.display());
-        std::fs::write(proc.join("1234/environ"), needle.as_bytes()).unwrap();
+        write_fake_proc_entry(&proc, 1234, 1234, needle.as_bytes(), None);
 
         // Encuentra el pid con HERMES_HOME del perfil.
         assert_eq!(processes_using_home_in(&home, &proc).unwrap(), vec![1234]);
 
         // Un auth probe del propio subsistema NO es escritor (se omite).
-        std::fs::create_dir_all(proc.join("4321")).unwrap();
-        std::fs::write(proc.join("4321/environ"), needle.as_bytes()).unwrap();
-        std::fs::write(proc.join("4321/cmdline"), b"hermes\0auth\0status\0nous\0").unwrap();
+        write_fake_proc_entry(
+            &proc,
+            4321,
+            4321,
+            needle.as_bytes(),
+            Some(b"hermes\0auth\0status\0nous\0"),
+        );
         let found = processes_using_home_in(&home, &proc).unwrap();
         assert!(found.contains(&1234) && !found.contains(&4321));
 
@@ -2785,8 +2902,7 @@ mod tests {
         // environ con EACCES (dumpable=0) sin señales alternativas ⇒ se omite
         // (host normal usable; NO se interpreta como dueño).
         std::fs::remove_dir_all(proc.join("1234")).unwrap();
-        std::fs::create_dir_all(proc.join("5678")).unwrap();
-        std::fs::write(proc.join("5678/environ"), b"HERMES_HOME=x\0").unwrap();
+        write_fake_proc_entry(&proc, 5678, 5678, b"HERMES_HOME=x\0", None);
         std::fs::set_permissions(proc.join("5678/environ"), PermissionsExt::from_mode(0o000))
             .unwrap();
         assert!(processes_using_home_in(&home, &proc).unwrap().is_empty());
@@ -2808,6 +2924,98 @@ mod tests {
         std::os::unix::fs::symlink(&f, proc.join("5678/fd/3")).unwrap();
         assert_eq!(processes_using_home_in(&home, &proc).unwrap(), vec![5678]);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proc_scan_esrch_after_disappearance_is_skipped() {
+        let dir = std::env::temp_dir().join(format!("aeril-r1-proc-gone-{}", crate::ids::new_id()));
+        let proc = dir.join("proc");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let needle = format!("HERMES_HOME={}\0", home.display());
+        write_fake_proc_entry(&proc, 111, 111, needle.as_bytes(), None);
+
+        let found = processes_using_home_with(&home, &proc, |entry| {
+            if entry.file_name().and_then(|s| s.to_str()) == Some("111") {
+                std::fs::remove_dir_all(entry).unwrap();
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            std::fs::read(entry.join("environ"))
+        })
+        .unwrap();
+        assert!(found.is_empty(), "un proceso desaparecido no debe bloquear");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proc_scan_esrch_with_live_identity_is_fail_closed() {
+        let dir = std::env::temp_dir().join(format!("aeril-r1-proc-live-{}", crate::ids::new_id()));
+        let proc = dir.join("proc");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let needle = format!("HERMES_HOME={}\0", home.display());
+        write_fake_proc_entry(&proc, 222, 222, needle.as_bytes(), None);
+
+        let err = processes_using_home_with(&home, &proc, |_entry| {
+            Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+        })
+        .expect_err("misma identidad viva debe conservar HOLD");
+        assert!(err.to_string().contains("identidad aún viva"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proc_scan_esrch_after_pid_reuse_is_skipped() {
+        let dir =
+            std::env::temp_dir().join(format!("aeril-r1-proc-reuse-{}", crate::ids::new_id()));
+        let proc = dir.join("proc");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let needle = format!("HERMES_HOME={}\0", home.display());
+        write_fake_proc_entry(&proc, 333, 333, needle.as_bytes(), None);
+
+        let found = processes_using_home_with(&home, &proc, |entry| {
+            std::fs::write(entry.join("stat"), fake_proc_stat(333, 999)).unwrap();
+            Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+        })
+        .unwrap();
+        assert!(found.is_empty(), "un PID reutilizado no debe bloquear");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proc_scan_non_utf8_comm_and_zero_starttime_are_inspected() {
+        let dir =
+            std::env::temp_dir().join(format!("aeril-r1-proc-bytes-{}", crate::ids::new_id()));
+        let proc = dir.join("proc");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let entry = proc.join("777");
+        std::fs::create_dir_all(&entry).unwrap();
+        let mut stat = b"777 (bin".to_vec();
+        stat.push(0xff);
+        stat.extend_from_slice(b") S 1 777 777 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n");
+        std::fs::write(entry.join("stat"), stat).unwrap();
+        let needle = format!("HERMES_HOME={}\0", home.display());
+        std::fs::write(entry.join("environ"), needle.as_bytes()).unwrap();
+
+        assert_eq!(processes_using_home_in(&home, &proc).unwrap(), vec![777]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proc_scan_unknown_identity_is_fail_closed() {
+        let dir =
+            std::env::temp_dir().join(format!("aeril-r1-proc-unknown-{}", crate::ids::new_id()));
+        let proc = dir.join("proc");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let needle = format!("HERMES_HOME={}\0", home.display());
+        write_fake_proc_entry(&proc, 444, 444, needle.as_bytes(), None);
+        std::fs::write(proc.join("444/stat"), b"not-a-valid-stat").unwrap();
+
+        assert!(processes_using_home_in(&home, &proc).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

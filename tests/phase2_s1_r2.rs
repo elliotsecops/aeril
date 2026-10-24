@@ -7,7 +7,7 @@ mod common;
 
 use common::pty::TuiPty;
 use common::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -1107,7 +1107,7 @@ fn r2_h4_concurrent_migration_is_serialized() {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get(0))
                     .unwrap();
-                assert_eq!(v, 4);
+                assert_eq!(v, aeril::store::schema::SCHEMA_VERSION);
                 let profile: Option<String> = store
                     .conn
                     .query_row("SELECT profile FROM runs WHERE id='run-old'", [], |r| {
@@ -1118,6 +1118,101 @@ fn r2_h4_concurrent_migration_is_serialized() {
             });
         }
     });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn r2_h4_v4_database_gets_v5_index_over_existing_events() {
+    let dir = std::env::temp_dir().join(format!("aeril-r2-migv4-{}", aeril::ids::new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("aeril.db");
+    let oid = "0".repeat(40);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for schema in [
+            aeril::store::schema::SCHEMA_V1,
+            aeril::store::schema::SCHEMA_V2,
+            aeril::store::schema::SCHEMA_V3,
+            aeril::store::schema::SCHEMA_V4,
+        ] {
+            conn.execute_batch(schema).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO threads (id, title, repo_id, repo_path, state, next_seq, created_ms, updated_ms)
+             VALUES ('t-v4', 'v4', 'r-v4', '/tmp', 'open', 2, 1, 1)",
+            [],
+        )
+        .unwrap();
+        let prepared = json!({
+            "snapshot_id": "snap-v4",
+            "git_ref": "refs/aeril/checkpoints/snap-v4",
+            "expected_oid": oid,
+            "run_id": null,
+            "base_oid": oid,
+            "parent_oid": oid,
+            "files": [],
+        });
+        let ready = json!({
+            "snapshot_id": "snap-v4",
+            "git_ref": "refs/aeril/checkpoints/snap-v4",
+            "oid": oid,
+            "base_oid": oid,
+            "patch": "",
+            "files": [],
+            "recovered": true,
+        });
+        for (id, seq, kind, payload) in [
+            ("p-v4", 0, "checkpoint.prepared", prepared),
+            ("r-v4", 1, "checkpoint.ready", ready),
+        ] {
+            conn.execute(
+                "INSERT INTO events (id, thread_id, seq, run_id, kind, actor, payload_version, payload, created_ms)
+                 VALUES (?1, 't-v4', ?2, NULL, ?3, 'system', 1, ?4, 1)",
+                rusqlite::params![id, seq, kind, payload.to_string()],
+            )
+            .unwrap();
+        }
+        conn.pragma_update(None, "user_version", 4).unwrap();
+    }
+    let store = aeril::store::Store::open(&path).expect("migración v4→v5");
+    let version: i64 = store
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, aeril::store::schema::SCHEMA_VERSION);
+    let idx: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master
+              WHERE type = 'index' AND name = 'idx_events_checkpoint_snapshot'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx, 1, "el índice v5 debe existir tras migrar una DB v4");
+    let (_, ready) = aeril::checkpoint::latest_ready(&store, "t-v4")
+        .expect("latest_ready sobre DB migrada")
+        .expect("ready existente");
+    assert_eq!(ready.snapshot_id, "snap-v4");
+    let plan_sql = "EXPLAIN QUERY PLAN
+         SELECT r.id FROM events r
+         LEFT JOIN events p ON p.thread_id = r.thread_id
+           AND p.kind = 'checkpoint.prepared'
+           AND json_extract(p.payload, '$.snapshot_id') =
+               json_extract(r.payload, '$.snapshot_id')
+         WHERE r.thread_id = 't-v4' AND r.kind = 'checkpoint.ready'
+         ORDER BY COALESCE(p.seq, r.seq) DESC, r.seq DESC LIMIT 1";
+    let mut stmt = store.conn.prepare(plan_sql).unwrap();
+    let plan: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        plan.iter()
+            .any(|l| l.contains("idx_events_checkpoint_snapshot")),
+        "el plan migrado debe usar el índice v5: {plan:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1134,7 +1229,7 @@ fn r2_h4_interrupted_v4_ddl_is_idempotent() {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, aeril::store::schema::SCHEMA_VERSION);
     }
 
     let dir = std::env::temp_dir().join(format!("aeril-r2-migpart-{}", aeril::ids::new_id()));
@@ -1152,7 +1247,7 @@ fn r2_h4_interrupted_v4_ddl_is_idempotent() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 4);
+    assert_eq!(v, aeril::store::schema::SCHEMA_VERSION);
 }
 
 // ── P2-H5: partial removal recovery ─────────────────────────────────────────

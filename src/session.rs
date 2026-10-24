@@ -646,7 +646,11 @@ impl Runner {
 
         let mut snapshot: Option<checkpoint::CaptureOutcome> = None;
         if state == "completed" {
-            match checkpoint::capture(store, &repo, &run, "run completado") {
+            let checkpoint::CaptureAttempt {
+                snapshot_id: attempted_snapshot,
+                result: capture_result,
+            } = checkpoint::capture_attempt(store, &repo, &run, "run completado");
+            match capture_result {
                 Ok(Some(c)) => {
                     self.note(UiNote::Event {
                         thread_id: thread_id.to_string(),
@@ -656,24 +660,80 @@ impl Runner {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    if matches!(e, Error::LeaseLost(_)) {
-                        // Pérdida de ownership detectada por el fence: evento
-                        // durable (best-effort; el fence ya rechazó el hecho).
-                        let _ = events::append_typed(
-                            &mut store.conn,
-                            thread_id,
-                            Some(&run.id),
-                            events::K_WORKSPACE_LEASE_LOST,
-                            "system",
-                            &payload::WorkspaceLeaseLost {
-                                workspace_id: target.workspace_id.clone(),
-                                run_id: run.id.clone(),
-                                reason: e.to_string(),
-                            },
-                        );
+                    // Un fallo transitorio después de persistir `prepared`
+                    // deja un checkpoint recuperable. No convierte un turno
+                    // completado del agente en `failed`: el estado del run
+                    // describe el turno, y `detail` declara que el checkpoint
+                    // queda pendiente de recuperación. Cualquier fallo sin
+                    // evidencia durable, o una pérdida de lease, sigue siendo
+                    // terminal y fail-closed.
+                    let lease_lost = matches!(e, Error::LeaseLost(_));
+                    // Un error de integridad detectado por la captura (por
+                    // ejemplo, un ready con OID/ref divergente) NO puede
+                    // anularse porque exista algún ready del run: es terminal.
+                    let can_defer = !lease_lost && !matches!(e, Error::Integrity(_));
+                    // Una sola instantánea SQLite, atada al snapshot exacto
+                    // que esta captura intentó: `ready` y `pending` no pueden
+                    // contradecirse si la recuperación confirma entre medio.
+                    // Si hay ready, el checkpoint ya es verificable; si hay
+                    // pending, el turno queda completado con recuperación
+                    // diferida. `None` solo se elige con evidencia terminal.
+                    match checkpoint::run_checkpoint_state(
+                        store,
+                        thread_id,
+                        &run.id,
+                        &attempted_snapshot,
+                    ) {
+                        Ok(checkpoint::RunCheckpointState::Ready(ready)) if can_defer => {
+                            // Una recuperación concurrente pudo publicar/verificar
+                            // el checkpoint mientras la captura viva fallaba al
+                            // confirmar su propio ready. La resolución durable ya
+                            // existe: no se degrada el turno ni se duplica ready.
+                            let (ready_ev, ready_payload) = *ready;
+                            snapshot = Some(checkpoint::CaptureOutcome {
+                                snapshot_id: ready_payload.snapshot_id.clone(),
+                                event_id: ready_ev.id,
+                                oid: ready_payload.oid,
+                                files: ready_payload.files,
+                                patch_len: ready_payload.patch.len(),
+                            });
+                            detail = Some(
+                                "turno completado; checkpoint resuelto por recuperación concurrente"
+                                    .into(),
+                            );
+                        }
+                        Ok(checkpoint::RunCheckpointState::Pending) if can_defer => {
+                            detail = Some(format!(
+                                "turno completado; checkpoint pendiente de recuperación: {e}"
+                            ));
+                        }
+                        other => {
+                            if lease_lost {
+                                // Pérdida de ownership detectada por el fence:
+                                // evento durable (best-effort; el fence ya rechazó
+                                // el hecho).
+                                let _ = events::append_typed(
+                                    &mut store.conn,
+                                    thread_id,
+                                    Some(&run.id),
+                                    events::K_WORKSPACE_LEASE_LOST,
+                                    "system",
+                                    &payload::WorkspaceLeaseLost {
+                                        workspace_id: target.workspace_id.clone(),
+                                        run_id: run.id.clone(),
+                                        reason: e.to_string(),
+                                    },
+                                );
+                            }
+                            state = "failed";
+                            detail = Some(match other {
+                                Err(scan) => format!(
+                                    "captura de checkpoint falló: {e}; no se pudo confirmar recuperabilidad: {scan}"
+                                ),
+                                _ => format!("captura de checkpoint falló: {e}"),
+                            });
+                        }
                     }
-                    state = "failed";
-                    detail = Some(format!("captura de checkpoint falló: {e}"));
                 }
             }
         }
