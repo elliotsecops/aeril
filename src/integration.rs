@@ -550,12 +550,13 @@ pub fn apply(
     // `session::integrate` repite la resolución del checkpoint, escribe la
     // intención durable ANTES de tocar la ref y usa el CAS existente. El
     // `expect` es el OID pinned por el preview, nunca uno refrescado.
-    let outcome = session::integrate(
+    let outcome = session::integrate_pinned(
         store,
         thread_id,
         snapshot_id,
         target_branch,
-        Some(expected_target_oid),
+        expected_target_oid,
+        expected_source_oid,
     )?;
     if outcome.target_oid_after != source {
         return Err(Error::integrity(format!(

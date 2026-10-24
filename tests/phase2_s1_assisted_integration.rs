@@ -1144,3 +1144,89 @@ fn i13c_reconcile_skips_live_owner_and_recovers_dead_owner() {
     assert!(blocked_live.is_empty(), "el dueño vivo no se finaliza");
     assert_eq!(blocked_dead.len(), 1);
 }
+
+// ── Pinned source is enforced inside the authoritative integrate path ───────
+
+#[test]
+fn i1b_pinned_source_mismatch_writes_nothing() {
+    let fx = Fx::new("p2s1-i1b");
+    fx.validate_ok();
+    let mut store = fx.store();
+    let err = session::integrate_pinned(
+        &mut store,
+        &fx.thread,
+        &fx.snapshot,
+        "destino",
+        &fx.base,
+        &"f".repeat(40),
+    )
+    .expect_err("source distinta debe fallar antes de escribir");
+    assert!(err.to_string().contains("fuente"), "{err}");
+    assert_eq!(fx.env.rev_parse("destino"), fx.base);
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_REQUESTED),
+        0
+    );
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_COMPLETED),
+        0
+    );
+}
+
+// ── Reconciliation never duplicates an existing completed success ───────────
+
+#[test]
+fn i13d_reconcile_does_not_duplicate_existing_completed() {
+    let env = TestEnv::new("p2s1-i13d");
+    let base = env.head_oid();
+    env.update_ref("refs/heads/destino", &base);
+    let thread = env.thread_new("dedupe completed");
+    let source = "1".repeat(40);
+    let mut store = Store::open(&env.data.join("aeril.db")).unwrap();
+    events::append_typed(
+        &mut store.conn,
+        &thread,
+        None,
+        events::K_INTEGRATION_COMPLETED,
+        "system",
+        &events::payload::IntegrationCompleted {
+            target_branch: "destino".into(),
+            source_oid: source.clone(),
+            target_oid_before: base.clone(),
+            target_oid_after: source.clone(),
+            recovered: false,
+        },
+    )
+    .unwrap();
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead_pid = child.id() as i64;
+    child.wait().unwrap();
+    events::append_typed(
+        &mut store.conn,
+        &thread,
+        None,
+        events::K_INTEGRATION_REQUESTED,
+        "system",
+        &events::payload::IntegrationRequested {
+            target_branch: "destino".into(),
+            source_oid: source.clone(),
+            target_oid_expected: base.clone(),
+            owner_pid: Some(dead_pid),
+            owner_pid_start: Some(1),
+        },
+    )
+    .unwrap();
+    let outcomes = session::reconcile_integrations(&mut store).unwrap();
+    assert!(outcomes.is_empty(), "ya hay un completed: {outcomes:?}");
+    assert_eq!(
+        events::fetch_by_kind(&store.conn, &thread, events::K_INTEGRATION_COMPLETED)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        events::fetch_by_kind(&store.conn, &thread, events::K_INTEGRATION_BLOCKED)
+            .unwrap()
+            .is_empty()
+    );
+}

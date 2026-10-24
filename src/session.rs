@@ -1515,6 +1515,44 @@ pub fn integrate(
     target_branch: &str,
     expect_oid: Option<&str>,
 ) -> Result<git::integrate::IntegrationOutcome> {
+    integrate_inner(
+        store,
+        thread_id,
+        snapshot_id,
+        target_branch,
+        expect_oid,
+        None,
+    )
+}
+
+/// Variante asistida: además del target esperado, exige que el checkpoint
+/// resuelto siga siendo EXACTAMENTE la fuente confirmada en el preview.
+pub fn integrate_pinned(
+    store: &mut Store,
+    thread_id: &str,
+    snapshot_id: &str,
+    target_branch: &str,
+    expect_oid: &str,
+    expected_source_oid: &str,
+) -> Result<git::integrate::IntegrationOutcome> {
+    integrate_inner(
+        store,
+        thread_id,
+        snapshot_id,
+        target_branch,
+        Some(expect_oid),
+        Some(expected_source_oid),
+    )
+}
+
+fn integrate_inner(
+    store: &mut Store,
+    thread_id: &str,
+    snapshot_id: &str,
+    target_branch: &str,
+    expect_oid: Option<&str>,
+    expected_source_oid: Option<&str>,
+) -> Result<git::integrate::IntegrationOutcome> {
     // Antes de una operación nueva, reconciliar intentos interrumpidos de
     // este u otros threads (nunca se fabrica éxito sin evidencia de la ref).
     reconcile_integrations(store)?;
@@ -1522,6 +1560,14 @@ pub fn integrate(
         .ok_or_else(|| Error::not_found(format!("thread {thread_id}")))?;
     let (_, ready) = checkpoint::ready_for_snapshot(store, thread_id, snapshot_id)?
         .ok_or_else(|| Error::not_ready(format!("no hay checkpoint ready {snapshot_id}")))?;
+    if let Some(expected) = expected_source_oid
+        && ready.oid != expected
+    {
+        return Err(Error::integrity(format!(
+            "la fuente del checkpoint cambió: preview {expected}, ahora {}; no se mueve la ref",
+            ready.oid
+        )));
+    }
     let repo = git::open(Path::new(&thread.repo_path))?;
     let expect = expect_oid.unwrap_or(&ready.base_oid).to_string();
 
@@ -1756,14 +1802,24 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
         let tx = store
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Un completed para el mismo (target, source) es idempotente aunque
+        // sea anterior a este request: evita duplicar el éxito al reconciliar
+        // un intento que llegó después de que otro proceso ya integró.
         let already: i64 = tx.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM events s
-                WHERE s.thread_id = ?1 AND s.seq > ?2
-                  AND s.kind IN (?3, ?4)
-                  AND json_extract(s.payload, '$.target_branch') = ?5
-                  AND json_extract(s.payload, '$.source_oid') = ?6
-            )",
+            "SELECT
+                EXISTS(
+                    SELECT 1 FROM events c
+                    WHERE c.kind = ?3
+                      AND json_extract(c.payload, '$.target_branch') = ?5
+                      AND json_extract(c.payload, '$.source_oid') = ?6
+                )
+                OR EXISTS(
+                    SELECT 1 FROM events s
+                    WHERE s.thread_id = ?1 AND s.seq > ?2
+                      AND s.kind = ?4
+                      AND json_extract(s.payload, '$.target_branch') = ?5
+                      AND json_extract(s.payload, '$.source_oid') = ?6
+                )",
             rusqlite::params![
                 p.thread_id,
                 p.seq,
