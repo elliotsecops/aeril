@@ -9,6 +9,7 @@
 use crate::error::{Error, Result};
 use crate::ids::{new_id, workspace_branch};
 use git2::{Oid, Repository, WorktreeAddOptions};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,47 @@ fn worktree_dir(data_dir: &Path, workspace_id: &str) -> PathBuf {
 /// Path del worktree de un workspace (identidad estable → atributo derivable).
 pub fn path_for(data_dir: &Path, workspace_id: &str) -> PathBuf {
     worktree_dir(data_dir, workspace_id)
+}
+
+/// Serializa la creación de worktrees contra el mismo repositorio.
+///
+/// libgit2 crea `.git/worktrees` sin tolerar que otro proceso lo cree entre
+/// la comprobación y el `mkdir` (TOCTOU). Un `flock` por `.git` evita el
+/// `File exists` intermitente cuando dos runs arrancan a la vez. El lock es
+/// advisory, se libera al cerrar el fd y no deja estado durable.
+struct RepoWorktreeLock {
+    file: std::fs::File,
+}
+
+impl RepoWorktreeLock {
+    fn acquire(repo: &Repository) -> Result<Self> {
+        let path = repo.commondir().join("aeril-worktree-create.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+        Ok(RepoWorktreeLock { file })
+    }
+}
+
+impl Drop for RepoWorktreeLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 /// Crea un workspace verificado: rama propia en `base_oid` + worktree ligado.
@@ -73,6 +115,8 @@ pub fn create(
     let mut opts = WorktreeAddOptions::new();
     opts.reference(Some(&branch_ref));
     let wt_name = format!("aeril-{workspace_id}");
+    // Serializar la creación del admin tree de libgit2 entre procesos.
+    let _worktree_lock = RepoWorktreeLock::acquire(repo)?;
     repo.worktree(&wt_name, &path, Some(&opts))?;
 
     // Verificación inmediata: el worktree existe, abre, y su HEAD es la base.
