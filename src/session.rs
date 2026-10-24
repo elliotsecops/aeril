@@ -1802,35 +1802,47 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
         let tx = store
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // Un completed para el mismo (target, source) es idempotente aunque
-        // sea anterior a este request: evita duplicar el éxito al reconciliar
-        // un intento que llegó después de que otro proceso ya integró.
-        let already: i64 = tx.query_row(
-            "SELECT
-                EXISTS(
+        // Un completed para el mismo thread/(target, source) es idempotente
+        // aunque sea anterior a este request. Solo se aplica cuando la
+        // resolución calculada es un éxito: un intento abandonado debe
+        // conservar su blocked aunque ya exista un completed histórico.
+        let completed_exists: i64 = if kind == events::K_INTEGRATION_COMPLETED {
+            tx.query_row(
+                "SELECT EXISTS(
                     SELECT 1 FROM events c
-                    WHERE c.kind = ?3
-                      AND json_extract(c.payload, '$.target_branch') = ?5
-                      AND json_extract(c.payload, '$.source_oid') = ?6
-                )
-                OR EXISTS(
-                    SELECT 1 FROM events s
-                    WHERE s.thread_id = ?1 AND s.seq > ?2
-                      AND s.kind = ?4
-                      AND json_extract(s.payload, '$.target_branch') = ?5
-                      AND json_extract(s.payload, '$.source_oid') = ?6
+                    WHERE c.thread_id = ?1 AND c.kind = ?2
+                      AND json_extract(c.payload, '$.target_branch') = ?3
+                      AND json_extract(c.payload, '$.source_oid') = ?4
                 )",
+                rusqlite::params![
+                    p.thread_id,
+                    events::K_INTEGRATION_COMPLETED,
+                    p.requested.target_branch,
+                    p.requested.source_oid
+                ],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        };
+        let blocked_after_request: i64 = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM events s
+                WHERE s.thread_id = ?1 AND s.seq > ?2
+                  AND s.kind = ?3
+                  AND json_extract(s.payload, '$.target_branch') = ?4
+                  AND json_extract(s.payload, '$.source_oid') = ?5
+            )",
             rusqlite::params![
                 p.thread_id,
                 p.seq,
-                events::K_INTEGRATION_COMPLETED,
                 events::K_INTEGRATION_BLOCKED,
                 p.requested.target_branch,
                 p.requested.source_oid
             ],
             |row| row.get(0),
         )?;
-        if already == 1 {
+        if completed_exists == 1 || blocked_after_request == 1 {
             tx.rollback()?;
             continue;
         }

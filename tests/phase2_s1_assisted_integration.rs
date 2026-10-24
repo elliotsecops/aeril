@@ -1177,10 +1177,62 @@ fn i1b_pinned_source_mismatch_writes_nothing() {
 
 #[test]
 fn i13d_reconcile_does_not_duplicate_existing_completed() {
-    let env = TestEnv::new("p2s1-i13d");
+    // El ref ya apunta al source: sin dedupe, recovery agregaría un segundo
+    // completed para el request muerto.
+    let fx = Fx::new("p2s1-i13d");
+    fx.env.update_ref("refs/heads/destino", &fx.source);
+    let mut store = fx.store();
+    events::append_typed(
+        &mut store.conn,
+        &fx.thread,
+        None,
+        events::K_INTEGRATION_COMPLETED,
+        "system",
+        &events::payload::IntegrationCompleted {
+            target_branch: "destino".into(),
+            source_oid: fx.source.clone(),
+            target_oid_before: fx.base.clone(),
+            target_oid_after: fx.source.clone(),
+            recovered: false,
+        },
+    )
+    .unwrap();
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead_pid = child.id() as i64;
+    child.wait().unwrap();
+    events::append_typed(
+        &mut store.conn,
+        &fx.thread,
+        None,
+        events::K_INTEGRATION_REQUESTED,
+        "system",
+        &events::payload::IntegrationRequested {
+            target_branch: "destino".into(),
+            source_oid: fx.source.clone(),
+            target_oid_expected: fx.base.clone(),
+            owner_pid: Some(dead_pid),
+            owner_pid_start: Some(1),
+        },
+    )
+    .unwrap();
+    let outcomes = session::reconcile_integrations(&mut store).unwrap();
+    assert!(outcomes.is_empty(), "ya hay un completed: {outcomes:?}");
+    assert_eq!(
+        events::fetch_by_kind(&store.conn, &fx.thread, events::K_INTEGRATION_COMPLETED)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn i13e_prior_completed_does_not_suppress_blocked_outcome() {
+    // El ref volvió a la base: el request muerto debe registrar blocked aunque
+    // exista un completed histórico para el mismo target/source.
+    let env = TestEnv::new("p2s1-i13e");
     let base = env.head_oid();
     env.update_ref("refs/heads/destino", &base);
-    let thread = env.thread_new("dedupe completed");
+    let thread = env.thread_new("blocked after completed");
     let source = "1".repeat(40);
     let mut store = Store::open(&env.data.join("aeril.db")).unwrap();
     events::append_typed(
@@ -1217,16 +1269,21 @@ fn i13d_reconcile_does_not_duplicate_existing_completed() {
     )
     .unwrap();
     let outcomes = session::reconcile_integrations(&mut store).unwrap();
-    assert!(outcomes.is_empty(), "ya hay un completed: {outcomes:?}");
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert!(matches!(
+        outcomes[0],
+        session::IntegrationReconcile::Abandoned { .. }
+    ));
+    assert_eq!(
+        events::fetch_by_kind(&store.conn, &thread, events::K_INTEGRATION_BLOCKED)
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(
         events::fetch_by_kind(&store.conn, &thread, events::K_INTEGRATION_COMPLETED)
             .unwrap()
             .len(),
         1
-    );
-    assert!(
-        events::fetch_by_kind(&store.conn, &thread, events::K_INTEGRATION_BLOCKED)
-            .unwrap()
-            .is_empty()
     );
 }
