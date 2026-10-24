@@ -18,8 +18,16 @@ fn big_script(n: usize) -> Value {
     json!({"message": "bulk", "final_message": "listo", "edits": edits})
 }
 
-fn ready_snapshots(env: &TestEnv, thread: &str) -> Vec<(String, String)> {
-    env.ready_snapshots(thread)
+fn raw_ready_count(env: &TestEnv, thread: &str) -> usize {
+    let out = env.aeril(&["export", "--thread", thread, "--format", "jsonl"]);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| {
+            v.get("type").and_then(Value::as_str) == Some("event")
+                && v.get("kind").and_then(Value::as_str) == Some("checkpoint.ready")
+        })
+        .count()
 }
 
 #[test]
@@ -71,7 +79,8 @@ fn capture_vs_recover_does_not_duplicate_ready() {
             .as_array()
             .map(|a| a.iter().any(|e| e["action"] == "completed_ready"))
             .unwrap_or(false);
-        let ready_before = ready_snapshots(&env, &thread);
+        let ready_before_count = raw_ready_count(&env, &thread);
+        let ready_before = env.ready_snapshots(&thread);
         unsafe {
             libc::kill(child.id() as i32, libc::SIGCONT);
         }
@@ -84,20 +93,15 @@ fn capture_vs_recover_does_not_duplicate_ready() {
             continue;
         }
         let run: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
-        let after = ready_snapshots(&env, &thread);
+        let after_count = raw_ready_count(&env, &thread);
         eprintln!(
             "attempt {attempt}: run state={} ready_before={} after={}",
-            run["state"],
-            ready_before.len(),
-            after.len()
+            run["state"], ready_before_count, after_count
         );
-        if !ready_before.is_empty() && after.len() > 1 {
-            panic!(
-                "DUPLICATE READY: {} ready events for one capture (run {run})",
-                after.len()
-            );
+        if ready_before_count >= 1 && after_count > 1 {
+            panic!("DUPLICATE READY: {after_count} ready events for one capture (run {run})");
         }
-        if !ready_before.is_empty() && after.len() == 1 && run["state"] == "completed" {
+        if ready_before_count >= 1 && after_count == 1 && run["state"] == "completed" {
             assert_eq!(
                 run["snapshot"]["snapshot_id"],
                 ready_before[0].0.as_str(),

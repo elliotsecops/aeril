@@ -377,21 +377,28 @@ fn ready_for_snapshot_run_conn(
     Ok(Some((ev, parsed)))
 }
 
-fn prepared_run_for_snapshot_conn(
+fn prepared_for_snapshot_conn(
     conn: &rusqlite::Connection,
     thread_id: &str,
     snapshot_id: &str,
-) -> Result<Option<Option<String>>> {
-    Ok(conn
+) -> Result<Option<(Option<String>, payload::CheckpointPrepared)>> {
+    let row: Option<(Option<String>, String)> = conn
         .query_row(
-            "SELECT run_id FROM events
+            "SELECT run_id, payload FROM events
               WHERE thread_id = ?1 AND kind = ?2
                 AND json_extract(payload, '$.snapshot_id') = ?3
               ORDER BY seq DESC LIMIT 1",
             rusqlite::params![thread_id, events::K_CHECKPOINT_PREPARED, snapshot_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()?)
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some((run_id, payload_text)) => {
+            let prepared: payload::CheckpointPrepared = serde_json::from_str(&payload_text)?;
+            Ok(Some((run_id, prepared)))
+        }
+    }
 }
 
 fn has_pending_snapshot_conn(
@@ -443,14 +450,32 @@ pub fn run_checkpoint_state(
     snapshot_id: &str,
 ) -> Result<RunCheckpointState> {
     let tx = store.conn.unchecked_transaction()?;
-    if let Some(Some(prepared_run)) = prepared_run_for_snapshot_conn(&tx, thread_id, snapshot_id)?
-        && prepared_run != run_id
-    {
-        return Err(Error::integrity(format!(
-            "checkpoint.prepared {snapshot_id} pertenece al run {prepared_run}, no a {run_id}"
-        )));
+    let prepared = prepared_for_snapshot_conn(&tx, thread_id, snapshot_id)?;
+    if let Some((event_run, prepared)) = &prepared {
+        for candidate in [event_run.as_deref(), prepared.run_id.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if candidate != run_id {
+                return Err(Error::integrity(format!(
+                    "checkpoint.prepared {snapshot_id} pertenece al run {candidate}, no a {run_id}"
+                )));
+            }
+        }
     }
     let ready = ready_for_snapshot_run_conn(&tx, thread_id, run_id, snapshot_id)?;
+    if let Some((_, ready)) = &ready {
+        let Some((_, prepared)) = &prepared else {
+            return Err(Error::integrity(format!(
+                "checkpoint.ready {snapshot_id} existe sin checkpoint.prepared verificable"
+            )));
+        };
+        if ready.oid != prepared.expected_oid || ready.git_ref != prepared.git_ref {
+            return Err(Error::integrity(format!(
+                "checkpoint.ready {snapshot_id} tiene OID/ref divergente del prepared"
+            )));
+        }
+    }
     let pending = has_pending_snapshot_conn(&tx, thread_id, snapshot_id)?;
     tx.commit()?;
     Ok(match ready {

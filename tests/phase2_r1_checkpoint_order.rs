@@ -544,3 +544,48 @@ fn r1_c_state_rejects_ready_from_another_run() {
         "un ready de otro run no puede resolver la captura"
     );
 }
+
+#[test]
+fn r1_c_state_rejects_ready_with_divergent_oid_or_ref() {
+    for (snapshot, oid, git_ref) in [
+        (
+            "bad-oid",
+            "f".repeat(40),
+            "refs/aeril/checkpoints/bad-oid".to_string(),
+        ),
+        (
+            "bad-ref",
+            OID.to_string(),
+            "refs/aeril/checkpoints/other".into(),
+        ),
+    ] {
+        let (mut store, thread) = store_thread();
+        add_run(&store, &thread, "run-1");
+        append(
+            &mut store,
+            &thread,
+            events::K_CHECKPOINT_PREPARED,
+            Some("run-1"),
+            &prepared(snapshot, Some("run-1")),
+        );
+        append(
+            &mut store,
+            &thread,
+            events::K_CHECKPOINT_READY,
+            Some("run-1"),
+            &json!({
+                "snapshot_id": snapshot,
+                "git_ref": git_ref,
+                "oid": oid,
+                "base_oid": OID,
+                "patch": "",
+                "files": [],
+                "recovered": true,
+            }),
+        );
+        assert!(
+            checkpoint::run_checkpoint_state(&store, &thread, "run-1", snapshot).is_err(),
+            "ready con OID/ref divergente debe fallar cerrado ({snapshot})"
+        );
+    }
+}
