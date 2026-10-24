@@ -1287,3 +1287,70 @@ fn i13e_prior_completed_does_not_suppress_blocked_outcome() {
         1
     );
 }
+
+// ── Same-source retry/no-op never creates a second completed ───────────────
+
+#[test]
+fn i8b_same_source_retry_does_not_duplicate_completed() {
+    let fx = Fx::new("p2s1-i8b");
+    fx.validate_ok();
+    let first = fx.apply(&fx.base).expect("first apply");
+    assert_eq!(first.target_oid_after, fx.source);
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_COMPLETED),
+        1
+    );
+    let mut store = fx.store();
+    let second = session::integrate_pinned(
+        &mut store,
+        &fx.thread,
+        &fx.snapshot,
+        "destino",
+        &fx.source,
+        &fx.source,
+    )
+    .expect("segunda llamada idempotente");
+    assert!(!second.performed, "ya estaba integrado");
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_COMPLETED),
+        1,
+        "no se duplica el éxito"
+    );
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_BLOCKED),
+        1,
+        "el no-op deja una resolución terminal"
+    );
+}
+
+// ── CLI flag ordering cannot silently route to the legacy path ─────────────
+
+#[test]
+fn cli_confirm_before_subcommand_does_not_bypass_gate() {
+    let fx = Fx::new("p2s1-cli-order");
+    let out = fx.env.aeril(&[
+        "integrate",
+        "--confirm",
+        "apply",
+        "--thread",
+        &fx.thread,
+        "--snapshot",
+        &fx.snapshot,
+        "--to",
+        "destino",
+        "--source",
+        &fx.source,
+        "--expect",
+        &fx.base,
+    ]);
+    assert!(!out.status.success(), "no debe caer en legacy");
+    assert_eq!(fx.env.rev_parse("destino"), fx.base);
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_REQUESTED),
+        0
+    );
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_COMPLETED),
+        0
+    );
+}

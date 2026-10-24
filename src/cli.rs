@@ -1131,6 +1131,14 @@ fn cmd_worktree(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
 // ── integrate ────────────────────────────────────────────────────────────────
 
 fn cmd_integrate(p: &Parsed, db_path: &Path) -> Result<i32> {
+    // `--confirm` es booleano para apply; si aparece antes del subcomando el
+    // parser podría consumir `apply` como su valor y caer en la ruta legacy.
+    // Rechazar esa forma evita un bypass silencioso del gate asistido.
+    if p.pos.get(1).is_none() && p.yes("confirm") {
+        return Err(Error::invalid(
+            "--confirm solo es válido con `integrate apply`; no se ejecuta la ruta legacy",
+        ));
+    }
     match p.pos.get(1).map(String::as_str) {
         None => cmd_integrate_legacy(p, db_path),
         Some("preview") => cmd_integrate_preview(p, db_path),

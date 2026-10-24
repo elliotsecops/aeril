@@ -45,6 +45,9 @@ impl IntegrationBlocked {
 pub struct IntegrationOutcome {
     pub target_oid_before: String,
     pub target_oid_after: String,
+    /// `true` solo si ESTA llamada movió la ref. Un no-op idempotente
+    /// (target ya en source, o otro writer ganó) no es un éxito nuevo.
+    pub performed: bool,
 }
 
 /// Fast-forward de `target_branch` (debe estar exactamente en `expect_oid`)
@@ -92,6 +95,7 @@ pub fn fast_forward_with_hook(
         return Ok(IntegrationOutcome {
             target_oid_before: target_s.clone(),
             target_oid_after: target_s,
+            performed: false,
         });
     }
 
@@ -136,6 +140,7 @@ pub fn fast_forward_with_hook(
             return Ok(IntegrationOutcome {
                 target_oid_before: target_s,
                 target_oid_after: source_oid.to_string(),
+                performed: false,
             });
         }
         Some(cur) if cur == expect_oid => {}
@@ -191,6 +196,7 @@ pub fn fast_forward_with_hook(
     Ok(IntegrationOutcome {
         target_oid_before: target_s,
         target_oid_after: source_oid.to_string(),
+        performed: true,
     })
 }
 

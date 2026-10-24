@@ -1590,21 +1590,41 @@ fn integrate_inner(
     crash::point("integrate_intent");
 
     match git::integrate::fast_forward(&repo, target_branch, &ready.oid, &expect) {
-        Ok(outcome) => {
+        Ok(outcome) if outcome.performed => {
             crash::point("integrate_committed");
-            events::append_typed(
-                &mut store.conn,
+            let completed = payload::IntegrationCompleted {
+                target_branch: target_branch.to_string(),
+                source_oid: ready.oid.clone(),
+                target_oid_before: outcome.target_oid_before.clone(),
+                target_oid_after: outcome.target_oid_after.clone(),
+                recovered: false,
+            };
+            if append_completed_once(store, thread_id, target_branch, &ready.oid, &completed)? {
+                Ok(outcome)
+            } else {
+                // Ya existía un éxito para el mismo target/source: no se
+                // duplica completed; se resuelve este intento como no-op.
+                append_integration_blocked(
+                    store,
+                    thread_id,
+                    target_branch,
+                    &ready.oid,
+                    Some(outcome.target_oid_after.clone()),
+                    "ya existía un integration.completed para el mismo target/source; esta llamada no agrega otro éxito",
+                )?;
+                Ok(outcome)
+            }
+        }
+        Ok(outcome) => {
+            // No-op idempotente: otro writer ya había aplicado el source (o
+            // el target ya estaba en source). No es un éxito nuevo.
+            append_integration_blocked(
+                store,
                 thread_id,
-                None,
-                events::K_INTEGRATION_COMPLETED,
-                "system",
-                &payload::IntegrationCompleted {
-                    target_branch: target_branch.to_string(),
-                    source_oid: ready.oid.clone(),
-                    target_oid_before: outcome.target_oid_before.clone(),
-                    target_oid_after: outcome.target_oid_after.clone(),
-                    recovered: false,
-                },
+                target_branch,
+                &ready.oid,
+                Some(outcome.target_oid_after.clone()),
+                "la rama destino ya apuntaba al source; no se movió ninguna ref",
             )?;
             Ok(outcome)
         }
@@ -1629,6 +1649,75 @@ fn integrate_inner(
             Err(Error::conflict(blocked.describe()))
         }
     }
+}
+
+/// Append idempotente del éxito de integración para el mismo thread y
+/// (target, source). Un segundo proceso que ganó el CAS pero encuentra un
+/// completed ya durable no agrega otro éxito.
+fn append_completed_once(
+    store: &mut Store,
+    thread_id: &str,
+    target_branch: &str,
+    source_oid: &str,
+    completed: &payload::IntegrationCompleted,
+) -> Result<bool> {
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let exists: i64 = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE thread_id = ?1 AND kind = ?2
+              AND json_extract(payload, '$.target_branch') = ?3
+              AND json_extract(payload, '$.source_oid') = ?4
+        )",
+        rusqlite::params![
+            thread_id,
+            events::K_INTEGRATION_COMPLETED,
+            target_branch,
+            source_oid
+        ],
+        |row| row.get(0),
+    )?;
+    if exists == 1 {
+        tx.rollback()?;
+        return Ok(false);
+    }
+    events::append_tx(
+        &tx,
+        thread_id,
+        None,
+        events::K_INTEGRATION_COMPLETED,
+        "system",
+        &serde_json::to_value(completed)?,
+        now_ms(),
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn append_integration_blocked(
+    store: &mut Store,
+    thread_id: &str,
+    target_branch: &str,
+    source_oid: &str,
+    target_oid_current: Option<String>,
+    reason: &str,
+) -> Result<()> {
+    events::append_typed(
+        &mut store.conn,
+        thread_id,
+        None,
+        events::K_INTEGRATION_BLOCKED,
+        "system",
+        &payload::IntegrationBlocked {
+            target_branch: target_branch.to_string(),
+            source_oid: source_oid.to_string(),
+            target_oid_current,
+            reason: reason.to_string(),
+        },
+    )?;
+    Ok(())
 }
 
 /// Resultado de reconciliar un intento de integración interrumpido.
