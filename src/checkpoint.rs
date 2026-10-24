@@ -853,7 +853,11 @@ pub fn latest_ready(
     // Fase 1: elegir solo `id`/`seq` (columnas pequeñas). Así el ORDER BY no
     // materializa el patch de cada ready; en historiales con patches grandes
     // el pico de memoria queda acotado. La fila ganadora se carga después.
-    let mut stmt = store.conn.prepare(
+    // Ambas fases comparten un snapshot de lectura: si otro worker agrega un
+    // ready lógico más nuevo entre la selección y la carga, esta llamada no
+    // puede devolver el anterior como si siguiera siendo el último.
+    let tx = store.conn.unchecked_transaction()?;
+    let mut stmt = tx.prepare(
         "SELECT r.id, p.seq, p.run_id, r.seq
            FROM events r
            LEFT JOIN events p
@@ -884,8 +888,8 @@ pub fn latest_ready(
             "checkpoint.ready seq {ready_seq} no puede preceder a su prepared seq {prepared_seq} (thread {thread_id})"
         )));
     }
-    // Fase 2: cargar únicamente la fila ganadora.
-    let ev = events::fetch_by_id(&store.conn, thread_id, &ready_id)?.ok_or_else(|| {
+    // Fase 2: cargar únicamente la fila ganadora, en el mismo snapshot.
+    let ev = events::fetch_by_id(&tx, thread_id, &ready_id)?.ok_or_else(|| {
         Error::integrity(format!(
             "checkpoint.ready {ready_id} desapareció entre selección y lectura (thread {thread_id})"
         ))
@@ -898,6 +902,9 @@ pub fn latest_ready(
         )));
     }
     let parsed: payload::CheckpointReady = ev.parse()?;
+    drop(rows);
+    drop(stmt);
+    tx.commit()?;
     Ok(Some((ev, parsed)))
 }
 
