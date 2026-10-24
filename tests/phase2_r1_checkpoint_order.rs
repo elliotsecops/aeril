@@ -373,11 +373,22 @@ fn r1_b7_large_history_keeps_logical_order() {
     {
         let lines: Vec<String> = rows.filter_map(Result::ok).collect();
         println!("QUERY_PLAN {}", lines.join(" | "));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("idx_events_checkpoint_snapshot")),
+            "el plan debe usar el índice v5: {lines:?}"
+        );
     }
 }
 
-fn run_state(store: &Store, thread_id: &str, run_id: &str) -> checkpoint::RunCheckpointState {
-    checkpoint::run_checkpoint_state(store, thread_id, run_id).unwrap()
+fn run_state(
+    store: &Store,
+    thread_id: &str,
+    run_id: &str,
+    snapshot_id: &str,
+) -> checkpoint::RunCheckpointState {
+    checkpoint::run_checkpoint_state(store, thread_id, run_id, snapshot_id).unwrap()
 }
 
 #[test]
@@ -405,7 +416,7 @@ fn r1_c_state_ready_is_visible_and_wins_over_unrelated_pending() {
         Some("run-1"),
         &prepared("b", Some("run-1")),
     );
-    match run_state(&store, &thread, "run-1") {
+    match run_state(&store, &thread, "run-1", "a") {
         checkpoint::RunCheckpointState::Ready(ready) => {
             let (ev, ready) = *ready;
             assert_eq!(ready.snapshot_id, "a");
@@ -413,6 +424,11 @@ fn r1_c_state_ready_is_visible_and_wins_over_unrelated_pending() {
         }
         other => panic!("se esperaba Ready(a), se obtuvo {other:?}"),
     }
+    // El pending de OTRO snapshot no contamina la clasificación de `a`.
+    assert!(matches!(
+        run_state(&store, &thread, "run-1", "b"),
+        checkpoint::RunCheckpointState::Pending
+    ));
 }
 
 #[test]
@@ -420,7 +436,7 @@ fn r1_c_state_pending_requires_durable_prepared() {
     let (mut store, thread) = store_thread();
     add_run(&store, &thread, "run-1");
     assert!(matches!(
-        run_state(&store, &thread, "run-1"),
+        run_state(&store, &thread, "run-1", "a"),
         checkpoint::RunCheckpointState::None
     ));
     append(
@@ -431,7 +447,7 @@ fn r1_c_state_pending_requires_durable_prepared() {
         &prepared("a", Some("run-1")),
     );
     assert!(matches!(
-        run_state(&store, &thread, "run-1"),
+        run_state(&store, &thread, "run-1", "a"),
         checkpoint::RunCheckpointState::Pending
     ));
 }
@@ -455,7 +471,76 @@ fn r1_c_state_terminal_failure_is_none() {
         &json!({"snapshot_id":"a","reason":"test","terminal":true}),
     );
     assert!(matches!(
-        run_state(&store, &thread, "run-1"),
+        run_state(&store, &thread, "run-1", "a"),
         checkpoint::RunCheckpointState::None
     ));
+}
+
+#[test]
+fn r1_b_legacy_ready_without_prepared_keeps_ready_seq_fallback() {
+    let (mut store, thread) = store_thread();
+    append(
+        &mut store,
+        &thread,
+        events::K_CHECKPOINT_READY,
+        None,
+        &ready("legacy-only", None),
+    );
+    let (ev, ready) = checkpoint::latest_ready(&store, &thread)
+        .unwrap()
+        .expect("ready legacy");
+    assert_eq!(ready.snapshot_id, "legacy-only");
+    assert!(ev.seq >= 0, "ready legacy conserva su seq real");
+}
+
+#[test]
+fn r1_c_state_handles_legacy_prepared_without_run_id() {
+    let (mut store, thread) = store_thread();
+    append(
+        &mut store,
+        &thread,
+        events::K_CHECKPOINT_PREPARED,
+        None,
+        &prepared("legacy", None),
+    );
+    assert!(matches!(
+        run_state(&store, &thread, "run-1", "legacy"),
+        checkpoint::RunCheckpointState::Pending
+    ));
+    append(
+        &mut store,
+        &thread,
+        events::K_CHECKPOINT_READY,
+        None,
+        &ready("legacy", None),
+    );
+    assert!(matches!(
+        run_state(&store, &thread, "run-1", "legacy"),
+        checkpoint::RunCheckpointState::Ready(_)
+    ));
+}
+
+#[test]
+fn r1_c_state_rejects_ready_from_another_run() {
+    let (mut store, thread) = store_thread();
+    add_run(&store, &thread, "run-1");
+    add_run(&store, &thread, "run-2");
+    append(
+        &mut store,
+        &thread,
+        events::K_CHECKPOINT_PREPARED,
+        Some("run-1"),
+        &prepared("a", Some("run-1")),
+    );
+    append(
+        &mut store,
+        &thread,
+        events::K_CHECKPOINT_READY,
+        Some("run-2"),
+        &ready("a", Some("run-2")),
+    );
+    assert!(
+        checkpoint::run_checkpoint_state(&store, &thread, "run-1", "a").is_err(),
+        "un ready de otro run no puede resolver la captura"
+    );
 }

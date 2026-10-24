@@ -646,7 +646,11 @@ impl Runner {
 
         let mut snapshot: Option<checkpoint::CaptureOutcome> = None;
         if state == "completed" {
-            match checkpoint::capture(store, &repo, &run, "run completado") {
+            let checkpoint::CaptureAttempt {
+                snapshot_id: attempted_snapshot,
+                result: capture_result,
+            } = checkpoint::capture_attempt(store, &repo, &run, "run completado");
+            match capture_result {
                 Ok(Some(c)) => {
                     self.note(UiNote::Event {
                         thread_id: thread_id.to_string(),
@@ -664,13 +668,23 @@ impl Runner {
                     // evidencia durable, o una pérdida de lease, sigue siendo
                     // terminal y fail-closed.
                     let lease_lost = matches!(e, Error::LeaseLost(_));
-                    // Una sola instantánea SQLite: `ready` y `pending` no
-                    // pueden contradecirse si la recuperación confirma entre
-                    // medio. Si hay ready, el checkpoint ya es verificable; si
-                    // hay pending, el turno queda completado con recuperación
+                    // Un error de integridad detectado por la captura (por
+                    // ejemplo, un ready con OID/ref divergente) NO puede
+                    // anularse porque exista algún ready del run: es terminal.
+                    let can_defer = !lease_lost && !matches!(e, Error::Integrity(_));
+                    // Una sola instantánea SQLite, atada al snapshot exacto
+                    // que esta captura intentó: `ready` y `pending` no pueden
+                    // contradecirse si la recuperación confirma entre medio.
+                    // Si hay ready, el checkpoint ya es verificable; si hay
+                    // pending, el turno queda completado con recuperación
                     // diferida. `None` solo se elige con evidencia terminal.
-                    match checkpoint::run_checkpoint_state(store, thread_id, &run.id) {
-                        Ok(checkpoint::RunCheckpointState::Ready(ready)) if !lease_lost => {
+                    match checkpoint::run_checkpoint_state(
+                        store,
+                        thread_id,
+                        &run.id,
+                        &attempted_snapshot,
+                    ) {
+                        Ok(checkpoint::RunCheckpointState::Ready(ready)) if can_defer => {
                             // Una recuperación concurrente pudo publicar/verificar
                             // el checkpoint mientras la captura viva fallaba al
                             // confirmar su propio ready. La resolución durable ya
@@ -688,7 +702,7 @@ impl Runner {
                                     .into(),
                             );
                         }
-                        Ok(checkpoint::RunCheckpointState::Pending) if !lease_lost => {
+                        Ok(checkpoint::RunCheckpointState::Pending) if can_defer => {
                             detail = Some(format!(
                                 "turno completado; checkpoint pendiente de recuperación: {e}"
                             ));
