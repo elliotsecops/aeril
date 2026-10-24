@@ -40,6 +40,9 @@ pub struct ThreadDetail {
     pub run_summary: Option<ThreadRunSummary>,
     pub progress: events::RunProgress,
     pub checkpoint: Option<CheckpointPanel>,
+    /// Snapshot/OID cuyo patch está realmente visible. Es la única identidad
+    /// que la tecla `a` puede marcar como revisada.
+    pub displayed_snapshot: Option<(String, String)>,
 }
 
 pub struct CheckpointPanel {
@@ -140,6 +143,11 @@ pub struct App {
     pub thread_opened_beacon: bool,
 }
 
+/// Identidad que la tecla `a` puede marcar: exactamente el patch visible.
+fn review_target(detail: &ThreadDetail) -> Option<(String, String)> {
+    detail.displayed_snapshot.clone()
+}
+
 impl App {
     fn reload_threads(&mut self) -> Result<()> {
         // S3: preservar la selección por IDENTIDAD. Con runs concurrentes el
@@ -229,6 +237,7 @@ impl App {
             run_summary: None,
             progress: events::RunProgress::default(),
             checkpoint: None,
+            displayed_snapshot: None,
         };
         self.detail = Some(detail);
         self.refresh_detail()?;
@@ -265,6 +274,7 @@ impl App {
         detail.patch.clear();
         detail.patch_scroll = 0;
         detail.checkpoint = None;
+        detail.displayed_snapshot = None;
         let selected_ready = if let Some(ev) = detail
             .events
             .get(detail.sel)
@@ -290,6 +300,7 @@ impl App {
                 ev.seq,
             )? as usize;
             detail.patch = ready.patch.lines().map(str::to_string).collect();
+            detail.displayed_snapshot = Some((ready.snapshot_id.clone(), ready.oid.clone()));
             detail.checkpoint = Some(CheckpointPanel {
                 ready,
                 run_id: ev.run_id.clone(),
@@ -307,6 +318,8 @@ impl App {
                 review::view_comment(&self.store, &detail.thread_id, &ev.id, repo.as_ref())
             {
                 detail.patch = view.original_patch.lines().map(str::to_string).collect();
+                detail.displayed_snapshot =
+                    Some((view.anchor.snapshot_id.clone(), view.snapshot_oid.clone()));
             }
         }
         Ok(())
@@ -522,38 +535,23 @@ impl App {
         Ok(())
     }
 
-    /// Marca explícitamente revisado el checkpoint seleccionado (o el último
-    /// ready). Es el hecho durable que usa Attention; no mueve refs.
+    /// Marca explícitamente revisado el checkpoint cuyo patch está visible.
+    /// La identidad sale de `displayed_snapshot`, no de "el último ready":
+    /// un comentario puede mostrar el patch de un snapshot anterior.
     fn mark_reviewed(&mut self) -> Result<()> {
         let Some(detail) = self.detail.as_ref() else {
             self.status = "abrí un thread para marcar un checkpoint revisado".into();
             return Ok(());
         };
         let thread_id = detail.thread_id.clone();
-        let selected = detail
-            .events
-            .get(detail.sel)
-            .filter(|ev| ev.kind == events::K_CHECKPOINT_READY)
-            .cloned();
-        let ready = match selected {
-            Some(ev) => match ev.parse::<events::payload::CheckpointReady>() {
-                Ok(ready) => ready,
-                Err(e) => {
-                    self.status = format!("checkpoint seleccionado ilegible: {e}");
-                    return Ok(());
-                }
-            },
-            None => match checkpoint::latest_ready(&self.store, &thread_id)? {
-                Some((_, ready)) => ready,
-                None => {
-                    self.status = "no hay checkpoint ready para marcar revisado".into();
-                    return Ok(());
-                }
-            },
+        let Some((snapshot_id, oid)) = review_target(detail) else {
+            self.status = "seleccioná un checkpoint listo para marcar revisado".into();
+            return Ok(());
         };
-        match review::acknowledge(&mut self.store, &thread_id, &ready.snapshot_id, &ready.oid) {
+        match review::acknowledge(&mut self.store, &thread_id, &snapshot_id, &oid) {
             Ok(true) => {
-                self.status = format!("checkpoint {} marcado revisado", &ready.snapshot_id[..8]);
+                let short: String = snapshot_id.chars().take(8).collect();
+                self.status = format!("checkpoint {short} marcado revisado");
                 self.reload_threads()?;
             }
             Ok(false) => self.status = "el checkpoint ya estaba marcado revisado".into(),
@@ -1321,7 +1319,7 @@ fn render_integration_preview(
     };
     let review = match preview.review {
         integration::ReviewState::Clear => "clear".to_string(),
-        integration::ReviewState::Required => "required — press `a` in Aeril".into(),
+        integration::ReviewState::Required => "required — press Esc, then `a` in Aeril".into(),
         integration::ReviewState::Pending => {
             format!("{} unresolved comment(s)", preview.unresolved_comments)
         }
@@ -1594,10 +1592,11 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             let branch = summary
                 .and_then(|s| s.latest_branch.clone())
                 .unwrap_or_else(|| "—".into());
-            let label = att
-                .map(|a| a.status_label.as_str())
-                .unwrap_or(state.as_str());
-            let status = format!("{label}  ·  {elapsed}");
+            let status = match att {
+                Some(a) if a.historical_checkpoint => "checkpoint previo".to_string(),
+                Some(a) => format!("{}  ·  {elapsed}", a.status_label),
+                None => format!("{state}  ·  {elapsed}"),
+            };
             let mut status_line = vec![
                 Span::styled("      ", Style::default()),
                 Span::styled(status.clone(), Style::default().fg(color)),
@@ -3045,6 +3044,7 @@ mod tests {
                 ordinal: 1,
                 total: 1,
             }),
+            displayed_snapshot: None,
         }
     }
 
@@ -3087,7 +3087,21 @@ mod tests {
                 ordinal: 1,
                 total: 1,
             }),
+            displayed_snapshot: None,
         }
+    }
+
+    #[test]
+    fn review_target_is_the_displayed_snapshot_not_the_latest_checkpoint() {
+        let mut detail = detail_with_two_runs();
+        detail.displayed_snapshot = Some(("snap-a".into(), "oid-a".into()));
+        assert_eq!(
+            review_target(&detail),
+            Some(("snap-a".into(), "oid-a".into())),
+            "la tecla `a` no debe caer al último ready si el patch visible es otro"
+        );
+        detail.displayed_snapshot = None;
+        assert_eq!(review_target(&detail), None);
     }
 
     #[test]
@@ -3136,6 +3150,7 @@ mod tests {
             }),
             progress,
             checkpoint,
+            displayed_snapshot: None,
         }
     }
 

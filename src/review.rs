@@ -6,12 +6,16 @@
 //! haya borrado. Remapear a un snapshot nuevo será una operación aparte que no
 //! está implementada en v0.
 
+use crate::checkpoint;
 use crate::error::{Error, Result};
 use crate::git;
+use crate::ids;
 use crate::store::Store;
 use crate::store::events::{self, EventRecord, payload};
+use crate::store::threads;
 use crate::util::fnv1a_hex;
 use git2::Repository;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommentState {
@@ -152,7 +156,7 @@ pub fn add_comment(
 }
 
 /// Estados derivados de eventos de feedback/resolución (escaneo acotado).
-fn states_for(store: &Store, thread_id: &str) -> Result<Vec<(String, CommentState)>> {
+fn states_for(conn: &rusqlite::Connection, thread_id: &str) -> Result<Vec<(String, CommentState)>> {
     let mut out: Vec<(String, CommentState)> = Vec::new();
     let mut set_state = |id: &str, state: CommentState| {
         if let Some(entry) = out.iter_mut().find(|(cid, _)| cid == id) {
@@ -164,19 +168,19 @@ fn states_for(store: &Store, thread_id: &str) -> Result<Vec<(String, CommentStat
             out.push((id.to_string(), state));
         }
     };
-    for ev in events::fetch_by_kind(&store.conn, thread_id, events::K_FEEDBACK_SENT)? {
+    for ev in events::fetch_by_kind(conn, thread_id, events::K_FEEDBACK_SENT)? {
         let p: payload::FeedbackSent = ev.parse()?;
         for cid in p.comment_ids {
             set_state(&cid, CommentState::Sent);
         }
     }
-    for ev in events::fetch_by_kind(&store.conn, thread_id, events::K_FEEDBACK_DELIVERED)? {
+    for ev in events::fetch_by_kind(conn, thread_id, events::K_FEEDBACK_DELIVERED)? {
         let p: payload::FeedbackDelivered = ev.parse()?;
         for cid in p.comment_ids {
             set_state(&cid, CommentState::Delivered);
         }
     }
-    for ev in events::fetch_by_kind(&store.conn, thread_id, events::K_COMMENT_RESOLVED)? {
+    for ev in events::fetch_by_kind(conn, thread_id, events::K_COMMENT_RESOLVED)? {
         let p: payload::CommentResolved = ev.parse()?;
         set_state(&p.comment_id, CommentState::Resolved);
     }
@@ -204,7 +208,7 @@ pub fn list_comment_summaries(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<CommentSummary>> {
-    let states = states_for(store, thread_id)?;
+    let states = states_for(&store.conn, thread_id)?;
     let mut out = Vec::new();
     for ev in events::fetch_by_kind(&store.conn, thread_id, events::K_COMMENT_ADDED)? {
         let added: payload::CommentAdded = ev.parse()?;
@@ -263,7 +267,7 @@ pub fn view_comment(
         anchored_text = lines_range(&content, added.anchor.start_line, added.anchor.end_line);
     }
 
-    let state = states_for(store, thread_id)?
+    let state = states_for(&store.conn, thread_id)?
         .into_iter()
         .find(|(cid, _)| cid == comment_id)
         .map(|(_, s)| s)
@@ -285,7 +289,7 @@ pub fn view_comment(
 
 /// IDs de comentarios sin resolver (para el envío de feedback).
 pub fn open_comment_ids(store: &Store, thread_id: &str) -> Result<Vec<String>> {
-    let states = states_for(store, thread_id)?;
+    let states = states_for(&store.conn, thread_id)?;
     let mut out = Vec::new();
     for ev in events::fetch_by_kind(&store.conn, thread_id, events::K_COMMENT_ADDED)? {
         let state = states
@@ -303,31 +307,32 @@ pub fn open_comment_ids(store: &Store, thread_id: &str) -> Result<Vec<String>> {
 /// IDs de comentarios NO resueltos anclados EXACTAMENTE a `snapshot_id` y
 /// `expected_oid`. Comentarios históricos de otros snapshots no participan.
 /// Evidencia malformada o con OID contradictorio falla cerrada.
-pub fn open_comment_ids_for_snapshot(
-    store: &Store,
+fn open_comment_ids_for_snapshot_conn(
+    conn: &rusqlite::Connection,
     thread_id: &str,
     snapshot_id: &str,
     expected_oid: &str,
 ) -> Result<Vec<String>> {
-    let states = states_for(store, thread_id)?;
-    let mut stmt = store.conn.prepare(
+    let states = states_for(conn, thread_id)?;
+    let mut stmt = conn.prepare(
         "SELECT id, payload FROM events
           WHERE thread_id = ?1 AND kind = ?2
-            AND json_extract(payload, '$.anchor.snapshot_id') = ?3
           ORDER BY seq ASC",
     )?;
-    let mut rows = stmt.query(rusqlite::params![
-        thread_id,
-        events::K_COMMENT_ADDED,
-        snapshot_id
-    ])?;
+    let mut rows = stmt.query(rusqlite::params![thread_id, events::K_COMMENT_ADDED])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
         let payload_text: String = row.get(1)?;
         let added: payload::CommentAdded = serde_json::from_str(&payload_text)
             .map_err(|e| Error::integrity(format!("comment.added {id} ilegible: {e}")))?;
-        if added.anchor.snapshot_id != snapshot_id || added.oid != expected_oid {
+        // Los comentarios de otros snapshots son históricos y no participan.
+        // Un comentario del snapshot exacto con OID contradictorio falla
+        // cerrado; un anchor ausente ya falló al deserializar.
+        if added.anchor.snapshot_id != snapshot_id {
+            continue;
+        }
+        if added.oid != expected_oid {
             return Err(Error::integrity(format!(
                 "comment.added {id} no corresponde al snapshot {snapshot_id} / OID {expected_oid}"
             )));
@@ -344,6 +349,18 @@ pub fn open_comment_ids_for_snapshot(
     Ok(out)
 }
 
+/// IDs de comentarios NO resueltos anclados EXACTAMENTE a `snapshot_id` y
+/// `expected_oid`. Comentarios históricos de otros snapshots no participan.
+/// Evidencia malformada o con OID contradictorio falla cerrada.
+pub fn open_comment_ids_for_snapshot(
+    store: &Store,
+    thread_id: &str,
+    snapshot_id: &str,
+    expected_oid: &str,
+) -> Result<Vec<String>> {
+    open_comment_ids_for_snapshot_conn(&store.conn, thread_id, snapshot_id, expected_oid)
+}
+
 /// Marca explícitamente un checkpoint como revisado por un humano. Es un
 /// hecho durable exacto al snapshot/OID, no una inferencia por ausencia de
 /// comentarios. Idempotente para el mismo snapshot/OID.
@@ -353,9 +370,10 @@ pub fn acknowledge(
     snapshot_id: &str,
     oid: &str,
 ) -> Result<bool> {
-    // El acknowledgement solo puede referirse a un checkpoint listo real y a
-    // su OID exacto. Una llamada de biblioteca no puede inventar identidades.
-    let (_, ready) = crate::checkpoint::ready_for_snapshot(store, thread_id, snapshot_id)?
+    // El acknowledgement solo puede referirse a un checkpoint listo, con
+    // prepared consistente, sin marcador failed y con ref/objetos Git
+    // verificables. Una llamada de biblioteca no puede inventar identidades.
+    let (_, ready) = checkpoint::ready_for_snapshot(store, thread_id, snapshot_id)?
         .ok_or_else(|| Error::not_ready(format!("no hay checkpoint ready {snapshot_id}")))?;
     if ready.oid != oid {
         return Err(Error::integrity(format!(
@@ -363,16 +381,62 @@ pub fn acknowledge(
             ready.oid
         )));
     }
-    let open = open_comment_ids_for_snapshot(store, thread_id, snapshot_id, oid)?;
+    if ready.git_ref != ids::checkpoint_ref(snapshot_id) {
+        return Err(Error::integrity(format!(
+            "ref de checkpoint inesperada para {snapshot_id}: {}",
+            ready.git_ref
+        )));
+    }
+    let prepared =
+        checkpoint::prepared_for_snapshot(store, thread_id, snapshot_id)?.ok_or_else(|| {
+            Error::not_ready(format!(
+                "no hay checkpoint.prepared verificable para {snapshot_id}"
+            ))
+        })?;
+    if prepared.snapshot_id != snapshot_id
+        || prepared.expected_oid != ready.oid
+        || prepared.git_ref != ready.git_ref
+    {
+        return Err(Error::integrity(format!(
+            "checkpoint.prepared y checkpoint.ready se contradicen para {snapshot_id}"
+        )));
+    }
+    if checkpoint::has_failed_marker(store, thread_id, snapshot_id)? {
+        return Err(Error::integrity(format!(
+            "el snapshot {snapshot_id} tiene un marcador checkpoint.failed"
+        )));
+    }
+    let thread = threads::get(&store.conn, thread_id)?
+        .ok_or_else(|| Error::not_found(format!("thread {thread_id}")))?;
+    let repo = git::open(Path::new(&thread.repo_path))?;
+    git::snapshot::verify_snapshot(&repo, &ready.git_ref, &ready.oid, &ready.files)?;
+
+    // El chequeo de comentarios y la escritura del ack comparten la misma
+    // transacción IMMEDIATE: un comentario no puede colarse entre ambos.
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let open = open_comment_ids_for_snapshot_conn(&tx, thread_id, snapshot_id, oid)?;
     if !open.is_empty() {
         return Err(Error::conflict(format!(
             "hay {} comentario(s) sin resolver en el snapshot; resolvelos antes de marcarlo revisado",
             open.len()
         )));
     }
-    let tx = store
-        .conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let failed_now: i64 = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE thread_id = ?1 AND kind = ?2
+              AND json_extract(payload, '$.snapshot_id') = ?3
+        )",
+        rusqlite::params![thread_id, events::K_CHECKPOINT_FAILED, snapshot_id],
+        |row| row.get(0),
+    )?;
+    if failed_now == 1 {
+        return Err(Error::integrity(format!(
+            "el snapshot {snapshot_id} recibió un marcador checkpoint.failed durante la revisión"
+        )));
+    }
     let exists: i64 = tx.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM events

@@ -1253,7 +1253,12 @@ fn cmd_attention(p: &Parsed, db_path: &Path) -> Result<i32> {
     }
     for item in &items {
         println!("{}", item.thread_title);
-        println!("  {} · → {}", item.status_label, item.next_action);
+        let label = if item.historical_checkpoint {
+            format!("checkpoint previo · {}", item.status_label)
+        } else {
+            item.status_label.clone()
+        };
+        println!("  {label} · → {}", item.next_action);
         if !item.reason.is_empty() {
             println!("  {}", item.reason);
         }

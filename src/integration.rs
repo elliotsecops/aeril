@@ -325,6 +325,21 @@ pub fn preview(
             "prepared y ready tienen identidades contradictorias",
         ));
     }
+    match checkpoint::has_failed_marker(store, thread_id, snapshot_id) {
+        Ok(true) => {
+            return Ok(p.blocked(
+                IntegrationStatus::SnapshotInvalid,
+                format!("el snapshot {snapshot_id} tiene un marcador checkpoint.failed"),
+            ));
+        }
+        Ok(false) => {}
+        Err(e) => {
+            return Ok(p.blocked(
+                IntegrationStatus::IntegrityError,
+                format!("no se pudo verificar checkpoint.failed: {e}"),
+            ));
+        }
+    }
     if ready.git_ref != checkpoint_ref(snapshot_id) {
         return Ok(p.blocked(
             IntegrationStatus::SnapshotInvalid,

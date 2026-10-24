@@ -7,6 +7,7 @@
 mod common;
 
 use aeril::attention::{self, AttentionStatus};
+use aeril::ids;
 use aeril::integration::ValidationState;
 use aeril::review;
 use aeril::store::events;
@@ -170,6 +171,16 @@ fn add_validation(
     )
 }
 
+fn add_ack(store: &mut Store, thread: &str, snapshot: &str, oid: &str) -> String {
+    append(
+        store,
+        thread,
+        None,
+        events::K_REVIEW_ACKNOWLEDGED,
+        json!({"snapshot_id": snapshot, "oid": oid}),
+    )
+}
+
 fn add_integration(
     store: &mut Store,
     thread: &str,
@@ -207,7 +218,7 @@ fn project(store: &Store, thread: &str) -> attention::TaskAttention {
 
 fn ready_with_review(store: &mut Store, thread: &str, run: &str) -> String {
     let ready = add_checkpoint(store, thread, run, SNAP, OID);
-    review::acknowledge(store, thread, SNAP, OID).expect("ack");
+    add_ack(store, thread, SNAP, OID);
     ready
 }
 
@@ -281,14 +292,11 @@ fn acknowledgement_is_exact_to_snapshot_and_oid() {
     let (mut store, thread, run) = new_thread("ack exacto");
     add_run(&mut store, &thread, &run, "completed");
     add_checkpoint(&mut store, &thread, &run, SNAP, OID);
+    add_ack(&mut store, &thread, SNAP, OID);
     assert!(
-        review::acknowledge(&mut store, &thread, SNAP, OTHER_OID).is_err(),
-        "no se puede ack un OID que no es el del checkpoint listo"
+        review::acknowledged(&store, &thread, SNAP, OID).expect("consulta"),
+        "el acknowledgement exacto debe existir"
     );
-    let a = project(&store, &thread);
-    assert_eq!(a.status, AttentionStatus::ReviewRequired);
-    assert_eq!(a.review.as_deref(), Some("required"));
-    review::acknowledge(&mut store, &thread, SNAP, OID).expect("ack exacto");
     assert!(
         !review::acknowledged(&store, &thread, SNAP, OTHER_OID).expect("consulta"),
         "el acknowledgement no debe satisfacer otro OID"
@@ -299,7 +307,7 @@ fn acknowledgement_is_exact_to_snapshot_and_oid() {
 }
 
 #[test]
-fn open_comments_block_ack_and_keep_review_pending() {
+fn open_comments_keep_review_pending() {
     let (mut store, thread, run) = new_thread("comentarios");
     add_run(&mut store, &thread, &run, "completed");
     let ready = add_checkpoint(&mut store, &thread, &run, SNAP, OID);
@@ -309,15 +317,11 @@ fn open_comments_block_ack_and_keep_review_pending() {
     assert_eq!(a.review.as_deref(), Some("pending"));
     assert_eq!(a.next_action, "resolver comentarios");
     assert!(a.reason.contains('1'));
-    assert!(
-        review::acknowledge(&mut store, &thread, SNAP, OID).is_err(),
-        "no se puede marcar revisado con comentarios abiertos"
-    );
     review::resolve(&mut store, &thread, &comment).expect("resolve");
     let a = project(&store, &thread);
     assert_eq!(a.status, AttentionStatus::ReviewRequired);
     assert_eq!(a.review.as_deref(), Some("required"));
-    review::acknowledge(&mut store, &thread, SNAP, OID).expect("ack tras resolver");
+    add_ack(&mut store, &thread, SNAP, OID);
     let a = project(&store, &thread);
     assert_eq!(a.status, AttentionStatus::ValidationRequired);
 }
@@ -349,7 +353,7 @@ fn failed_validation_then_passed_reaches_ready() {
     let a = project(&store, &thread);
     assert_eq!(a.status, AttentionStatus::ReadyToIntegrate);
     assert_eq!(a.validation, Some(ValidationState::Passed));
-    assert_eq!(a.next_action, "preview e integrar");
+    assert_eq!(a.next_action, "abrir preview de integración");
     assert!(a.is_actionable());
 }
 
@@ -587,6 +591,233 @@ fn malformed_integration_event_is_integrity_hold() {
     assert_eq!(all[0].status, AttentionStatus::IntegrityHold);
 }
 
+// ── evidencia contradictoria: integridad antes que acción ──────────────────
+
+#[test]
+fn ready_without_prepared_is_integrity_hold() {
+    let (mut store, thread, run) = new_thread("ready sin prepared");
+    add_run(&mut store, &thread, &run, "completed");
+    add_ready(&mut store, &thread, &run, SNAP, OID);
+    let a = project(&store, &thread);
+    assert_eq!(a.status, AttentionStatus::IntegrityHold);
+    assert_eq!(a.next_action, "revisar estado");
+    assert!(a.reason.contains("prepared"));
+}
+
+#[test]
+fn contradictory_prepared_is_integrity_hold() {
+    let (mut store, thread, run) = new_thread("prepared contradictorio");
+    add_run(&mut store, &thread, &run, "completed");
+    add_prepared(&mut store, &thread, &run, SNAP, OTHER_OID);
+    add_ready(&mut store, &thread, &run, SNAP, OID);
+    let a = project(&store, &thread);
+    assert_eq!(a.status, AttentionStatus::IntegrityHold);
+    assert!(a.reason.contains("contradicen"));
+}
+
+#[test]
+fn ready_with_failed_marker_is_integrity_hold() {
+    let (mut store, thread, run) = new_thread("ready y failed");
+    add_run(&mut store, &thread, &run, "completed");
+    add_checkpoint(&mut store, &thread, &run, SNAP, OID);
+    append(
+        &mut store,
+        &thread,
+        Some(&run),
+        events::K_CHECKPOINT_FAILED,
+        json!({
+            "snapshot_id": SNAP,
+            "phase": "recovery",
+            "reason": "marcador tardío",
+            "terminal": true
+        }),
+    );
+    let a = project(&store, &thread);
+    assert_eq!(a.status, AttentionStatus::IntegrityHold);
+    assert!(a.reason.contains("failed"));
+}
+
+// ── secuencias de eventos: stale, validación y recuperación ─────────────────
+
+#[test]
+fn blocked_then_completed_does_not_keep_advertising_the_block() {
+    let (mut store, thread, run) = new_thread("bloqueo resuelto");
+    add_run(&mut store, &thread, &run, "completed");
+    ready_with_review(&mut store, &thread, &run);
+    add_validation(&mut store, &thread, &run, SNAP, OID, 0, true);
+    add_integration(
+        &mut store,
+        &thread,
+        events::K_INTEGRATION_BLOCKED,
+        OID,
+        "la rama destino está siendo usada por un checkout",
+    );
+    assert_eq!(
+        project(&store, &thread).status,
+        AttentionStatus::IntegrationBlocked
+    );
+    add_integration(
+        &mut store,
+        &thread,
+        events::K_INTEGRATION_COMPLETED,
+        OID,
+        "",
+    );
+    let a = project(&store, &thread);
+    assert_eq!(a.status, AttentionStatus::Done);
+    assert_eq!(a.status_label, "integrado");
+    assert_eq!(a.next_action, "ninguna");
+}
+
+#[test]
+fn validation_of_checkpoint_a_does_not_validate_checkpoint_b() {
+    let (mut store, thread, run) = new_thread("validación no heredada");
+    add_run(&mut store, &thread, &run, "completed");
+    add_checkpoint(&mut store, &thread, &run, "snap-a", OID);
+    add_validation(&mut store, &thread, &run, "snap-a", OID, 0, true);
+    add_checkpoint(&mut store, &thread, &run, "snap-b", OTHER_OID);
+    add_ack(&mut store, &thread, "snap-b", OTHER_OID);
+    let a = project(&store, &thread);
+    assert_eq!(a.snapshot_id.as_deref(), Some("snap-b"));
+    assert_eq!(a.status, AttentionStatus::ValidationRequired);
+    assert_eq!(a.validation, Some(ValidationState::Missing));
+}
+
+#[test]
+fn late_recovered_ready_a_does_not_replace_logical_latest_b() {
+    let (mut store, thread, run) = new_thread("ready recuperado tarde");
+    add_run(&mut store, &thread, &run, "completed");
+    add_prepared(&mut store, &thread, &run, "snap-a", OID);
+    add_prepared(&mut store, &thread, &run, "snap-b", OTHER_OID);
+    add_ready(&mut store, &thread, &run, "snap-b", OTHER_OID);
+    add_ready(&mut store, &thread, &run, "snap-a", OID);
+    let a = project(&store, &thread);
+    assert_eq!(a.snapshot_id.as_deref(), Some("snap-b"));
+    assert_eq!(a.status, AttentionStatus::ReviewRequired);
+}
+
+#[test]
+fn completed_run_without_pending_checkpoint_is_not_called_integrated() {
+    let (mut store, thread, run) = new_thread("sin checkpoint");
+    add_run(&mut store, &thread, &run, "completed");
+    let a = project(&store, &thread);
+    assert_eq!(a.status, AttentionStatus::Done);
+    assert_eq!(a.status_label, "sin trabajo pendiente");
+    assert_eq!(a.next_action, "ninguna");
+}
+
+// ── permisos: ni pendientes ni auditados como limpios ───────────────────────
+
+#[test]
+fn completed_run_with_unresolved_permission_is_not_clean() {
+    let (mut store, thread, run) = new_thread("permiso sin responder");
+    add_run(&mut store, &thread, &run, "completed");
+    append(
+        &mut store,
+        &thread,
+        Some(&run),
+        events::K_PERMISSION_REQUESTED,
+        json!({
+            "request_id": "req-1",
+            "tool_call_id": "call-1",
+            "title": "editar NOTES.md",
+            "options": ["allow_once"]
+        }),
+    );
+    let a = project(&store, &thread);
+    assert_eq!(a.status, AttentionStatus::IntegrityHold);
+    assert!(a.reason.contains("sin respuesta durable"));
+}
+
+#[test]
+fn permission_audit_failure_is_integrity_hold() {
+    let (mut store, thread, run) = new_thread("auditoría de permiso");
+    add_run(&mut store, &thread, &run, "completed");
+    append(
+        &mut store,
+        &thread,
+        Some(&run),
+        events::K_PERMISSION_AUDIT_FAILED,
+        json!({
+            "request_id": "req-1",
+            "stage": "responded",
+            "detail": "no se pudo escribir la decisión"
+        }),
+    );
+    let a = project(&store, &thread);
+    assert_eq!(a.status, AttentionStatus::IntegrityHold);
+    assert!(a.reason.contains("auditoría"));
+}
+
+#[test]
+fn malformed_comment_anchor_fails_closed() {
+    let (mut store, thread, run) = new_thread("comentario sin anchor");
+    add_run(&mut store, &thread, &run, "completed");
+    let ready = add_checkpoint(&mut store, &thread, &run, SNAP, OID);
+    append(
+        &mut store,
+        &thread,
+        Some(&run),
+        events::K_COMMENT_ADDED,
+        json!({
+            "checkpoint_event_id": ready,
+            "oid": OID,
+            "text": "comentario corrupto"
+        }),
+    );
+    assert!(attention::project_thread(&store, &thread).is_err());
+    let all = attention::project_all(&store, 10).expect("proyección global");
+    assert_eq!(all[0].status, AttentionStatus::IntegrityHold);
+}
+
+// ── runs solapados y read-only ──────────────────────────────────────────────
+
+#[test]
+fn old_checkpoint_is_marked_as_historical_when_a_new_run_started() {
+    let (mut store, thread, run) = new_thread("run solapado");
+    add_run(&mut store, &thread, &run, "completed");
+    add_checkpoint(&mut store, &thread, &run, SNAP, OID);
+    add_run_at(&mut store, &thread, "run-2", "running", 10);
+    let a = project(&store, &thread);
+    assert_eq!(a.status, AttentionStatus::ReviewRequired);
+    assert_eq!(a.run_id.as_deref(), Some("run-2"));
+    assert_eq!(a.checkpoint_run_id.as_deref(), Some("run-1"));
+    assert!(a.historical_checkpoint);
+    assert!(a.reason.contains("run anterior"));
+}
+
+#[test]
+fn attention_projection_is_read_only() {
+    let (mut store, thread, run) = new_thread("read only");
+    add_run(&mut store, &thread, &run, "completed");
+    add_checkpoint(&mut store, &thread, &run, SNAP, OID);
+    let count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .expect("count");
+    let max_seq: i64 = store
+        .conn
+        .query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |row| {
+            row.get(0)
+        })
+        .expect("seq");
+    for _ in 0..10 {
+        attention::project_all(&store, 100).expect("proyección");
+    }
+    let count_after: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .expect("count");
+    let max_seq_after: i64 = store
+        .conn
+        .query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |row| {
+            row.get(0)
+        })
+        .expect("seq");
+    assert_eq!(count, count_after);
+    assert_eq!(max_seq, max_seq_after);
+}
+
 // ── integración real: CLI y TUI ─────────────────────────────────────────────
 
 fn ready_env(name: &str) -> (TestEnv, String, String) {
@@ -601,6 +832,17 @@ fn ready_env(name: &str) -> (TestEnv, String, String) {
     let snapshots = env.ready_snapshots(&thread);
     assert_eq!(snapshots.len(), 1, "checkpoint ready: {snapshots:?}");
     (env, thread, snapshots[0].0.clone())
+}
+
+fn count_kind(env: &TestEnv, thread: &str, kind: &str) -> usize {
+    let store = Store::open(&env.data.join("aeril.db")).expect("store");
+    events::fetch_by_kind(&store.conn, thread, kind)
+        .expect("events")
+        .len()
+}
+
+fn ready_oid(env: &TestEnv, thread: &str) -> String {
+    env.ready_snapshots(thread)[0].1.clone()
 }
 
 fn attention_item(env: &TestEnv, thread: &str) -> serde_json::Value {
@@ -620,6 +862,7 @@ fn cli_attention_reports_exact_next_action() {
     assert_eq!(a["status"], "review_required");
     assert_eq!(a["next_action"], "marcar revisado");
     assert_eq!(a["review"], "required");
+    assert_eq!(count_kind(&env, &thread, events::K_REVIEW_ACKNOWLEDGED), 0);
     let human = env.aeril(&["attention"]);
     assert!(human.status.success());
     let text = String::from_utf8_lossy(&human.stdout);
@@ -628,7 +871,7 @@ fn cli_attention_reports_exact_next_action() {
         "{text}"
     );
 
-    env.aeril_ok(&[
+    let first = env.aeril_ok(&[
         "review",
         "ack",
         "--thread",
@@ -636,6 +879,28 @@ fn cli_attention_reports_exact_next_action() {
         "--snapshot",
         &snapshot,
     ]);
+    assert_eq!(first["new_event"], true);
+    let second = env.aeril_ok(&[
+        "review",
+        "ack",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &snapshot,
+    ]);
+    assert_eq!(
+        second["new_event"], false,
+        "ack repetido debe ser idempotente"
+    );
+    assert_eq!(count_kind(&env, &thread, events::K_REVIEW_ACKNOWLEDGED), 1);
+    for _ in 0..3 {
+        let _ = attention_item(&env, &thread);
+    }
+    assert_eq!(
+        count_kind(&env, &thread, events::K_REVIEW_ACKNOWLEDGED),
+        1,
+        "Attention no debe escribir acknowledgements"
+    );
     let a = attention_item(&env, &thread);
     assert_eq!(a["status"], "validation_required");
     assert_eq!(a["next_action"], "ejecutar validación");
@@ -651,8 +916,118 @@ fn cli_attention_reports_exact_next_action() {
     ]);
     let a = attention_item(&env, &thread);
     assert_eq!(a["status"], "ready_to_integrate");
-    assert_eq!(a["next_action"], "preview e integrar");
+    assert_eq!(a["next_action"], "abrir preview de integración");
     assert_eq!(a["validation"], "passed");
+}
+
+#[test]
+fn cli_ack_rejects_unverifiable_or_contradictory_checkpoints() {
+    let (env, thread, snapshot) = ready_env("pa0-attn-ack-strict");
+    let mut store = Store::open(&env.data.join("aeril.db")).expect("store");
+    let oid = ready_oid(&env, &thread);
+
+    store
+        .conn
+        .execute(
+            "UPDATE events SET payload = json_set(payload, '$.expected_oid', ?2)
+              WHERE thread_id = ?1 AND kind = ?3
+                AND json_extract(payload, '$.snapshot_id') = ?4",
+            rusqlite::params![thread, OTHER_OID, events::K_CHECKPOINT_PREPARED, snapshot],
+        )
+        .expect("mutar prepared");
+    let out = env.aeril(&[
+        "review",
+        "ack",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &snapshot,
+    ]);
+    assert!(
+        !out.status.success(),
+        "ack con prepared contradictorio debe fallar"
+    );
+
+    store
+        .conn
+        .execute(
+            "UPDATE events SET payload = json_set(payload, '$.expected_oid', ?2)
+              WHERE thread_id = ?1 AND kind = ?3
+                AND json_extract(payload, '$.snapshot_id') = ?4",
+            rusqlite::params![thread, oid, events::K_CHECKPOINT_PREPARED, snapshot],
+        )
+        .expect("restaurar prepared");
+    events::append(
+        &mut store.conn,
+        &thread,
+        None,
+        events::K_CHECKPOINT_FAILED,
+        "system",
+        &json!({
+            "snapshot_id": snapshot,
+            "phase": "recovery",
+            "reason": "marcador de auditoría",
+            "terminal": true
+        }),
+    )
+    .expect("failed marker");
+    let out = env.aeril(&[
+        "review",
+        "ack",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &snapshot,
+    ]);
+    assert!(
+        !out.status.success(),
+        "ack con checkpoint.failed debe fallar"
+    );
+
+    store
+        .conn
+        .execute(
+            "DELETE FROM events WHERE thread_id = ?1 AND kind = ?2
+              AND json_extract(payload, '$.snapshot_id') = ?3",
+            rusqlite::params![thread, events::K_CHECKPOINT_FAILED, snapshot],
+        )
+        .expect("quitar failed");
+    git(
+        &env.repo,
+        &["update-ref", "-d", &ids::checkpoint_ref(&snapshot)],
+    );
+    let out = env.aeril(&[
+        "review",
+        "ack",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &snapshot,
+    ]);
+    assert!(!out.status.success(), "ack sin ref verificable debe fallar");
+
+    env.update_ref(&ids::checkpoint_ref(&snapshot), &oid);
+    store
+        .conn
+        .execute(
+            "DELETE FROM events WHERE thread_id = ?1 AND kind = ?2
+              AND json_extract(payload, '$.snapshot_id') = ?3",
+            rusqlite::params![thread, events::K_CHECKPOINT_PREPARED, snapshot],
+        )
+        .expect("quitar prepared");
+    let out = env.aeril(&[
+        "review",
+        "ack",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &snapshot,
+    ]);
+    assert!(
+        !out.status.success(),
+        "ack sin prepared verificable debe fallar"
+    );
+    assert_eq!(count_kind(&env, &thread, events::K_REVIEW_ACKNOWLEDGED), 0);
 }
 
 #[test]
@@ -679,6 +1054,11 @@ fn tui_shows_attention_and_a_marks_the_checkpoint_reviewed() {
         "falta la próxima acción: {}",
         pty.output_lossy()
     );
+    assert_eq!(
+        count_kind(&env, &thread, events::K_REVIEW_ACKNOWLEDGED),
+        0,
+        "abrir y mirar la tarea no debe crear un acknowledgement"
+    );
     pty.send(b"a");
     pty.pump(500);
     let store = Store::open(&env.data.join("aeril.db")).expect("store");
@@ -698,4 +1078,33 @@ fn tui_shows_attention_and_a_marks_the_checkpoint_reviewed() {
         pty.output_lossy()
     );
     pty.kill();
+}
+
+#[test]
+fn tui_attention_is_legible_at_supported_sizes() {
+    let (env, _thread, _snapshot) = ready_env("pa0-attn-sizes");
+    for (rows, cols) in [(24, 80), (40, 120), (50, 180)] {
+        let mut pty = TuiPty::spawn_sized(&env, &[], &[], rows, cols);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pty.output_contains("Aeril") {
+            assert!(
+                Instant::now() < deadline,
+                "la TUI no dibujó el primer frame en {cols}x{rows}"
+            );
+            pty.pump(100);
+        }
+        pty.enter();
+        pty.pump(400);
+        assert!(
+            pty.output_contains("checkpoint listo"),
+            "falta el estado en {cols}x{rows}: {}",
+            pty.output_lossy()
+        );
+        assert!(
+            pty.output_contains("marcar revisado"),
+            "falta la próxima acción en {cols}x{rows}: {}",
+            pty.output_lossy()
+        );
+        pty.kill();
+    }
 }

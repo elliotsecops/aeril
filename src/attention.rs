@@ -68,7 +68,7 @@ impl AttentionStatus {
             AttentionStatus::ReadyToIntegrate => "validación aprobada",
             AttentionStatus::InProgress => "agente trabajando",
             AttentionStatus::Failed => "run fallido",
-            AttentionStatus::Done => "integrado y cerrado",
+            AttentionStatus::Done => "sin trabajo pendiente",
             AttentionStatus::NoRun => "sin run",
         }
     }
@@ -84,8 +84,14 @@ pub struct TaskAttention {
     pub next_action: String,
     pub reason: String,
     pub run_state: Option<String>,
+    pub run_id: Option<String>,
     pub snapshot_id: Option<String>,
     pub source_oid: Option<String>,
+    /// Run que produjo el checkpoint mostrado. Permite distinguir el último
+    /// resultado revisable de un run posterior que todavía trabaja.
+    pub checkpoint_run_id: Option<String>,
+    /// `true` si el checkpoint mostrado pertenece a un run anterior al último.
+    pub historical_checkpoint: bool,
     pub validation: Option<ValidationState>,
     /// `pending` (comentarios abiertos), `required` (sin acknowledgement) o
     /// `clear`. Se calcula solo para el snapshot/OID exacto.
@@ -109,16 +115,20 @@ impl TaskAttention {
             next_action: action.to_string(),
             reason: reason.into(),
             run_state: None,
+            run_id: None,
             snapshot_id: None,
             source_oid: None,
+            checkpoint_run_id: None,
+            historical_checkpoint: false,
             validation: None,
             review: None,
             integration: None,
         }
     }
 
-    fn with_run(mut self, run_state: Option<String>) -> Self {
+    fn with_run(mut self, run_state: Option<String>, run_id: Option<String>) -> Self {
         self.run_state = run_state;
+        self.run_id = run_id;
         self
     }
 
@@ -128,6 +138,13 @@ impl TaskAttention {
         self.status_label = status.label().to_string();
         self.next_action = action.to_string();
         self.reason = reason.into();
+        if self.historical_checkpoint {
+            if !self.reason.is_empty() {
+                self.reason.push_str(" · checkpoint de un run anterior");
+            } else {
+                self.reason = "checkpoint de un run anterior".into();
+            }
+        }
     }
 
     /// `true` si la tarea requiere una acción del humano para avanzar. Un run
@@ -282,42 +299,28 @@ fn latest_pending_prepared(store: &Store, thread_id: &str) -> Result<Option<i64>
         .optional()?)
 }
 
-/// Pedido de permiso sin respuesta durable y sin cierre del run. Solo cuenta
-/// mientras el run sigue vivo: un pedido de un supervisor muerto es
-/// recuperación, no autorización.
-fn pending_permission(
-    store: &Store,
-    thread_id: &str,
-    run_active: bool,
-    run_live: bool,
-) -> Result<Option<String>> {
-    if !run_active || !run_live {
-        return Ok(None);
-    }
+/// Pedido de permiso sin respuesta durable, acotado al run que lo emitió.
+/// No importa si el run sigue activo: un pedido sin responder al cierre es
+/// evidencia inconsistente, nunca un run limpio.
+fn pending_permission(store: &Store, thread_id: &str, run_id: &str) -> Result<Option<String>> {
     let row: Option<(String,)> = store
         .conn
         .query_row(
             "SELECT p.payload FROM events p
-              WHERE p.thread_id = ?1 AND p.kind = ?2
+              WHERE p.thread_id = ?1 AND p.run_id = ?2 AND p.kind = ?3
                 AND NOT EXISTS (
                     SELECT 1 FROM events r
-                    WHERE r.thread_id = p.thread_id AND r.kind = ?3
+                    WHERE r.thread_id = p.thread_id AND r.kind = ?4
                       AND json_extract(r.payload, '$.request_id') =
                           json_extract(p.payload, '$.request_id')
                       AND r.seq > p.seq
                 )
-                AND NOT EXISTS (
-                    SELECT 1 FROM events e
-                    WHERE e.thread_id = p.thread_id AND e.seq > p.seq
-                      AND e.kind IN (?4, ?5)
-                )
               ORDER BY p.seq DESC LIMIT 1",
             rusqlite::params![
                 thread_id,
+                run_id,
                 events::K_PERMISSION_REQUESTED,
-                events::K_PERMISSION_RESPONDED,
-                events::K_RUN_ENDED,
-                events::K_RUN_STARTED
+                events::K_PERMISSION_RESPONDED
             ],
             |row| Ok((row.get(0)?,)),
         )
@@ -340,6 +343,39 @@ fn pending_permission(
     } else {
         p.title
     }))
+}
+
+/// Fallo durable al auditar una autorización. Sin auditoría no hay
+/// autorización: la tarea no puede presentarse como limpia.
+fn permission_audit_failure(
+    store: &Store,
+    thread_id: &str,
+    run_id: &str,
+) -> Result<Option<String>> {
+    let text: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT payload FROM events
+              WHERE thread_id = ?1 AND run_id = ?2 AND kind = ?3
+              ORDER BY seq DESC LIMIT 1",
+            rusqlite::params![thread_id, run_id, events::K_PERMISSION_AUDIT_FAILED],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    let p: payload::PermissionAuditFailed = serde_json::from_str(&text).map_err(|e| {
+        Error::integrity(format!(
+            "permission.audit_failed ilegible en el thread {thread_id}: {e}"
+        ))
+    })?;
+    if p.stage.trim().is_empty() || p.detail.trim().is_empty() {
+        return Err(Error::integrity(format!(
+            "permission.audit_failed incompleto en el thread {thread_id}"
+        )));
+    }
+    Ok(Some(format!("{}: {}", p.stage, p.detail)))
 }
 
 /// Estado de la última validación registrada para el snapshot exacto.
@@ -437,6 +473,7 @@ pub fn project_thread(store: &Store, thread_id: &str) -> Result<TaskAttention> {
         .ok_or_else(|| Error::not_found(format!("thread {thread_id}")))?;
     let run = runs::latest(&store.conn, thread_id)?;
     let run_state = run.as_ref().map(|r| r.state.clone());
+    let run_id = run.as_ref().map(|r| r.id.clone());
     let run_active = matches!(run_state.as_deref(), Some("starting") | Some("running"));
     let run_live = match run.as_ref() {
         Some(run) if run_active => match run.workspace_id.as_deref() {
@@ -451,38 +488,100 @@ pub fn project_thread(store: &Store, thread_id: &str) -> Result<TaskAttention> {
     };
 
     let ready = checkpoint::latest_ready(store, thread_id)?;
-    if let Some((_, ready)) = ready.as_ref()
-        && let Some(prepared) =
-            checkpoint::prepared_for_snapshot(store, thread_id, &ready.snapshot_id)?
-        && (prepared.snapshot_id != ready.snapshot_id
+    if let Some((_, ready)) = ready.as_ref() {
+        let prepared = checkpoint::prepared_for_snapshot(store, thread_id, &ready.snapshot_id)?;
+        let Some(prepared) = prepared else {
+            let mut a = TaskAttention::new(
+                &thread,
+                AttentionStatus::IntegrityHold,
+                "revisar estado",
+                "checkpoint ready sin checkpoint.prepared verificable",
+            )
+            .with_run(run_state, run_id.clone());
+            a.snapshot_id = Some(ready.snapshot_id.clone());
+            a.source_oid = Some(ready.oid.clone());
+            return Ok(a);
+        };
+        if prepared.snapshot_id != ready.snapshot_id
             || prepared.expected_oid != ready.oid
-            || prepared.git_ref != ready.git_ref)
+            || prepared.git_ref != ready.git_ref
+        {
+            let mut a = TaskAttention::new(
+                &thread,
+                AttentionStatus::IntegrityHold,
+                "revisar estado",
+                "checkpoint.prepared y checkpoint.ready se contradicen",
+            )
+            .with_run(run_state, run_id.clone());
+            a.snapshot_id = Some(ready.snapshot_id.clone());
+            a.source_oid = Some(ready.oid.clone());
+            return Ok(a);
+        }
+        if checkpoint::has_failed_marker(store, thread_id, &ready.snapshot_id)? {
+            let mut a = TaskAttention::new(
+                &thread,
+                AttentionStatus::IntegrityHold,
+                "revisar estado",
+                "checkpoint.ready y checkpoint.failed coexisten para el mismo snapshot",
+            )
+            .with_run(run_state, run_id.clone());
+            a.snapshot_id = Some(ready.snapshot_id.clone());
+            a.source_oid = Some(ready.oid.clone());
+            return Ok(a);
+        }
+    }
+
+    let pending_prepared = latest_pending_prepared(store, thread_id)?;
+    let integration = latest_integration(store, thread_id)?;
+
+    // 1) Integridad de permisos: un fallo de auditoría o un pedido sin
+    //    respuesta al cierre no puede convertirse en un run limpio.
+    if let Some(detail) = run_id
+        .as_deref()
+        .map(|rid| permission_audit_failure(store, thread_id, rid))
+        .transpose()?
+        .flatten()
     {
         let mut a = TaskAttention::new(
             &thread,
             AttentionStatus::IntegrityHold,
             "revisar estado",
-            "checkpoint.prepared y checkpoint.ready se contradicen",
+            format!("fallo de auditoría de permiso: {detail}"),
         )
-        .with_run(run_state);
-        a.snapshot_id = Some(ready.snapshot_id.clone());
-        a.source_oid = Some(ready.oid.clone());
+        .with_run(run_state, run_id.clone());
+        if let Some((_, ready)) = ready.as_ref() {
+            a.snapshot_id = Some(ready.snapshot_id.clone());
+            a.source_oid = Some(ready.oid.clone());
+        }
         return Ok(a);
     }
 
-    let pending_prepared = latest_pending_prepared(store, thread_id)?;
-    let integration = latest_integration(store, thread_id)?;
-    let permission = pending_permission(store, thread_id, run_active, run_live)?;
-
-    // 1) Permiso: solo si el run que lo pidió sigue vivo.
+    let permission = match run_id.as_deref() {
+        Some(rid) => pending_permission(store, thread_id, rid)?,
+        None => None,
+    };
     if let Some(title) = permission {
-        let mut a = TaskAttention::new(
-            &thread,
-            AttentionStatus::PermissionPending,
-            "responder permiso",
-            format!("el agente espera autorización: {title}"),
-        )
-        .with_run(run_state);
+        let (status, action, reason) = if run_active && run_live {
+            (
+                AttentionStatus::PermissionPending,
+                "responder permiso",
+                format!("el agente espera autorización: {title}"),
+            )
+        } else if run_active {
+            (
+                AttentionStatus::RecoveryRequired,
+                "aeril recover",
+                format!("hay un permiso sin responder y el supervisor no está vivo: {title}"),
+            )
+        } else {
+            (
+                AttentionStatus::IntegrityHold,
+                "revisar estado",
+                format!("permission.requested sin respuesta durable al cierre del run: {title}"),
+            )
+        };
+        let mut a =
+            TaskAttention::new(&thread, status, action, reason).with_run(run_state, run_id.clone());
         if let Some((_, ready)) = ready.as_ref() {
             a.snapshot_id = Some(ready.snapshot_id.clone());
             a.source_oid = Some(ready.oid.clone());
@@ -499,7 +598,7 @@ pub fn project_thread(store: &Store, thread_id: &str) -> Result<TaskAttention> {
             "aeril recover",
             "hay un checkpoint preparado sin resolver",
         )
-        .with_run(run_state);
+        .with_run(run_state, run_id.clone());
         if let Some((_, ready)) = ready.as_ref() {
             a.snapshot_id = Some(ready.snapshot_id.clone());
             a.source_oid = Some(ready.oid.clone());
@@ -516,7 +615,7 @@ pub fn project_thread(store: &Store, thread_id: &str) -> Result<TaskAttention> {
             "aeril recover",
             "el run figura activo pero no tiene un supervisor vivo",
         )
-        .with_run(run_state));
+        .with_run(run_state, run_id.clone()));
     }
 
     // 4) Checkpoint listo: integración, revisión y validación exactas.
@@ -527,9 +626,15 @@ pub fn project_thread(store: &Store, thread_id: &str) -> Result<TaskAttention> {
             "revisar cambios",
             String::new(),
         )
-        .with_run(run_state.clone());
+        .with_run(run_state.clone(), run_id.clone());
         a.snapshot_id = Some(ready.snapshot_id.clone());
         a.source_oid = Some(ready.oid.clone());
+        a.checkpoint_run_id = ready_ev.run_id.clone();
+        a.historical_checkpoint = match (&a.checkpoint_run_id, &run_id) {
+            (Some(checkpoint_run), Some(latest_run)) => checkpoint_run != latest_run,
+            (None, Some(_)) => true,
+            _ => false,
+        };
 
         if let Some(event) = integration.as_ref()
             && event.seq() > ready_ev.seq
@@ -557,11 +662,14 @@ pub fn project_thread(store: &Store, thread_id: &str) -> Result<TaskAttention> {
                             "observar progreso",
                             "el checkpoint anterior está integrado; hay un run nuevo en curso",
                         ),
-                        _ => a.set(
-                            AttentionStatus::Done,
-                            "ninguna",
-                            "el checkpoint ya está integrado en la rama destino",
-                        ),
+                        _ => {
+                            a.set(
+                                AttentionStatus::Done,
+                                "ninguna",
+                                "el checkpoint ya está integrado en la rama destino",
+                            );
+                            a.status_label = "integrado".into();
+                        }
                     }
                     return Ok(a);
                 }
@@ -637,8 +745,8 @@ pub fn project_thread(store: &Store, thread_id: &str) -> Result<TaskAttention> {
             ValidationState::Passed => {
                 a.set(
                     AttentionStatus::ReadyToIntegrate,
-                    "preview e integrar",
-                    "revisión y validación verificadas para el snapshot exacto",
+                    "abrir preview de integración",
+                    "revisión y validación verificadas; la elegibilidad Git la decide el preview",
                 );
             }
         }
@@ -653,35 +761,35 @@ pub fn project_thread(store: &Store, thread_id: &str) -> Result<TaskAttention> {
             "revisar fallo",
             "el último run falló",
         )
-        .with_run(run_state)),
+        .with_run(run_state, run_id.clone())),
         Some("cancelled") => Ok(TaskAttention::new(
             &thread,
             AttentionStatus::Failed,
             "revisar cancelación",
             "el último run fue cancelado",
         )
-        .with_run(run_state)),
+        .with_run(run_state, run_id.clone())),
         Some("completed") => Ok(TaskAttention::new(
             &thread,
             AttentionStatus::Done,
             "ninguna",
             "el run terminó sin un checkpoint pendiente",
         )
-        .with_run(run_state)),
+        .with_run(run_state, run_id.clone())),
         Some(_) if run_active => Ok(TaskAttention::new(
             &thread,
             AttentionStatus::InProgress,
             "observar progreso",
             "el agente está trabajando; todavía no hay checkpoint",
         )
-        .with_run(run_state)),
+        .with_run(run_state, run_id.clone())),
         Some(_) => Ok(TaskAttention::new(
             &thread,
             AttentionStatus::NoRun,
             "iniciar run",
             "todavía no hay trabajo revisable",
         )
-        .with_run(run_state)),
+        .with_run(run_state, run_id.clone())),
         None => Ok(TaskAttention::new(
             &thread,
             AttentionStatus::NoRun,
