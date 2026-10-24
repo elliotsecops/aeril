@@ -1,6 +1,7 @@
 //! CLI de Aeril: subcomandos para el flujo completo sin TUI (tests y scripts).
 
 use crate::agent;
+use crate::attention;
 use crate::bench;
 use crate::checkpoint;
 use crate::error::{Error, Result};
@@ -151,6 +152,8 @@ fn dispatch(args: &[String], t0: Instant) -> Result<i32> {
         Some("run") => cmd_run(&p, &data_dir, &db_path),
         Some("checkpoint") => cmd_checkpoint(&p, &db_path),
         Some("comment") => cmd_comment(&p, &db_path),
+        Some("review") => cmd_review(&p, &db_path),
+        Some("attention") => cmd_attention(&p, &db_path),
         Some("feedback") => cmd_feedback(&p, &data_dir, &db_path),
         Some("recover") => cmd_recover(&p, &db_path),
         Some("lease") => cmd_lease(&p, &db_path),
@@ -1197,6 +1200,64 @@ fn cmd_integrate_apply(p: &Parsed, db_path: &Path) -> Result<i32> {
     let mut store = open_store(db_path)?;
     let applied = integration::apply(&mut store, &thread_id, &snapshot_id, &to, &source, &expect)?;
     print_json(&serde_json::to_value(applied)?)?;
+    Ok(0)
+}
+
+// ── review ───────────────────────────────────────────────────────────────────
+
+fn cmd_review(p: &Parsed, db_path: &Path) -> Result<i32> {
+    match p.pos.get(1).map(String::as_str) {
+        Some("ack") => {
+            let thread_id = p.require("thread")?;
+            let snapshot_id = p.require("snapshot")?;
+            let mut store = open_store(db_path)?;
+            let (_, ready) = checkpoint::ready_for_snapshot(&store, &thread_id, &snapshot_id)?
+                .ok_or_else(|| {
+                    Error::not_ready(format!("no hay checkpoint ready {snapshot_id}"))
+                })?;
+            let appended = review::acknowledge(&mut store, &thread_id, &snapshot_id, &ready.oid)?;
+            print_json(&json!({
+                "thread_id": thread_id,
+                "snapshot_id": snapshot_id,
+                "oid": ready.oid,
+                "acknowledged": true,
+                "new_event": appended,
+            }))?;
+            Ok(0)
+        }
+        Some(other) => Err(Error::invalid(format!(
+            "review {other:?} no soportado (ack)"
+        ))),
+        None => Err(Error::invalid("review requiere subcomando (ack)")),
+    }
+}
+
+// ── attention ────────────────────────────────────────────────────────────────
+
+fn cmd_attention(p: &Parsed, db_path: &Path) -> Result<i32> {
+    let limit: i64 = p
+        .flag("limit")
+        .map(|v| v.parse())
+        .transpose()
+        .map_err(|_| Error::invalid("--limit inválido"))?
+        .unwrap_or(200);
+    let store = open_store(db_path)?;
+    let items = attention::project_all(&store, limit)?;
+    if p.yes("json") {
+        print_json(&serde_json::to_value(items)?)?;
+        return Ok(0);
+    }
+    if items.is_empty() {
+        println!("No tasks.");
+        return Ok(0);
+    }
+    for item in &items {
+        println!("{}", item.thread_title);
+        println!("  {} · → {}", item.status_label, item.next_action);
+        if !item.reason.is_empty() {
+            println!("  {}", item.reason);
+        }
+    }
     Ok(0)
 }
 

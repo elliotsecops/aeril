@@ -47,6 +47,7 @@ pub const K_INTEGRATION_REQUESTED: &str = "integration.requested";
 pub const K_INTEGRATION_COMPLETED: &str = "integration.completed";
 pub const K_INTEGRATION_BLOCKED: &str = "integration.blocked";
 pub const K_VALIDATION_RECORDED: &str = "validation.recorded";
+pub const K_REVIEW_ACKNOWLEDGED: &str = "review.acknowledged";
 
 // ── payloads tipados (v1) ────────────────────────────────────────────────────
 pub mod payload {
@@ -348,6 +349,12 @@ pub mod payload {
         #[serde(default)]
         pub target_oid_current: Option<String>,
         pub reason: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Default)]
+    pub struct ReviewAcknowledged {
+        pub snapshot_id: String,
+        pub oid: String,
     }
 
     #[derive(Debug, Serialize, Deserialize, Default)]

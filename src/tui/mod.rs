@@ -2,6 +2,7 @@
 //! Mantiene las acciones del corte vertical (comentar, feedback, integrar y
 //! cancelar) sobre el estado durable de la Fase 0/1.
 
+use crate::attention;
 use crate::bench;
 use crate::checkpoint;
 use crate::error::{Error, Result};
@@ -121,6 +122,7 @@ pub struct App {
     pub db_path: PathBuf,
     pub threads: Vec<ThreadRow>,
     pub run_summaries: HashMap<String, ThreadRunSummary>,
+    pub attention: HashMap<String, attention::TaskAttention>,
     pub thread_sel: usize,
     pub detail: Option<ThreadDetail>,
     pub mode: Mode,
@@ -150,6 +152,10 @@ impl App {
             .or_else(|| self.threads.get(self.thread_sel).map(|t| t.id.clone()));
         self.threads = threads::list_projection(&self.store.conn, 200)?;
         self.run_summaries = threads::run_summaries(&self.store.conn, 200)?;
+        self.attention = attention::project_all(&self.store, 200)?
+            .into_iter()
+            .map(|a| (a.thread_id.clone(), a))
+            .collect();
         if let Some(id) = prev_sel_id
             && let Some(idx) = self.threads.iter().position(|t| t.id == id)
         {
@@ -516,6 +522,47 @@ impl App {
         Ok(())
     }
 
+    /// Marca explícitamente revisado el checkpoint seleccionado (o el último
+    /// ready). Es el hecho durable que usa Attention; no mueve refs.
+    fn mark_reviewed(&mut self) -> Result<()> {
+        let Some(detail) = self.detail.as_ref() else {
+            self.status = "abrí un thread para marcar un checkpoint revisado".into();
+            return Ok(());
+        };
+        let thread_id = detail.thread_id.clone();
+        let selected = detail
+            .events
+            .get(detail.sel)
+            .filter(|ev| ev.kind == events::K_CHECKPOINT_READY)
+            .cloned();
+        let ready = match selected {
+            Some(ev) => match ev.parse::<events::payload::CheckpointReady>() {
+                Ok(ready) => ready,
+                Err(e) => {
+                    self.status = format!("checkpoint seleccionado ilegible: {e}");
+                    return Ok(());
+                }
+            },
+            None => match checkpoint::latest_ready(&self.store, &thread_id)? {
+                Some((_, ready)) => ready,
+                None => {
+                    self.status = "no hay checkpoint ready para marcar revisado".into();
+                    return Ok(());
+                }
+            },
+        };
+        match review::acknowledge(&mut self.store, &thread_id, &ready.snapshot_id, &ready.oid) {
+            Ok(true) => {
+                self.status = format!("checkpoint {} marcado revisado", &ready.snapshot_id[..8]);
+                self.reload_threads()?;
+            }
+            Ok(false) => self.status = "el checkpoint ya estaba marcado revisado".into(),
+            Err(e) => self.status = format!("no se pudo marcar revisado: {e}"),
+        }
+        self.refresh_detail()?;
+        Ok(())
+    }
+
     /// `y` es la única tecla que ejecuta la operación. Revalida preview,
     /// snapshot, validación, review y target pinned antes del CAS.
     fn confirm_integration(&mut self) -> Result<()> {
@@ -874,6 +921,7 @@ impl App {
                     self.detail = None;
                 }
                 KeyCode::Char('c') => self.start_comment()?,
+                KeyCode::Char('a') => self.mark_reviewed()?,
                 KeyCode::Char('n') => self.start_run_prompt()?,
                 KeyCode::Char('f') => self.send_feedback()?,
                 KeyCode::Char('i') => self.start_integrate()?,
@@ -923,6 +971,10 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
 
     let threads = threads::list_projection(&store.conn, 200)?;
     let run_summaries = threads::run_summaries(&store.conn, 200)?;
+    let attention = attention::project_all(&store, 200)?
+        .into_iter()
+        .map(|a| (a.thread_id.clone(), a))
+        .collect();
     let (ui_tx, ui_rx) = mpsc::channel();
     let mut app = App {
         store,
@@ -930,6 +982,7 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
         db_path: db_path.clone(),
         threads,
         run_summaries,
+        attention,
         thread_sel: 0,
         detail: None,
         mode: Mode::Normal,
@@ -1208,9 +1261,9 @@ fn render(f: &mut Frame, app: &mut App) {
         }
     } else {
         let body = Layout::horizontal([
-            Constraint::Percentage(24),
+            Constraint::Percentage(28),
             Constraint::Percentage(44),
-            Constraint::Percentage(32),
+            Constraint::Percentage(28),
         ])
         .split(chunks[1]);
         render_tasks(f, app, body[0]);
@@ -1268,6 +1321,7 @@ fn render_integration_preview(
     };
     let review = match preview.review {
         integration::ReviewState::Clear => "clear".to_string(),
+        integration::ReviewState::Required => "required — press `a` in Aeril".into(),
         integration::ReviewState::Pending => {
             format!("{} unresolved comment(s)", preview.unresolved_comments)
         }
@@ -1453,10 +1507,23 @@ fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let running = running_thread_count(app);
-    let summary = if area.width >= 34 {
-        format!("{} total  ·  {} running ", app.threads.len(), running)
+    let attention_count = app.attention.values().filter(|a| a.is_actionable()).count();
+    let summary = if area.width >= 46 {
+        format!(
+            "{} total · {} attention · {} running ",
+            app.threads.len(),
+            attention_count,
+            running
+        )
+    } else if area.width >= 32 {
+        format!(
+            "{} · {} attn · {} run ",
+            app.threads.len(),
+            attention_count,
+            running
+        )
     } else {
-        format!("{} · {} active ", app.threads.len(), running)
+        format!("{} · {} attn ", app.threads.len(), attention_count)
     };
     let block = panel();
     let inner = block.inner(area).inner(Margin {
@@ -1511,14 +1578,26 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         .iter()
         .enumerate()
         .map(|(idx, thread)| {
-            let (state, color) = task_state(app, &thread.id);
+            let (state, state_color) = task_state(app, &thread.id);
+            let att = app.attention.get(&thread.id);
+            let color = att
+                .map(|a| match a.priority {
+                    0..=3 => MAGENTA,
+                    4..=6 => YELLOW,
+                    7 => GREEN,
+                    _ => MUTED,
+                })
+                .unwrap_or(state_color);
             let summary = app.run_summaries.get(&thread.id);
             let elapsed = elapsed_for(summary);
             let selected = idx == app.thread_sel;
             let branch = summary
                 .and_then(|s| s.latest_branch.clone())
                 .unwrap_or_else(|| "—".into());
-            let status = format!("{state}  ·  {elapsed}");
+            let label = att
+                .map(|a| a.status_label.as_str())
+                .unwrap_or(state.as_str());
+            let status = format!("{label}  ·  {elapsed}");
             let mut status_line = vec![
                 Span::styled("      ", Style::default()),
                 Span::styled(status.clone(), Style::default().fg(color)),
@@ -1546,15 +1625,25 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 status_line.push(Span::raw(" ".repeat(padding)));
                 status_line.push(Span::styled(branch_text, Style::default().fg(DIM)));
                 lines.push(Line::from(status_line));
-            } else if compact_items {
-                lines.push(Line::from(status_line));
             } else {
                 lines.push(Line::from(status_line));
+                if !compact_items {
+                    lines.push(Line::from(vec![
+                        Span::styled("      ", Style::default()),
+                        Span::styled(
+                            format!("↳ {}", truncate_chars(&branch, title_width.max(8))),
+                            Style::default().fg(DIM),
+                        ),
+                    ]));
+                }
+            }
+            if let Some(att) = att {
+                let action = format!("→ {}", att.next_action);
                 lines.push(Line::from(vec![
                     Span::styled("      ", Style::default()),
                     Span::styled(
-                        format!("↳ {}", truncate_chars(&branch, title_width.max(8))),
-                        Style::default().fg(DIM),
+                        truncate_chars(&action, list_area.width.saturating_sub(6).max(8) as usize),
+                        Style::default().fg(color),
                     ),
                 ]));
             }
@@ -2334,6 +2423,8 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     Span::raw(" refresh   "),
                     key_badge("c"),
                     Span::raw(" comment   "),
+                    key_badge("a"),
+                    Span::raw(" reviewed   "),
                     key_badge("x"),
                     Span::raw(" cancel   "),
                     key_badge("?"),
@@ -2462,7 +2553,7 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 if compact {
                     "↑↓ select · Enter open · n run · c comment · Tab view · r refresh · q quit"
                 } else {
-                    "↑↓ select · Enter open · n run · c comment · f feedback · i integrate · x cancel · PgUp/PgDn patch · r refresh · q quit"
+                    "↑↓ select · Enter open · n run · c comment · a reviewed · f feedback · i integrate · x cancel · PgUp/PgDn patch · r refresh · q quit"
                 },
                 Style::default().fg(MUTED),
             )),

@@ -344,6 +344,84 @@ pub fn open_comment_ids_for_snapshot(
     Ok(out)
 }
 
+/// Marca explícitamente un checkpoint como revisado por un humano. Es un
+/// hecho durable exacto al snapshot/OID, no una inferencia por ausencia de
+/// comentarios. Idempotente para el mismo snapshot/OID.
+pub fn acknowledge(
+    store: &mut Store,
+    thread_id: &str,
+    snapshot_id: &str,
+    oid: &str,
+) -> Result<bool> {
+    // El acknowledgement solo puede referirse a un checkpoint listo real y a
+    // su OID exacto. Una llamada de biblioteca no puede inventar identidades.
+    let (_, ready) = crate::checkpoint::ready_for_snapshot(store, thread_id, snapshot_id)?
+        .ok_or_else(|| Error::not_ready(format!("no hay checkpoint ready {snapshot_id}")))?;
+    if ready.oid != oid {
+        return Err(Error::integrity(format!(
+            "el checkpoint {snapshot_id} tiene OID {}, no {oid}",
+            ready.oid
+        )));
+    }
+    let open = open_comment_ids_for_snapshot(store, thread_id, snapshot_id, oid)?;
+    if !open.is_empty() {
+        return Err(Error::conflict(format!(
+            "hay {} comentario(s) sin resolver en el snapshot; resolvelos antes de marcarlo revisado",
+            open.len()
+        )));
+    }
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let exists: i64 = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE thread_id = ?1 AND kind = ?2
+              AND json_extract(payload, '$.snapshot_id') = ?3
+              AND json_extract(payload, '$.oid') = ?4
+        )",
+        rusqlite::params![thread_id, events::K_REVIEW_ACKNOWLEDGED, snapshot_id, oid],
+        |row| row.get(0),
+    )?;
+    if exists == 1 {
+        tx.rollback()?;
+        return Ok(false);
+    }
+    events::append_tx(
+        &tx,
+        thread_id,
+        None,
+        events::K_REVIEW_ACKNOWLEDGED,
+        "human",
+        &serde_json::to_value(payload::ReviewAcknowledged {
+            snapshot_id: snapshot_id.to_string(),
+            oid: oid.to_string(),
+        })?,
+        crate::timeutil::now_ms(),
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// ¿El snapshot/OID exacto tiene un acknowledgement humano durable?
+///
+/// No depende del `seq`: el acknowledgement identifica bytes inmutables
+/// (snapshot + OID). Un ready recuperado con la misma identidad no invalida
+/// una revisión ya registrada.
+pub fn acknowledged(store: &Store, thread_id: &str, snapshot_id: &str, oid: &str) -> Result<bool> {
+    let exists: i64 = store.conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE thread_id = ?1 AND kind = ?2
+              AND json_extract(payload, '$.snapshot_id') = ?3
+              AND json_extract(payload, '$.oid') = ?4
+        )",
+        rusqlite::params![thread_id, events::K_REVIEW_ACKNOWLEDGED, snapshot_id, oid],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
 pub fn resolve(store: &mut Store, thread_id: &str, comment_id: &str) -> Result<()> {
     let ev = events::fetch_by_id(&store.conn, thread_id, comment_id)?
         .ok_or_else(|| Error::not_found(format!("comentario {comment_id}")))?;
