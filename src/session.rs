@@ -1537,6 +1537,8 @@ pub fn integrate(
             target_branch: target_branch.to_string(),
             source_oid: ready.oid.clone(),
             target_oid_expected: expect.clone(),
+            owner_pid: Some(std::process::id() as i64),
+            owner_pid_start: leases::process_start_time(std::process::id() as i64),
         },
     )?;
     crash::point("integrate_intent");
@@ -1599,6 +1601,24 @@ pub enum IntegrationReconcile {
     },
 }
 
+/// Un request pertenece a un proceso VIVO solo si el PID existe y, cuando
+/// hay starttime durable, coincide. Un `/proc` ilegible con starttime
+/// registrado se trata como vivo (conservador): nunca se finaliza el intento
+/// de un dueño que podría seguir operando.
+fn integration_owner_alive(requested: &payload::IntegrationRequested) -> bool {
+    let Some(pid) = requested.owner_pid else {
+        return false; // evento legacy: Conserva la reconciliación histórica.
+    };
+    if !leases::pid_alive(pid) {
+        return false;
+    }
+    match (requested.owner_pid_start, leases::process_start_time(pid)) {
+        (Some(expected), Some(actual)) => expected == actual,
+        (Some(_), None) => true,
+        (None, _) => true,
+    }
+}
+
 /// Reconcilia `integration.requested` sin resolución. Idempotente frente a
 /// reconciliaciones concurrentes (el append re-chequea dentro de la tx).
 /// Nunca mueve refs: solo registra lo que la ref demuestra.
@@ -1656,6 +1676,9 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
 
     let mut outcomes = Vec::new();
     for p in pending {
+        if integration_owner_alive(&p.requested) {
+            continue; // el dueño sigue vivo: no fabricar una resolución
+        }
         let Some(repo) = git::open(Path::new(&p.repo_path)).ok() else {
             continue; // repo no disponible: sigue pendiente, sin inventar nada
         };

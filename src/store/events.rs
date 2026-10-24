@@ -321,6 +321,13 @@ pub mod payload {
         pub target_branch: String,
         pub source_oid: String,
         pub target_oid_expected: String,
+        /// Dueño del intento: permite que la reconciliación no finalice el
+        /// request de un proceso que sigue vivo. Campos opcionales para
+        /// compatibilidad con eventos históricos.
+        #[serde(default)]
+        pub owner_pid: Option<i64>,
+        #[serde(default)]
+        pub owner_pid_start: Option<u64>,
     }
 
     #[derive(Debug, Serialize, Deserialize, Default)]

@@ -3,11 +3,12 @@
 mod common;
 
 use aeril::integration::{self, IntegrationStatus, ValidationState};
+use aeril::session;
 use aeril::store::{Store, events};
 use common::pty::TuiPty;
 use common::*;
 use serde_json::{Value, json};
-use std::process::Output;
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 struct Fx {
@@ -1090,4 +1091,56 @@ fn i15c_preview_is_legible_at_supported_terminal_sizes() {
         pty.pump(100);
         pty.kill();
     }
+}
+
+// ── I13c: reconciliation must not finalize a live owner ────────────────────
+
+#[test]
+fn i13c_reconcile_skips_live_owner_and_recovers_dead_owner() {
+    let env = TestEnv::new("p2s1-i13c");
+    let base = env.head_oid();
+    env.update_ref("refs/heads/destino", &base);
+    let live = env.thread_new("live owner");
+    let dead = env.thread_new("dead owner");
+    let mut store = Store::open(&env.data.join("aeril.db")).unwrap();
+    let append = |store: &mut Store, thread: &str, pid: i64, start: Option<u64>| {
+        events::append_typed(
+            &mut store.conn,
+            thread,
+            None,
+            events::K_INTEGRATION_REQUESTED,
+            "system",
+            &events::payload::IntegrationRequested {
+                target_branch: "destino".into(),
+                source_oid: "1".repeat(40),
+                target_oid_expected: base.clone(),
+                owner_pid: Some(pid),
+                owner_pid_start: start,
+            },
+        )
+        .unwrap();
+    };
+    let live_pid = std::process::id() as i64;
+    append(
+        &mut store,
+        &live,
+        live_pid,
+        aeril::store::leases::process_start_time(live_pid),
+    );
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead_pid = child.id() as i64;
+    child.wait().unwrap();
+    append(&mut store, &dead, dead_pid, Some(1));
+    let outcomes = session::reconcile_integrations(&mut store).unwrap();
+    assert_eq!(outcomes.len(), 1, "solo el dueño muerto se reconcilia");
+    assert!(matches!(
+        outcomes[0],
+        session::IntegrationReconcile::Abandoned { .. }
+    ));
+    let blocked_live =
+        events::fetch_by_kind(&store.conn, &live, events::K_INTEGRATION_BLOCKED).unwrap();
+    let blocked_dead =
+        events::fetch_by_kind(&store.conn, &dead, events::K_INTEGRATION_BLOCKED).unwrap();
+    assert!(blocked_live.is_empty(), "el dueño vivo no se finaliza");
+    assert_eq!(blocked_dead.len(), 1);
 }
