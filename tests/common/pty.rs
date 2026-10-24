@@ -19,12 +19,23 @@ pub struct TuiPty {
 impl TuiPty {
     /// Lanza la TUI (`aeril` sin subcomando) conectada a un PTY de 120x40.
     pub fn spawn(env: &TestEnv, args: &[&str], extra_env: &[(&str, &str)]) -> TuiPty {
+        Self::spawn_sized(env, args, extra_env, 40, 120)
+    }
+
+    /// Igual que [`spawn`] con un tamaño de terminal explícito (rows, cols).
+    pub fn spawn_sized(
+        env: &TestEnv,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+        rows: u16,
+        cols: u16,
+    ) -> TuiPty {
         unsafe {
             let mut master: libc::c_int = -1;
             let mut slave: libc::c_int = -1;
             let winsz = libc::winsize {
-                ws_row: 40,
-                ws_col: 120,
+                ws_row: rows,
+                ws_col: cols,
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             };

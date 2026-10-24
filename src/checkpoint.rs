@@ -933,6 +933,19 @@ pub fn latest_ready(
     Ok(Some((ev, parsed)))
 }
 
+/// Prepared payload exacto de un snapshot (intención durable original).
+/// Devuelve `None` si no existe; un payload ilegible se propaga como error.
+pub fn prepared_for_snapshot(
+    store: &Store,
+    thread_id: &str,
+    snapshot_id: &str,
+) -> Result<Option<payload::CheckpointPrepared>> {
+    Ok(
+        prepared_for_snapshot_conn(&store.conn, thread_id, snapshot_id)?
+            .map(|(_, prepared)| prepared),
+    )
+}
+
 pub fn ready_for_snapshot(
     store: &Store,
     thread_id: &str,

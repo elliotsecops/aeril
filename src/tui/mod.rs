@@ -6,6 +6,7 @@ use crate::bench;
 use crate::checkpoint;
 use crate::error::{Error, Result};
 use crate::git;
+use crate::integration;
 use crate::review;
 use crate::session::{self, PermissionPolicySetting, RunOptions, Runner, UiNote};
 use crate::store::Store;
@@ -17,7 +18,9 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Layout, Margin};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -58,6 +61,9 @@ pub enum Mode {
     BranchInput {
         buf: String,
         snapshot_id: String,
+    },
+    IntegrationPreview {
+        preview: Box<integration::IntegrationPreview>,
     },
     /// S3: captura del objetivo de un run nuevo en el thread abierto.
     RunInput {
@@ -440,8 +446,25 @@ impl App {
             return Ok(());
         };
         let thread_id = detail.thread_id.clone();
-        match checkpoint::latest_ready(&self.store, &thread_id)? {
-            Some((_, ready)) => {
+        // Si el usuario seleccionó un checkpoint.ready en el timeline, ese es
+        // el snapshot elegido. Si no, se elige latest_ready UNA vez y se pinea.
+        let selected = detail
+            .events
+            .get(detail.sel)
+            .filter(|ev| ev.kind == events::K_CHECKPOINT_READY)
+            .cloned();
+        let ready = match selected {
+            Some(ev) => match ev.parse::<events::payload::CheckpointReady>() {
+                Ok(ready) => Some(ready),
+                Err(e) => {
+                    self.status = format!("checkpoint seleccionado ilegible: {e}");
+                    return Ok(());
+                }
+            },
+            None => checkpoint::latest_ready(&self.store, &thread_id)?.map(|(_, ready)| ready),
+        };
+        match ready {
+            Some(ready) => {
                 self.mode = Mode::BranchInput {
                     buf: "main".into(),
                     snapshot_id: ready.snapshot_id,
@@ -455,6 +478,7 @@ impl App {
         }
     }
 
+    /// Enter en BranchInput SOLO calcula el preview read-only. Nunca mueve refs.
     fn submit_integrate(&mut self) -> Result<()> {
         let Mode::BranchInput { buf, snapshot_id } =
             std::mem::replace(&mut self.mode, Mode::Normal)
@@ -470,12 +494,74 @@ impl App {
             self.status = "rama destino vacía".into();
             return Ok(());
         }
-        match session::integrate(&mut self.store, &thread_id, &snapshot_id, &target, None) {
+        match integration::preview(&self.store, &thread_id, &snapshot_id, &target) {
+            Ok(preview) => {
+                self.status = if preview.eligible {
+                    "preview listo: y confirma · Esc cancela".into()
+                } else {
+                    format!(
+                        "preview: {} · {}",
+                        preview.status_label(),
+                        preview.reason.clone().unwrap_or_default()
+                    )
+                };
+                self.mode = Mode::IntegrationPreview {
+                    preview: Box::new(preview),
+                };
+            }
+            Err(e) => {
+                self.status = format!("preview falló: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// `y` es la única tecla que ejecuta la operación. Revalida preview,
+    /// snapshot, validación, review y target pinned antes del CAS.
+    fn confirm_integration(&mut self) -> Result<()> {
+        let Mode::IntegrationPreview { preview } = std::mem::replace(&mut self.mode, Mode::Normal)
+        else {
+            return Ok(());
+        };
+        let Some(detail) = self.detail.as_ref() else {
+            self.status = "no hay thread abierto: integración cancelada".into();
+            return Ok(());
+        };
+        if detail.thread_id != preview.thread_id {
+            self.status = "el thread cambió: preview invalidado, generá uno nuevo".into();
+            return Ok(());
+        }
+        if !preview.eligible {
+            self.status = format!(
+                "no confirmable: {}",
+                preview.reason.clone().unwrap_or_else(|| "bloqueado".into())
+            );
+            return Ok(());
+        }
+        let (Some(source), Some(target)) = (&preview.source_oid, &preview.target_oid) else {
+            self.status = "preview sin identidades completas: cancelado".into();
+            return Ok(());
+        };
+        match integration::apply(
+            &mut self.store,
+            &preview.thread_id,
+            &preview.snapshot_id,
+            &preview.target_branch,
+            source,
+            target,
+        ) {
+            Ok(outcome) if outcome.noop => {
+                self.status = format!(
+                    "ya integrado: {} apunta a {}",
+                    outcome.target_branch, outcome.target_oid_after
+                );
+            }
             Ok(outcome) => {
                 self.status = format!(
-                    "integrado fast-forward a {target}: {} → {}",
-                    &outcome.target_oid_before[..8],
-                    &outcome.target_oid_after[..8]
+                    "integrado fast-forward a {}: {} → {}",
+                    outcome.target_branch,
+                    &outcome.target_oid_before[..8.min(outcome.target_oid_before.len())],
+                    &outcome.target_oid_after[..8.min(outcome.target_oid_after.len())]
                 );
             }
             Err(e) => {
@@ -695,6 +781,16 @@ impl App {
                     buf.pop();
                 }
                 KeyCode::Char(c) => buf.push(c),
+                _ => {}
+            },
+            Mode::IntegrationPreview { .. } => match key.code {
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.mode = Mode::Normal;
+                    self.status = "integración cancelada (sin cambios)".into();
+                }
+                KeyCode::Char('y') => self.confirm_integration()?,
+                // Enter y cualquier otra tecla NO ejecutan: la confirmación
+                // explícita es obligatoria.
                 _ => {}
             },
             Mode::RunInput { buf } => match key.code {
@@ -1122,6 +1218,171 @@ fn render(f: &mut Frame, app: &mut App) {
         render_checkpoint(f, app, body[2]);
     }
     render_footer(f, app, chunks[2]);
+    if let Mode::IntegrationPreview { preview } = &app.mode {
+        render_integration_preview(f, preview, f.area());
+    }
+}
+
+fn render_integration_preview(
+    f: &mut Frame,
+    preview: &integration::IntegrationPreview,
+    area: ratatui::layout::Rect,
+) {
+    let width = if area.width >= 120 {
+        104
+    } else {
+        area.width.saturating_sub(4).max(40)
+    };
+    let height = if area.height >= 36 {
+        22
+    } else {
+        area.height.saturating_sub(4).max(12)
+    };
+    let rect = ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    };
+    f.render_widget(Clear, rect);
+    let accent = if preview.eligible { GREEN } else { RED };
+    let short = |s: &str| s[..12.min(s.len())].to_string();
+    let validation = match preview.validation {
+        integration::ValidationState::Passed => format!(
+            "PASS — {}",
+            preview
+                .validation_command
+                .as_deref()
+                .unwrap_or("validation")
+        ),
+        integration::ValidationState::Missing => "MISSING — ejecutá la instrucción inferior".into(),
+        integration::ValidationState::Failed
+        | integration::ValidationState::WrongOid
+        | integration::ValidationState::Invalid => format!(
+            "BLOCKED — {}",
+            preview
+                .reason
+                .clone()
+                .unwrap_or_else(|| "evidencia inválida".into())
+        ),
+    };
+    let review = match preview.review {
+        integration::ReviewState::Clear => "clear".to_string(),
+        integration::ReviewState::Pending => {
+            format!("{} unresolved comment(s)", preview.unresolved_comments)
+        }
+        integration::ReviewState::Invalid => "invalid evidence".into(),
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            "Integration preview",
+            Style::default()
+                .fg(TEXT_BRIGHT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Thread      ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{} ({})", preview.thread_title, short(&preview.thread_id)),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Snapshot    ", Style::default().fg(MUTED)),
+            Span::styled(short(&preview.snapshot_id), Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("Source      ", Style::default().fg(MUTED)),
+            Span::styled(
+                preview
+                    .source_oid
+                    .as_deref()
+                    .map(short)
+                    .unwrap_or_else(|| "—".into()),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Target      ", Style::default().fg(MUTED)),
+            Span::styled(preview.target_branch.clone(), Style::default().fg(TEXT)),
+            Span::styled("  @ ", Style::default().fg(MUTED)),
+            Span::styled(
+                preview
+                    .target_oid
+                    .as_deref()
+                    .map(short)
+                    .unwrap_or_else(|| "—".into()),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Files       ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{} changed", preview.files_changed),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled("   Changes ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("+{} / -{}", preview.additions, preview.deletions),
+                Style::default().fg(TEXT),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Validation  ", Style::default().fg(MUTED)),
+            Span::styled(validation, Style::default().fg(accent)),
+        ]),
+        Line::from(vec![
+            Span::styled("Review      ", Style::default().fg(MUTED)),
+            Span::styled(review, Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("Git         ", Style::default().fg(MUTED)),
+            Span::styled(
+                preview.status_label(),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            preview.reason.clone().unwrap_or_else(|| {
+                if preview.eligible {
+                    "Fast-forward verificado. La ref solo se moverá con [y].".into()
+                } else {
+                    "Operación bloqueada: no se moverá ninguna ref.".into()
+                }
+            }),
+            Style::default().fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            if preview.validation == integration::ValidationState::Missing {
+                preview.validation_instruction.clone()
+            } else {
+                String::new()
+            },
+            Style::default().fg(YELLOW),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            if preview.eligible {
+                "[y] Confirm fast-forward    [Esc] Cancel"
+            } else {
+                "[Esc] Close"
+            },
+            Style::default().fg(TEXT_BRIGHT),
+        )),
+    ];
+    let block = Block::default()
+        .title(" assisted integration ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent))
+        .style(Style::default().bg(PANEL_BG));
+    f.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        rect,
+    );
 }
 
 fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -2130,9 +2391,9 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Mode::BranchInput { .. } => (
             Line::from(Span::styled(
                 if compact {
-                    "INTEGRAR FF · Enter ejecuta · Esc cancela"
+                    "INTEGRAR · Enter inspecciona · Esc cancela"
                 } else {
-                    "INTEGRAR fast-forward: escribí la rama destino · Enter ejecuta · Esc cancela"
+                    "INTEGRAR fast-forward: rama destino · Enter abre preview · Esc cancela"
                 },
                 Style::default().fg(MAGENTA),
             )),
@@ -2145,6 +2406,35 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     }
                 ),
                 Style::default().fg(TEXT_BRIGHT),
+            )),
+        ),
+        Mode::IntegrationPreview { preview } => (
+            Line::from(vec![
+                Span::styled("INTEGRACIÓN ", Style::default().fg(MAGENTA)),
+                Span::styled(
+                    preview.status_label(),
+                    Style::default().fg(if preview.eligible { GREEN } else { RED }),
+                ),
+                Span::styled(
+                    if preview.eligible {
+                        " · [y] confirmar   [Esc] cancelar"
+                    } else {
+                        " · [Esc] cerrar"
+                    },
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+            Line::from(Span::styled(
+                preview.reason.clone().unwrap_or_else(|| {
+                    format!(
+                        "{} · {} archivos · +{} / -{}",
+                        preview.target_branch,
+                        preview.files_changed,
+                        preview.additions,
+                        preview.deletions
+                    )
+                }),
+                Style::default().fg(TEXT),
             )),
         ),
         Mode::RunInput { .. } => (

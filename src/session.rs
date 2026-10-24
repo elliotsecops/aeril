@@ -1515,6 +1515,44 @@ pub fn integrate(
     target_branch: &str,
     expect_oid: Option<&str>,
 ) -> Result<git::integrate::IntegrationOutcome> {
+    integrate_inner(
+        store,
+        thread_id,
+        snapshot_id,
+        target_branch,
+        expect_oid,
+        None,
+    )
+}
+
+/// Variante asistida: además del target esperado, exige que el checkpoint
+/// resuelto siga siendo EXACTAMENTE la fuente confirmada en el preview.
+pub fn integrate_pinned(
+    store: &mut Store,
+    thread_id: &str,
+    snapshot_id: &str,
+    target_branch: &str,
+    expect_oid: &str,
+    expected_source_oid: &str,
+) -> Result<git::integrate::IntegrationOutcome> {
+    integrate_inner(
+        store,
+        thread_id,
+        snapshot_id,
+        target_branch,
+        Some(expect_oid),
+        Some(expected_source_oid),
+    )
+}
+
+fn integrate_inner(
+    store: &mut Store,
+    thread_id: &str,
+    snapshot_id: &str,
+    target_branch: &str,
+    expect_oid: Option<&str>,
+    expected_source_oid: Option<&str>,
+) -> Result<git::integrate::IntegrationOutcome> {
     // Antes de una operación nueva, reconciliar intentos interrumpidos de
     // este u otros threads (nunca se fabrica éxito sin evidencia de la ref).
     reconcile_integrations(store)?;
@@ -1522,6 +1560,14 @@ pub fn integrate(
         .ok_or_else(|| Error::not_found(format!("thread {thread_id}")))?;
     let (_, ready) = checkpoint::ready_for_snapshot(store, thread_id, snapshot_id)?
         .ok_or_else(|| Error::not_ready(format!("no hay checkpoint ready {snapshot_id}")))?;
+    if let Some(expected) = expected_source_oid
+        && ready.oid != expected
+    {
+        return Err(Error::integrity(format!(
+            "la fuente del checkpoint cambió: preview {expected}, ahora {}; no se mueve la ref",
+            ready.oid
+        )));
+    }
     let repo = git::open(Path::new(&thread.repo_path))?;
     let expect = expect_oid.unwrap_or(&ready.base_oid).to_string();
 
@@ -1537,27 +1583,66 @@ pub fn integrate(
             target_branch: target_branch.to_string(),
             source_oid: ready.oid.clone(),
             target_oid_expected: expect.clone(),
+            owner_pid: Some(std::process::id() as i64),
+            owner_pid_start: leases::process_start_time(std::process::id() as i64),
         },
     )?;
     crash::point("integrate_intent");
 
     match git::integrate::fast_forward(&repo, target_branch, &ready.oid, &expect) {
-        Ok(outcome) => {
+        Ok(outcome) if outcome.performed => {
             crash::point("integrate_committed");
-            events::append_typed(
-                &mut store.conn,
-                thread_id,
-                None,
-                events::K_INTEGRATION_COMPLETED,
-                "system",
-                &payload::IntegrationCompleted {
+            let completed = payload::IntegrationCompleted {
+                target_branch: target_branch.to_string(),
+                source_oid: ready.oid.clone(),
+                target_oid_before: outcome.target_oid_before.clone(),
+                target_oid_after: outcome.target_oid_after.clone(),
+                recovered: false,
+            };
+            if append_completed_once(store, thread_id, target_branch, &ready.oid, &completed)? {
+                Ok(outcome)
+            } else if expected_source_oid.is_some() {
+                // Asistido: un segundo éxito no se duplica; se resuelve como
+                // no-op terminal.
+                append_integration_blocked(
+                    store,
+                    thread_id,
+                    target_branch,
+                    &ready.oid,
+                    Some(outcome.target_oid_after.clone()),
+                    "ya existía un integration.completed para el mismo target/source; esta llamada no agrega otro éxito",
+                )?;
+                Ok(outcome)
+            } else {
+                // Legacy: conservar el contrato previo sin duplicar completed.
+                Ok(outcome)
+            }
+        }
+        Ok(outcome) => {
+            if expected_source_oid.is_some() {
+                // Asistido: otro writer ya había aplicado el source (o el
+                // target ya estaba en source). No es un éxito nuevo.
+                append_integration_blocked(
+                    store,
+                    thread_id,
+                    target_branch,
+                    &ready.oid,
+                    Some(outcome.target_oid_after.clone()),
+                    "la rama destino ya apuntaba al source; no se movió ninguna ref",
+                )?;
+            } else {
+                // Legacy: el no-op histórico registraba completed; se
+                // conserva ese contrato, deduplicado.
+                crash::point("integrate_committed");
+                let completed = payload::IntegrationCompleted {
                     target_branch: target_branch.to_string(),
                     source_oid: ready.oid.clone(),
                     target_oid_before: outcome.target_oid_before.clone(),
                     target_oid_after: outcome.target_oid_after.clone(),
                     recovered: false,
-                },
-            )?;
+                };
+                append_completed_once(store, thread_id, target_branch, &ready.oid, &completed)?;
+            }
             Ok(outcome)
         }
         Err(blocked) => {
@@ -1583,6 +1668,75 @@ pub fn integrate(
     }
 }
 
+/// Append idempotente del éxito de integración para el mismo thread y
+/// (target, source). Un segundo proceso que ganó el CAS pero encuentra un
+/// completed ya durable no agrega otro éxito.
+fn append_completed_once(
+    store: &mut Store,
+    thread_id: &str,
+    target_branch: &str,
+    source_oid: &str,
+    completed: &payload::IntegrationCompleted,
+) -> Result<bool> {
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let exists: i64 = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE thread_id = ?1 AND kind = ?2
+              AND json_extract(payload, '$.target_branch') = ?3
+              AND json_extract(payload, '$.source_oid') = ?4
+        )",
+        rusqlite::params![
+            thread_id,
+            events::K_INTEGRATION_COMPLETED,
+            target_branch,
+            source_oid
+        ],
+        |row| row.get(0),
+    )?;
+    if exists == 1 {
+        tx.rollback()?;
+        return Ok(false);
+    }
+    events::append_tx(
+        &tx,
+        thread_id,
+        None,
+        events::K_INTEGRATION_COMPLETED,
+        "system",
+        &serde_json::to_value(completed)?,
+        now_ms(),
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn append_integration_blocked(
+    store: &mut Store,
+    thread_id: &str,
+    target_branch: &str,
+    source_oid: &str,
+    target_oid_current: Option<String>,
+    reason: &str,
+) -> Result<()> {
+    events::append_typed(
+        &mut store.conn,
+        thread_id,
+        None,
+        events::K_INTEGRATION_BLOCKED,
+        "system",
+        &payload::IntegrationBlocked {
+            target_branch: target_branch.to_string(),
+            source_oid: source_oid.to_string(),
+            target_oid_current,
+            reason: reason.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
 /// Resultado de reconciliar un intento de integración interrumpido.
 #[derive(Debug)]
 pub enum IntegrationReconcile {
@@ -1599,6 +1753,24 @@ pub enum IntegrationReconcile {
     },
 }
 
+/// Un request pertenece a un proceso VIVO solo si el PID existe y, cuando
+/// hay starttime durable, coincide. Un `/proc` ilegible con starttime
+/// registrado se trata como vivo (conservador): nunca se finaliza el intento
+/// de un dueño que podría seguir operando.
+fn integration_owner_alive(requested: &payload::IntegrationRequested) -> bool {
+    let Some(pid) = requested.owner_pid else {
+        return false; // evento legacy: Conserva la reconciliación histórica.
+    };
+    if !leases::pid_alive(pid) {
+        return false;
+    }
+    match (requested.owner_pid_start, leases::process_start_time(pid)) {
+        (Some(expected), Some(actual)) => expected == actual,
+        (Some(_), None) => true,
+        (None, _) => true,
+    }
+}
+
 /// Reconcilia `integration.requested` sin resolución. Idempotente frente a
 /// reconciliaciones concurrentes (el append re-chequea dentro de la tx).
 /// Nunca mueve refs: solo registra lo que la ref demuestra.
@@ -1609,16 +1781,24 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
         thread_id: String,
         repo_path: String,
         requested: payload::IntegrationRequested,
+        blocked_after: bool,
     }
     let pending: Vec<Pending> = {
         let mut stmt = store.conn.prepare(
-        "SELECT r.seq, r.thread_id, r.payload, t.repo_path
+        "SELECT r.seq, r.thread_id, r.payload, t.repo_path,
+                EXISTS(
+                    SELECT 1 FROM events b
+                    WHERE b.thread_id = r.thread_id AND b.seq > r.seq
+                      AND b.kind = ?3
+                      AND json_extract(b.payload, '$.target_branch') = json_extract(r.payload, '$.target_branch')
+                      AND json_extract(b.payload, '$.source_oid') = json_extract(r.payload, '$.source_oid')
+                )
          FROM events r JOIN threads t ON t.id = r.thread_id
          WHERE r.kind = ?1
            AND NOT EXISTS (
              SELECT 1 FROM events s
              WHERE s.thread_id = r.thread_id AND s.seq > r.seq
-               AND s.kind IN (?2, ?3)
+               AND s.kind = ?2
                AND json_extract(s.payload, '$.target_branch') = json_extract(r.payload, '$.target_branch')
                AND json_extract(s.payload, '$.source_oid') = json_extract(r.payload, '$.source_oid')
            )
@@ -1636,12 +1816,13 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? == 1,
                 ))
             },
         )?;
         let mut pending = Vec::new();
         for r in rows {
-            let (seq, thread_id, payload_text, repo_path) = r?;
+            let (seq, thread_id, payload_text, repo_path, blocked_after) = r?;
             let requested: payload::IntegrationRequested = serde_json::from_str(&payload_text)
                 .map_err(|e| Error::integrity(format!("integration.requested ilegible: {e}")))?;
             pending.push(Pending {
@@ -1649,6 +1830,7 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
                 thread_id,
                 repo_path,
                 requested,
+                blocked_after,
             });
         }
         pending
@@ -1656,6 +1838,9 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
 
     let mut outcomes = Vec::new();
     for p in pending {
+        if integration_owner_alive(&p.requested) {
+            continue; // el dueño sigue vivo: no fabricar una resolución
+        }
         let Some(repo) = git::open(Path::new(&p.repo_path)).ok() else {
             continue; // repo no disponible: sigue pendiente, sin inventar nada
         };
@@ -1666,6 +1851,14 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
             .and_then(|r| r.target())
             .map(|o| o.to_string());
 
+        if p.blocked_after && current.as_deref() != Some(p.requested.source_oid.as_str()) {
+            // Un blocked posterior resuelve este intento salvo que la ref
+            // demuestre que SÍ se aplicó el source: en ese caso el blocked
+            // pertenece a otro intento concurrente y no debe ocultar la
+            // recuperación del ganador.
+            continue;
+        }
+        let current_is_source = current.as_deref() == Some(p.requested.source_oid.as_str());
         let (kind, value, outcome) = match current.as_deref() {
             Some(cur) if cur == p.requested.source_oid => {
                 let ev = payload::IntegrationCompleted {
@@ -1733,25 +1926,51 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
         let tx = store
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let already: i64 = tx.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM events s
-                WHERE s.thread_id = ?1 AND s.seq > ?2
-                  AND s.kind IN (?3, ?4)
-                  AND json_extract(s.payload, '$.target_branch') = ?5
-                  AND json_extract(s.payload, '$.source_oid') = ?6
-            )",
-            rusqlite::params![
-                p.thread_id,
-                p.seq,
-                events::K_INTEGRATION_COMPLETED,
-                events::K_INTEGRATION_BLOCKED,
-                p.requested.target_branch,
-                p.requested.source_oid
-            ],
-            |row| row.get(0),
-        )?;
-        if already == 1 {
+        // Un completed para el mismo thread/(target, source) es idempotente
+        // aunque sea anterior a este request. Solo se aplica cuando la
+        // resolución calculada es un éxito: un intento abandonado debe
+        // conservar su blocked aunque ya exista un completed histórico.
+        let completed_exists: i64 = if kind == events::K_INTEGRATION_COMPLETED {
+            tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM events c
+                    WHERE c.thread_id = ?1 AND c.kind = ?2
+                      AND json_extract(c.payload, '$.target_branch') = ?3
+                      AND json_extract(c.payload, '$.source_oid') = ?4
+                )",
+                rusqlite::params![
+                    p.thread_id,
+                    events::K_INTEGRATION_COMPLETED,
+                    p.requested.target_branch,
+                    p.requested.source_oid
+                ],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        };
+        let blocked_after_request: i64 = if current_is_source {
+            0 // un blocked ajeno no resuelve un crash cuyo ref demuestra source
+        } else {
+            tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM events s
+                    WHERE s.thread_id = ?1 AND s.seq > ?2
+                      AND s.kind = ?3
+                      AND json_extract(s.payload, '$.target_branch') = ?4
+                      AND json_extract(s.payload, '$.source_oid') = ?5
+                )",
+                rusqlite::params![
+                    p.thread_id,
+                    p.seq,
+                    events::K_INTEGRATION_BLOCKED,
+                    p.requested.target_branch,
+                    p.requested.source_oid
+                ],
+                |row| row.get(0),
+            )?
+        };
+        if completed_exists == 1 || blocked_after_request == 1 {
             tx.rollback()?;
             continue;
         }
