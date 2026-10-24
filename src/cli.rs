@@ -36,12 +36,17 @@ fn parse(args: &[String]) -> Parsed {
             p.after_dashdash.extend(it.cloned());
             break;
         }
-        if let Some(key) = a.strip_prefix("--") {
-            p.has.insert(key.to_string());
+        if let Some(raw) = a.strip_prefix("--") {
+            if let Some((key, value)) = raw.split_once('=') {
+                p.has.insert(key.to_string());
+                p.flags.insert(key.to_string(), value.to_string());
+                continue;
+            }
+            p.has.insert(raw.to_string());
             if let Some(next) = it.peek()
                 && !next.starts_with("--")
             {
-                p.flags.insert(key.to_string(), (*next).clone());
+                p.flags.insert(raw.to_string(), (*next).clone());
                 it.next();
             }
         } else {

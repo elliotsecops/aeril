@@ -1353,6 +1353,33 @@ fn cli_confirm_before_subcommand_does_not_bypass_gate() {
         count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_COMPLETED),
         0
     );
+
+    // Variante `--confirm=true`: tampoco debe caer en la ruta legacy.
+    let out = fx.env.aeril(&[
+        "integrate",
+        "--confirm=true",
+        "apply",
+        "--thread",
+        &fx.thread,
+        "--snapshot",
+        &fx.snapshot,
+        "--to",
+        "destino",
+        "--source",
+        &fx.source,
+        "--expect",
+        &fx.base,
+    ]);
+    assert!(!out.status.success(), "confirm=... no debe caer en legacy");
+    assert_eq!(fx.env.rev_parse("destino"), fx.base);
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_REQUESTED),
+        0
+    );
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_COMPLETED),
+        0
+    );
 }
 
 // ── Legacy no-op keeps completed semantics without duplicating ──────────────
