@@ -195,7 +195,7 @@ pub fn fast_forward_with_hook(
 }
 
 /// Devuelve una descripción del worktree que tiene la rama chequeada, si hay.
-fn checked_out_worktree(repo: &Repository, branch: &str) -> Option<String> {
+pub fn checked_out_worktree(repo: &Repository, branch: &str) -> Option<String> {
     if let Ok(head) = repo.head()
         && head.is_branch()
         && head.shorthand().ok() == Some(branch)

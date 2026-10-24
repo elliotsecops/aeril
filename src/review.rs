@@ -300,6 +300,50 @@ pub fn open_comment_ids(store: &Store, thread_id: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// IDs de comentarios NO resueltos anclados EXACTAMENTE a `snapshot_id` y
+/// `expected_oid`. Comentarios históricos de otros snapshots no participan.
+/// Evidencia malformada o con OID contradictorio falla cerrada.
+pub fn open_comment_ids_for_snapshot(
+    store: &Store,
+    thread_id: &str,
+    snapshot_id: &str,
+    expected_oid: &str,
+) -> Result<Vec<String>> {
+    let states = states_for(store, thread_id)?;
+    let mut stmt = store.conn.prepare(
+        "SELECT id, payload FROM events
+          WHERE thread_id = ?1 AND kind = ?2
+            AND json_extract(payload, '$.anchor.snapshot_id') = ?3
+          ORDER BY seq ASC",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![
+        thread_id,
+        events::K_COMMENT_ADDED,
+        snapshot_id
+    ])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let payload_text: String = row.get(1)?;
+        let added: payload::CommentAdded = serde_json::from_str(&payload_text)
+            .map_err(|e| Error::integrity(format!("comment.added {id} ilegible: {e}")))?;
+        if added.anchor.snapshot_id != snapshot_id || added.oid != expected_oid {
+            return Err(Error::integrity(format!(
+                "comment.added {id} no corresponde al snapshot {snapshot_id} / OID {expected_oid}"
+            )));
+        }
+        let state = states
+            .iter()
+            .find(|(cid, _)| *cid == id)
+            .map(|(_, s)| *s)
+            .unwrap_or(CommentState::Open);
+        if state != CommentState::Resolved {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
 pub fn resolve(store: &mut Store, thread_id: &str, comment_id: &str) -> Result<()> {
     let ev = events::fetch_by_id(&store.conn, thread_id, comment_id)?
         .ok_or_else(|| Error::not_found(format!("comentario {comment_id}")))?;

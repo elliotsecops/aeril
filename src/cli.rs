@@ -6,6 +6,7 @@ use crate::checkpoint;
 use crate::error::{Error, Result};
 use crate::export;
 use crate::git;
+use crate::integration;
 use crate::review;
 use crate::session::{self, PermissionPolicySetting, RunOptions, Runner};
 use crate::store::events::{self, payload};
@@ -1130,6 +1131,18 @@ fn cmd_worktree(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
 // ── integrate ────────────────────────────────────────────────────────────────
 
 fn cmd_integrate(p: &Parsed, db_path: &Path) -> Result<i32> {
+    match p.pos.get(1).map(String::as_str) {
+        None => cmd_integrate_legacy(p, db_path),
+        Some("preview") => cmd_integrate_preview(p, db_path),
+        Some("apply") => cmd_integrate_apply(p, db_path),
+        Some(other) => Err(Error::invalid(format!(
+            "integrate {other:?} no soportado (preview|apply)"
+        ))),
+    }
+}
+
+/// Compatibilidad P2-R1: fast-forward directo, sin gate de validación/review.
+fn cmd_integrate_legacy(p: &Parsed, db_path: &Path) -> Result<i32> {
     let thread_id = p.require("thread")?;
     let snapshot_id = p.require("snapshot")?;
     let to = p.flag("to").unwrap_or_else(|| "main".into());
@@ -1141,6 +1154,33 @@ fn cmd_integrate(p: &Parsed, db_path: &Path) -> Result<i32> {
         "target_oid_before": outcome.target_oid_before,
         "target_oid_after": outcome.target_oid_after,
     }))?;
+    Ok(0)
+}
+
+fn cmd_integrate_preview(p: &Parsed, db_path: &Path) -> Result<i32> {
+    let thread_id = p.require("thread")?;
+    let snapshot_id = p.require("snapshot")?;
+    let to = p.require("to")?;
+    let store = open_store(db_path)?;
+    let preview = integration::preview(&store, &thread_id, &snapshot_id, &to)?;
+    print_json(&serde_json::to_value(preview)?)?;
+    Ok(0)
+}
+
+fn cmd_integrate_apply(p: &Parsed, db_path: &Path) -> Result<i32> {
+    if !p.yes("confirm") {
+        return Err(Error::invalid(
+            "integrate apply requiere --confirm (no hay confirmación implícita)",
+        ));
+    }
+    let thread_id = p.require("thread")?;
+    let snapshot_id = p.require("snapshot")?;
+    let to = p.require("to")?;
+    let source = p.require("source")?;
+    let expect = p.require("expect")?;
+    let mut store = open_store(db_path)?;
+    let applied = integration::apply(&mut store, &thread_id, &snapshot_id, &to, &source, &expect)?;
+    print_json(&serde_json::to_value(applied)?)?;
     Ok(0)
 }
 
