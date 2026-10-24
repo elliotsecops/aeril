@@ -503,25 +503,37 @@ fn proc_entry_gone(err: &std::io::Error) -> bool {
 /// Lee el starttime de una entrada de `/proc` inyectable. `None` significa que
 /// la entrada desapareció; los errores de formato o de acceso se propagan.
 fn proc_start_at(dir: &Path) -> std::io::Result<Option<u64>> {
-    let stat = match std::fs::read_to_string(dir.join("stat")) {
+    // `comm` puede contener bytes no UTF-8 (hasta 16 bytes arbitrarios). Se
+    // parsea el stat como bytes y solo se exige UTF-8 a los campos numéricos;
+    // un proceso ajeno con `comm` binario no debe bloquear el escaneo.
+    let stat = match std::fs::read(dir.join("stat")) {
         Ok(stat) => stat,
         Err(err) if proc_entry_gone(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
-    let Some(after_comm) = stat.rsplit_once(')').map(|(_, a)| a) else {
+    let Some(close) = stat.iter().rposition(|b| *b == b')') else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "stat sin ')'",
         ));
     };
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    let start = fields
-        .get(19)
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "stat sin starttime válido")
-        })?;
+    let fields: Vec<&[u8]> = stat[close + 1..]
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|f| !f.is_empty())
+        .collect();
+    let raw = fields.get(19).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "stat sin starttime")
+    })?;
+    let text = std::str::from_utf8(raw).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "starttime no es ASCII numérico",
+        )
+    })?;
+    // starttime 0 es un valor válido (ticks desde el boot); no se filtra.
+    let start = text
+        .parse::<u64>()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "starttime inválido"))?;
     Ok(Some(start))
 }
 
@@ -2969,6 +2981,26 @@ mod tests {
         })
         .unwrap();
         assert!(found.is_empty(), "un PID reutilizado no debe bloquear");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proc_scan_non_utf8_comm_and_zero_starttime_are_inspected() {
+        let dir =
+            std::env::temp_dir().join(format!("aeril-r1-proc-bytes-{}", crate::ids::new_id()));
+        let proc = dir.join("proc");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let entry = proc.join("777");
+        std::fs::create_dir_all(&entry).unwrap();
+        let mut stat = b"777 (bin".to_vec();
+        stat.push(0xff);
+        stat.extend_from_slice(b") S 1 777 777 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n");
+        std::fs::write(entry.join("stat"), stat).unwrap();
+        let needle = format!("HERMES_HOME={}\0", home.display());
+        std::fs::write(entry.join("environ"), needle.as_bytes()).unwrap();
+
+        assert_eq!(processes_using_home_in(&home, &proc).unwrap(), vec![777]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
