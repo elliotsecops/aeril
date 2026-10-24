@@ -65,6 +65,23 @@ impl Fx {
             "validate true falló: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        self.ack();
+    }
+
+    fn ack(&self) {
+        let out = self.env.aeril(&[
+            "review",
+            "ack",
+            "--thread",
+            &self.thread,
+            "--snapshot",
+            &self.snapshot,
+        ]);
+        assert!(
+            out.status.success(),
+            "review ack falló: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn validate_cmd(&self, cmd: &[&str]) -> Value {
@@ -393,6 +410,7 @@ fn i8_concurrent_assisted_apply_has_one_winner() {
             "true",
         ]);
         assert_eq!(v["exit_code"], 0);
+        env.aeril_ok(&["review", "ack", "--thread", &t, "--snapshot", &snap.0]);
         threads.push((t, snap.0, snap.1));
     }
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -860,6 +878,7 @@ fn i11b_recover_pending_then_fresh_preview_is_eligible() {
         "true",
     ]);
     assert_eq!(v["exit_code"], 0);
+    env.aeril_ok(&["review", "ack", "--thread", &thread, "--snapshot", &snap]);
     let store = Store::open(&env.data.join("aeril.db")).unwrap();
     let p = integration::preview(&store, &thread, &snap, "destino").unwrap();
     assert!(p.eligible, "preview tras recover: {p:?}");
@@ -1515,4 +1534,56 @@ fn cli_confirm_false_does_not_confirm() {
         count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_COMPLETED),
         0
     );
+}
+
+#[test]
+fn pa0_review_ack_is_explicit_and_blocks_until_recorded() {
+    let fx = Fx::new("pa0-ack");
+    // Validación sin acknowledgement: el gate asistido sigue bloqueado.
+    let v = fx.validate_cmd(&["true"]);
+    assert_eq!(v["exit_code"], 0);
+    let p = fx.preview("destino");
+    assert_eq!(p.review, aeril::integration::ReviewState::Required);
+    assert!(!p.eligible);
+    fx.ack();
+    let p = fx.preview("destino");
+    assert_eq!(p.review, aeril::integration::ReviewState::Clear);
+    assert!(p.eligible);
+
+    // Un comentario abierto impide marcar revisado.
+    let comment = fx.env.aeril_ok(&[
+        "comment",
+        "add",
+        "--thread",
+        &fx.thread,
+        "--snapshot",
+        &fx.snapshot,
+        "--path",
+        "NOTES.md",
+        "--start",
+        "1",
+        "--end",
+        "1",
+        "--text",
+        "pendiente",
+    ]);
+    let ack = fx.env.aeril(&[
+        "review",
+        "ack",
+        "--thread",
+        &fx.thread,
+        "--snapshot",
+        &fx.snapshot,
+    ]);
+    assert!(!ack.status.success(), "no se ack con comentarios abiertos");
+    fx.env.aeril_ok(&[
+        "comment",
+        "resolve",
+        "--thread",
+        &fx.thread,
+        "--comment",
+        comment["comment_id"].as_str().unwrap(),
+    ]);
+    let p = fx.preview("destino");
+    assert_eq!(p.review, aeril::integration::ReviewState::Clear);
 }

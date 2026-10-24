@@ -50,6 +50,7 @@ pub enum ValidationState {
 #[serde(rename_all = "snake_case")]
 pub enum ReviewState {
     Clear,
+    Required,
     Pending,
     Invalid,
 }
@@ -136,7 +137,7 @@ impl IntegrationPreview {
             IntegrationStatus::SnapshotInvalid => "snapshot invalid",
             IntegrationStatus::ValidationRequired => "validation required",
             IntegrationStatus::ValidationFailed => "validation failed",
-            IntegrationStatus::ReviewPending => "review pending",
+            IntegrationStatus::ReviewPending => "review required",
             IntegrationStatus::IntegrityError => "integrity error",
             IntegrationStatus::StaleTarget => "stale target",
         }
@@ -324,6 +325,21 @@ pub fn preview(
             "prepared y ready tienen identidades contradictorias",
         ));
     }
+    match checkpoint::has_failed_marker(store, thread_id, snapshot_id) {
+        Ok(true) => {
+            return Ok(p.blocked(
+                IntegrationStatus::SnapshotInvalid,
+                format!("el snapshot {snapshot_id} tiene un marcador checkpoint.failed"),
+            ));
+        }
+        Ok(false) => {}
+        Err(e) => {
+            return Ok(p.blocked(
+                IntegrationStatus::IntegrityError,
+                format!("no se pudo verificar checkpoint.failed: {e}"),
+            ));
+        }
+    }
     if ready.git_ref != checkpoint_ref(snapshot_id) {
         return Ok(p.blocked(
             IntegrationStatus::SnapshotInvalid,
@@ -372,10 +388,20 @@ pub fn preview(
             }
         };
     p.unresolved_comments = unresolved.len();
-    p.review = if unresolved.is_empty() {
-        ReviewState::Clear
-    } else {
+    p.review = if !unresolved.is_empty() {
         ReviewState::Pending
+    } else {
+        match review::acknowledged(store, thread_id, snapshot_id, &ready.oid) {
+            Ok(true) => ReviewState::Clear,
+            Ok(false) => ReviewState::Required,
+            Err(e) => {
+                p.review = ReviewState::Invalid;
+                return Ok(p.blocked(
+                    IntegrationStatus::IntegrityError,
+                    format!("review acknowledgement ilegible: {e}"),
+                ));
+            }
+        }
     };
 
     if target_branch.is_empty() || target_branch.trim() != target_branch {
@@ -478,6 +504,14 @@ pub fn preview(
             p.unresolved_comments
         );
         return Ok(p.blocked(IntegrationStatus::ReviewPending, reason));
+    }
+    if p.review == ReviewState::Required {
+        return Ok(p.blocked(
+            IntegrationStatus::ReviewPending,
+            format!(
+                "revisión explícita pendiente; ejecutá: aeril review ack --thread {thread_id} --snapshot {snapshot_id}"
+            ),
+        ));
     }
 
     let files = match git::diff::files_between(&repo, &target_s, &ready.oid) {

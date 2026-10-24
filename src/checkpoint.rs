@@ -933,6 +933,34 @@ pub fn latest_ready(
     Ok(Some((ev, parsed)))
 }
 
+/// ¿Existe un marcador `checkpoint.failed` para este snapshot?
+///
+/// Un `ready` acompañado de un `failed` es evidencia contradictoria: ni una
+/// revisión ni una integración deben aceptarlo.
+pub fn has_failed_marker(store: &Store, thread_id: &str, snapshot_id: &str) -> Result<bool> {
+    let exists: i64 = store.conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events
+            WHERE thread_id = ?1 AND kind = ?2
+              AND json_extract(payload, '$.snapshot_id') = ?3
+        )",
+        rusqlite::params![thread_id, events::K_CHECKPOINT_FAILED, snapshot_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
+/// Prepared payload exacto de un snapshot, junto con el `run_id` de su
+/// evento durable (intención original). Devuelve `None` si no existe; un
+/// payload ilegible se propaga como error.
+pub fn prepared_for_snapshot_with_run(
+    store: &Store,
+    thread_id: &str,
+    snapshot_id: &str,
+) -> Result<Option<(Option<String>, payload::CheckpointPrepared)>> {
+    prepared_for_snapshot_conn(&store.conn, thread_id, snapshot_id)
+}
+
 /// Prepared payload exacto de un snapshot (intención durable original).
 /// Devuelve `None` si no existe; un payload ilegible se propaga como error.
 pub fn prepared_for_snapshot(
@@ -941,7 +969,7 @@ pub fn prepared_for_snapshot(
     snapshot_id: &str,
 ) -> Result<Option<payload::CheckpointPrepared>> {
     Ok(
-        prepared_for_snapshot_conn(&store.conn, thread_id, snapshot_id)?
+        prepared_for_snapshot_with_run(store, thread_id, snapshot_id)?
             .map(|(_, prepared)| prepared),
     )
 }
