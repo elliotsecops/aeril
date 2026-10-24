@@ -1781,16 +1781,24 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
         thread_id: String,
         repo_path: String,
         requested: payload::IntegrationRequested,
+        blocked_after: bool,
     }
     let pending: Vec<Pending> = {
         let mut stmt = store.conn.prepare(
-        "SELECT r.seq, r.thread_id, r.payload, t.repo_path
+        "SELECT r.seq, r.thread_id, r.payload, t.repo_path,
+                EXISTS(
+                    SELECT 1 FROM events b
+                    WHERE b.thread_id = r.thread_id AND b.seq > r.seq
+                      AND b.kind = ?3
+                      AND json_extract(b.payload, '$.target_branch') = json_extract(r.payload, '$.target_branch')
+                      AND json_extract(b.payload, '$.source_oid') = json_extract(r.payload, '$.source_oid')
+                )
          FROM events r JOIN threads t ON t.id = r.thread_id
          WHERE r.kind = ?1
            AND NOT EXISTS (
              SELECT 1 FROM events s
              WHERE s.thread_id = r.thread_id AND s.seq > r.seq
-               AND s.kind IN (?2, ?3)
+               AND s.kind = ?2
                AND json_extract(s.payload, '$.target_branch') = json_extract(r.payload, '$.target_branch')
                AND json_extract(s.payload, '$.source_oid') = json_extract(r.payload, '$.source_oid')
            )
@@ -1808,12 +1816,13 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? == 1,
                 ))
             },
         )?;
         let mut pending = Vec::new();
         for r in rows {
-            let (seq, thread_id, payload_text, repo_path) = r?;
+            let (seq, thread_id, payload_text, repo_path, blocked_after) = r?;
             let requested: payload::IntegrationRequested = serde_json::from_str(&payload_text)
                 .map_err(|e| Error::integrity(format!("integration.requested ilegible: {e}")))?;
             pending.push(Pending {
@@ -1821,6 +1830,7 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
                 thread_id,
                 repo_path,
                 requested,
+                blocked_after,
             });
         }
         pending
@@ -1841,6 +1851,14 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
             .and_then(|r| r.target())
             .map(|o| o.to_string());
 
+        if p.blocked_after && current.as_deref() != Some(p.requested.source_oid.as_str()) {
+            // Un blocked posterior resuelve este intento salvo que la ref
+            // demuestre que SÍ se aplicó el source: en ese caso el blocked
+            // pertenece a otro intento concurrente y no debe ocultar la
+            // recuperación del ganador.
+            continue;
+        }
+        let current_is_source = current.as_deref() == Some(p.requested.source_oid.as_str());
         let (kind, value, outcome) = match current.as_deref() {
             Some(cur) if cur == p.requested.source_oid => {
                 let ev = payload::IntegrationCompleted {
@@ -1931,23 +1949,27 @@ pub fn reconcile_integrations(store: &mut Store) -> Result<Vec<IntegrationReconc
         } else {
             0
         };
-        let blocked_after_request: i64 = tx.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM events s
-                WHERE s.thread_id = ?1 AND s.seq > ?2
-                  AND s.kind = ?3
-                  AND json_extract(s.payload, '$.target_branch') = ?4
-                  AND json_extract(s.payload, '$.source_oid') = ?5
-            )",
-            rusqlite::params![
-                p.thread_id,
-                p.seq,
-                events::K_INTEGRATION_BLOCKED,
-                p.requested.target_branch,
-                p.requested.source_oid
-            ],
-            |row| row.get(0),
-        )?;
+        let blocked_after_request: i64 = if current_is_source {
+            0 // un blocked ajeno no resuelve un crash cuyo ref demuestra source
+        } else {
+            tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM events s
+                    WHERE s.thread_id = ?1 AND s.seq > ?2
+                      AND s.kind = ?3
+                      AND json_extract(s.payload, '$.target_branch') = ?4
+                      AND json_extract(s.payload, '$.source_oid') = ?5
+                )",
+                rusqlite::params![
+                    p.thread_id,
+                    p.seq,
+                    events::K_INTEGRATION_BLOCKED,
+                    p.requested.target_branch,
+                    p.requested.source_oid
+                ],
+                |row| row.get(0),
+            )?
+        };
         if completed_exists == 1 || blocked_after_request == 1 {
             tx.rollback()?;
             continue;

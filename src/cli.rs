@@ -1181,7 +1181,10 @@ fn cmd_integrate_preview(p: &Parsed, db_path: &Path) -> Result<i32> {
 }
 
 fn cmd_integrate_apply(p: &Parsed, db_path: &Path) -> Result<i32> {
-    if !p.yes("confirm") {
+    let confirm_value = p.flag("confirm").unwrap_or_default().to_ascii_lowercase();
+    let confirmed =
+        p.yes("confirm") && !matches!(confirm_value.as_str(), "false" | "0" | "no" | "off");
+    if !confirmed {
         return Err(Error::invalid(
             "integrate apply requiere --confirm (no hay confirmación implícita)",
         ));

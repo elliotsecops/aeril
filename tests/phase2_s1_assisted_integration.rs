@@ -1418,3 +1418,101 @@ fn i8c_legacy_noop_preserves_completed_contract() {
         "el no-op legacy conserva completed, no blocked"
     );
 }
+
+// ── A blocked loser must not hide the crashed winner's completion ───────────
+
+#[test]
+fn i13f_blocked_other_request_does_not_hide_crashed_winner() {
+    let fx = Fx::new("p2s1-i13f");
+    fx.env.update_ref("refs/heads/destino", &fx.source);
+    let mut store = fx.store();
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead_pid = child.id() as i64;
+    child.wait().unwrap();
+    let append_request = |store: &mut Store| {
+        events::append_typed(
+            &mut store.conn,
+            &fx.thread,
+            None,
+            events::K_INTEGRATION_REQUESTED,
+            "system",
+            &events::payload::IntegrationRequested {
+                target_branch: "destino".into(),
+                source_oid: fx.source.clone(),
+                target_oid_expected: fx.base.clone(),
+                owner_pid: Some(dead_pid),
+                owner_pid_start: Some(1),
+            },
+        )
+        .unwrap();
+    };
+    append_request(&mut store); // ganador que crasheó antes de completed
+    append_request(&mut store); // no-op concurrente
+    events::append_typed(
+        &mut store.conn,
+        &fx.thread,
+        None,
+        events::K_INTEGRATION_BLOCKED,
+        "system",
+        &events::payload::IntegrationBlocked {
+            target_branch: "destino".into(),
+            source_oid: fx.source.clone(),
+            target_oid_current: Some(fx.source.clone()),
+            reason: "no-op del otro intento".into(),
+        },
+    )
+    .unwrap();
+    let outcomes = session::reconcile_integrations(&mut store).unwrap();
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "solo el ganador se completa: {outcomes:?}"
+    );
+    assert!(matches!(
+        outcomes[0],
+        session::IntegrationReconcile::CompletedRecovered { .. }
+    ));
+    assert_eq!(
+        events::fetch_by_kind(&store.conn, &fx.thread, events::K_INTEGRATION_COMPLETED)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        events::fetch_by_kind(&store.conn, &fx.thread, events::K_INTEGRATION_BLOCKED)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn cli_confirm_false_does_not_confirm() {
+    let fx = Fx::new("p2s1-cli-false");
+    fx.validate_ok();
+    let out = fx.env.aeril(&[
+        "integrate",
+        "apply",
+        "--thread",
+        &fx.thread,
+        "--snapshot",
+        &fx.snapshot,
+        "--to",
+        "destino",
+        "--source",
+        &fx.source,
+        "--expect",
+        &fx.base,
+        "--confirm=false",
+    ]);
+    assert!(!out.status.success(), "false no es confirmación");
+    assert_eq!(fx.env.rev_parse("destino"), fx.base);
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_REQUESTED),
+        0
+    );
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_COMPLETED),
+        0
+    );
+}
