@@ -231,7 +231,10 @@ fn no_run_needs_a_run() {
     assert_eq!(a.status, AttentionStatus::NoRun);
     assert_eq!(a.next_action, "iniciar run");
     assert!(a.run_state.is_none());
-    assert!(!a.is_actionable());
+    assert!(
+        a.is_actionable(),
+        "una tarea sin run requiere iniciar trabajo"
+    );
 }
 
 #[test]
@@ -770,6 +773,47 @@ fn malformed_comment_anchor_fails_closed() {
     assert_eq!(all[0].status, AttentionStatus::IntegrityHold);
 }
 
+#[test]
+fn legacy_permission_without_run_id_is_not_clean() {
+    let (mut store, thread, run) = new_thread("permiso legacy");
+    add_run(&mut store, &thread, &run, "completed");
+    append(
+        &mut store,
+        &thread,
+        None,
+        events::K_PERMISSION_REQUESTED,
+        json!({
+            "request_id": "req-legacy",
+            "tool_call_id": "call-legacy",
+            "title": "editar NOTES.md",
+            "options": ["allow_once"]
+        }),
+    );
+    let a = project(&store, &thread);
+    assert_eq!(a.status, AttentionStatus::IntegrityHold);
+    assert!(a.reason.contains("sin respuesta durable"));
+}
+
+#[test]
+fn legacy_permission_audit_failure_without_run_id_is_not_clean() {
+    let (mut store, thread, run) = new_thread("auditoría legacy");
+    add_run(&mut store, &thread, &run, "completed");
+    append(
+        &mut store,
+        &thread,
+        None,
+        events::K_PERMISSION_AUDIT_FAILED,
+        json!({
+            "request_id": "req-legacy",
+            "stage": "responded",
+            "detail": "fallo durable sin run_id"
+        }),
+    );
+    let a = project(&store, &thread);
+    assert_eq!(a.status, AttentionStatus::IntegrityHold);
+    assert!(a.reason.contains("auditoría"));
+}
+
 // ── runs solapados y read-only ──────────────────────────────────────────────
 
 #[test]
@@ -925,6 +969,85 @@ fn cli_ack_rejects_unverifiable_or_contradictory_checkpoints() {
     let (env, thread, snapshot) = ready_env("pa0-attn-ack-strict");
     let mut store = Store::open(&env.data.join("aeril.db")).expect("store");
     let oid = ready_oid(&env, &thread);
+    let prepared_run: String = store
+        .conn
+        .query_row(
+            "SELECT run_id FROM events
+              WHERE thread_id = ?1 AND kind = ?2
+                AND json_extract(payload, '$.snapshot_id') = ?3
+              ORDER BY seq DESC LIMIT 1",
+            rusqlite::params![thread, events::K_CHECKPOINT_PREPARED, snapshot],
+            |row| row.get(0),
+        )
+        .expect("run_id del prepared");
+
+    // Identidad de run contradictoria entre prepared y ready.
+    store
+        .conn
+        .execute(
+            "UPDATE events SET payload = json_set(payload, '$.run_id', 'otro-run')
+              WHERE thread_id = ?1 AND kind = ?2
+                AND json_extract(payload, '$.snapshot_id') = ?3",
+            rusqlite::params![thread, events::K_CHECKPOINT_PREPARED, snapshot],
+        )
+        .expect("mutar run_id");
+    let out = env.aeril(&[
+        "review",
+        "ack",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &snapshot,
+    ]);
+    assert!(
+        !out.status.success(),
+        "ack con run_id contradictorio debe fallar"
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE events SET payload = json_set(payload, '$.run_id', ?2)
+              WHERE thread_id = ?1 AND kind = ?3
+                AND json_extract(payload, '$.snapshot_id') = ?4",
+            rusqlite::params![
+                thread,
+                prepared_run,
+                events::K_CHECKPOINT_PREPARED,
+                snapshot
+            ],
+        )
+        .expect("restaurar run_id");
+
+    store
+        .conn
+        .execute(
+            "UPDATE events SET payload = json_set(payload, '$.base_oid', ?2)
+              WHERE thread_id = ?1 AND kind = ?3
+                AND json_extract(payload, '$.snapshot_id') = ?4",
+            rusqlite::params![thread, OTHER_OID, events::K_CHECKPOINT_PREPARED, snapshot],
+        )
+        .expect("mutar base_oid");
+    let out = env.aeril(&[
+        "review",
+        "ack",
+        "--thread",
+        &thread,
+        "--snapshot",
+        &snapshot,
+    ]);
+    assert!(
+        !out.status.success(),
+        "ack con base_oid contradictorio debe fallar"
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE events SET payload = json_set(payload, '$.base_oid', ?2)
+              WHERE thread_id = ?1 AND kind = ?3
+                AND json_extract(payload, '$.snapshot_id') = ?4",
+            rusqlite::params![thread, BASE, events::K_CHECKPOINT_PREPARED, snapshot],
+        )
+        .expect("restaurar base_oid");
 
     store
         .conn

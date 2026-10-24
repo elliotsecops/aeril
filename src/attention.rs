@@ -148,10 +148,13 @@ impl TaskAttention {
     }
 
     /// `true` si la tarea requiere una acción del humano para avanzar. Un run
-    /// en curso y los estados terminales son observación, no acción.
+    /// en curso es observación; `Done` no requiere acción. `Failed` y `NoRun`
+    /// sí requieren revisar el fallo o iniciar trabajo.
     pub fn is_actionable(&self) -> bool {
-        self.status.priority() <= AttentionStatus::ReadyToIntegrate.priority()
-            && self.status != AttentionStatus::InProgress
+        !matches!(
+            self.status,
+            AttentionStatus::InProgress | AttentionStatus::Done
+        )
     }
 }
 
@@ -299,15 +302,19 @@ fn latest_pending_prepared(store: &Store, thread_id: &str) -> Result<Option<i64>
         .optional()?)
 }
 
-/// Pedido de permiso sin respuesta durable, acotado al run que lo emitió.
-/// No importa si el run sigue activo: un pedido sin responder al cierre es
-/// evidencia inconsistente, nunca un run limpio.
-fn pending_permission(store: &Store, thread_id: &str, run_id: &str) -> Result<Option<String>> {
+/// Pedido de permiso sin respuesta durable, acotado al run actual y a los
+/// eventos legacy sin `run_id`. No importa si el run sigue activo: un pedido
+/// sin responder al cierre es evidencia inconsistente, nunca un run limpio.
+fn pending_permission(
+    store: &Store,
+    thread_id: &str,
+    run_id: Option<&str>,
+) -> Result<Option<String>> {
     let row: Option<(String,)> = store
         .conn
         .query_row(
             "SELECT p.payload FROM events p
-              WHERE p.thread_id = ?1 AND p.run_id = ?2 AND p.kind = ?3
+              WHERE p.thread_id = ?1 AND (p.run_id = ?2 OR p.run_id IS NULL) AND p.kind = ?3
                 AND NOT EXISTS (
                     SELECT 1 FROM events r
                     WHERE r.thread_id = p.thread_id AND r.kind = ?4
@@ -350,13 +357,13 @@ fn pending_permission(store: &Store, thread_id: &str, run_id: &str) -> Result<Op
 fn permission_audit_failure(
     store: &Store,
     thread_id: &str,
-    run_id: &str,
+    run_id: Option<&str>,
 ) -> Result<Option<String>> {
     let text: Option<String> = store
         .conn
         .query_row(
             "SELECT payload FROM events
-              WHERE thread_id = ?1 AND run_id = ?2 AND kind = ?3
+              WHERE thread_id = ?1 AND (run_id = ?2 OR run_id IS NULL) AND kind = ?3
               ORDER BY seq DESC LIMIT 1",
             rusqlite::params![thread_id, run_id, events::K_PERMISSION_AUDIT_FAILED],
             |row| row.get(0),
@@ -536,12 +543,7 @@ pub fn project_thread(store: &Store, thread_id: &str) -> Result<TaskAttention> {
 
     // 1) Integridad de permisos: un fallo de auditoría o un pedido sin
     //    respuesta al cierre no puede convertirse en un run limpio.
-    if let Some(detail) = run_id
-        .as_deref()
-        .map(|rid| permission_audit_failure(store, thread_id, rid))
-        .transpose()?
-        .flatten()
-    {
+    if let Some(detail) = permission_audit_failure(store, thread_id, run_id.as_deref())? {
         let mut a = TaskAttention::new(
             &thread,
             AttentionStatus::IntegrityHold,
@@ -556,10 +558,7 @@ pub fn project_thread(store: &Store, thread_id: &str) -> Result<TaskAttention> {
         return Ok(a);
     }
 
-    let permission = match run_id.as_deref() {
-        Some(rid) => pending_permission(store, thread_id, rid)?,
-        None => None,
-    };
+    let permission = pending_permission(store, thread_id, run_id.as_deref())?;
     if let Some(title) = permission {
         let (status, action, reason) = if run_active && run_live {
             (

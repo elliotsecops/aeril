@@ -373,7 +373,7 @@ pub fn acknowledge(
     // El acknowledgement solo puede referirse a un checkpoint listo, con
     // prepared consistente, sin marcador failed y con ref/objetos Git
     // verificables. Una llamada de biblioteca no puede inventar identidades.
-    let (_, ready) = checkpoint::ready_for_snapshot(store, thread_id, snapshot_id)?
+    let (ready_ev, ready) = checkpoint::ready_for_snapshot(store, thread_id, snapshot_id)?
         .ok_or_else(|| Error::not_ready(format!("no hay checkpoint ready {snapshot_id}")))?;
     if ready.oid != oid {
         return Err(Error::integrity(format!(
@@ -387,19 +387,36 @@ pub fn acknowledge(
             ready.git_ref
         )));
     }
-    let prepared =
-        checkpoint::prepared_for_snapshot(store, thread_id, snapshot_id)?.ok_or_else(|| {
-            Error::not_ready(format!(
-                "no hay checkpoint.prepared verificable para {snapshot_id}"
-            ))
-        })?;
+    let (prepared_run_id, prepared) =
+        checkpoint::prepared_for_snapshot_with_run(store, thread_id, snapshot_id)?.ok_or_else(
+            || {
+                Error::not_ready(format!(
+                    "no hay checkpoint.prepared verificable para {snapshot_id}"
+                ))
+            },
+        )?;
     if prepared.snapshot_id != snapshot_id
         || prepared.expected_oid != ready.oid
         || prepared.git_ref != ready.git_ref
+        || prepared.base_oid != ready.base_oid
+        || prepared.files != ready.files
     {
         return Err(Error::integrity(format!(
             "checkpoint.prepared y checkpoint.ready se contradicen para {snapshot_id}"
         )));
+    }
+    for (left, right) in [
+        (ready_ev.run_id.as_deref(), prepared_run_id.as_deref()),
+        (ready_ev.run_id.as_deref(), prepared.run_id.as_deref()),
+        (prepared_run_id.as_deref(), prepared.run_id.as_deref()),
+    ] {
+        if let (Some(left), Some(right)) = (left, right)
+            && left != right
+        {
+            return Err(Error::integrity(format!(
+                "run_id contradictorio entre checkpoint.ready y checkpoint.prepared para {snapshot_id}"
+            )));
+        }
     }
     if checkpoint::has_failed_marker(store, thread_id, snapshot_id)? {
         return Err(Error::integrity(format!(
@@ -410,6 +427,19 @@ pub fn acknowledge(
         .ok_or_else(|| Error::not_found(format!("thread {thread_id}")))?;
     let repo = git::open(Path::new(&thread.repo_path))?;
     git::snapshot::verify_snapshot(&repo, &ready.git_ref, &ready.oid, &ready.files)?;
+    let source = git2::Oid::from_str(&ready.oid)?;
+    let base = git2::Oid::from_str(&ready.base_oid)?;
+    repo.find_commit(base)
+        .map_err(|e| Error::integrity(format!("commit base {} ausente: {e}", ready.base_oid)))?;
+    if !repo
+        .graph_descendant_of(source, base)
+        .map_err(|e| Error::integrity(format!("no se pudo comprobar la base: {e}")))?
+    {
+        return Err(Error::integrity(format!(
+            "el checkpoint {snapshot_id} no desciende de su base {}",
+            ready.base_oid
+        )));
+    }
 
     // El chequeo de comentarios y la escritura del ack comparten la misma
     // transacción IMMEDIATE: un comentario no puede colarse entre ambos.

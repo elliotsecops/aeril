@@ -318,6 +318,9 @@ impl App {
                 review::view_comment(&self.store, &detail.thread_id, &ev.id, repo.as_ref())
             {
                 detail.patch = view.original_patch.lines().map(str::to_string).collect();
+                // El panel derecho no debe seguir mostrando el último ready si
+                // el patch visible pertenece al snapshot anclado del comentario.
+                detail.checkpoint = None;
                 detail.displayed_snapshot =
                     Some((view.anchor.snapshot_id.clone(), view.snapshot_oid.clone()));
             }
@@ -370,10 +373,8 @@ impl App {
             self.status = "el checkpoint no tiene archivos anclables (lado nuevo)".into();
             return Ok(());
         };
-        let desc = format!(
-            "{path} líneas {start}-{end} · snapshot {}",
-            &ready.snapshot_id[..8]
-        );
+        let short_snapshot: String = ready.snapshot_id.chars().take(8).collect();
+        let desc = format!("{path} líneas {start}-{end} · snapshot {short_snapshot}");
         self.mode = Mode::CommentInput {
             buf: String::new(),
             anchor_desc: desc,
@@ -418,10 +419,9 @@ impl App {
             buf.trim(),
         ) {
             Ok(id) => {
-                self.status = format!(
-                    "comentario {} agregado (abierto, f para enviar feedback)",
-                    &id[..8]
-                );
+                let short_id: String = id.chars().take(8).collect();
+                self.status =
+                    format!("comentario {short_id} agregado (abierto, f para enviar feedback)");
                 self.refresh_detail()?;
             }
             Err(e) => {

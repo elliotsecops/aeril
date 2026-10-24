@@ -1252,7 +1252,8 @@ fn cmd_attention(p: &Parsed, db_path: &Path) -> Result<i32> {
         return Ok(0);
     }
     for item in &items {
-        println!("{}", item.thread_title);
+        let short_thread: String = item.thread_id.chars().take(8).collect();
+        println!("{}  [{short_thread}]", item.thread_title);
         let label = if item.historical_checkpoint {
             format!("checkpoint previo · {}", item.status_label)
         } else {

@@ -308,7 +308,8 @@ De mayor a menor prioridad:
 - Los comentarios resueltos no equivalen a revisión; hace falta el acknowledgement.
 - Un permiso pendiente de un supervisor muerto es recuperación, no autorización.
 - Un `permission.requested` sin respuesta al cierre, o un
-  `permission.audit_failed`, es integridad/recovery: nunca un run limpio.
+  `permission.audit_failed`, es integridad/recovery: nunca un run limpio. Los
+  eventos legacy sin `run_id` también fallan cerrado.
 - Un checkpoint `ready` exige `prepared` consistente, sin marcador `failed`, y
   ref/objetos Git verificables para poder revisarse o integrarse.
 - Si el último run es posterior al checkpoint, el checkpoint se marca
@@ -335,8 +336,9 @@ De mayor a menor prioridad:
 - No se puede emitir con comentarios abiertos en ese snapshot/OID. El chequeo de
   comentarios y la escritura del ack comparten una transacción `IMMEDIATE`.
 - La ausencia de comentarios **no** se interpreta como revisión.
-- El ack exige un `checkpoint.ready` real con `prepared` consistente, sin
-  `checkpoint.failed` para el mismo snapshot, y con ref/objetos Git verificables.
+- El ack exige un `checkpoint.ready` real con `prepared` consistente en
+  snapshot/OID/ref/base/files/run_id, sin `checkpoint.failed` para el mismo
+  snapshot, y con ref/objetos Git verificables y ancestría desde la base.
 - El preview de integración asistida exige, para el snapshot exacto:
   1. checkpoint `ready` y `prepared` consistentes;
   2. sin comentarios abiertos;

@@ -950,6 +950,17 @@ pub fn has_failed_marker(store: &Store, thread_id: &str, snapshot_id: &str) -> R
     Ok(exists == 1)
 }
 
+/// Prepared payload exacto de un snapshot, junto con el `run_id` de su
+/// evento durable (intención original). Devuelve `None` si no existe; un
+/// payload ilegible se propaga como error.
+pub fn prepared_for_snapshot_with_run(
+    store: &Store,
+    thread_id: &str,
+    snapshot_id: &str,
+) -> Result<Option<(Option<String>, payload::CheckpointPrepared)>> {
+    prepared_for_snapshot_conn(&store.conn, thread_id, snapshot_id)
+}
+
 /// Prepared payload exacto de un snapshot (intención durable original).
 /// Devuelve `None` si no existe; un payload ilegible se propaga como error.
 pub fn prepared_for_snapshot(
@@ -958,7 +969,7 @@ pub fn prepared_for_snapshot(
     snapshot_id: &str,
 ) -> Result<Option<payload::CheckpointPrepared>> {
     Ok(
-        prepared_for_snapshot_conn(&store.conn, thread_id, snapshot_id)?
+        prepared_for_snapshot_with_run(store, thread_id, snapshot_id)?
             .map(|(_, prepared)| prepared),
     )
 }

@@ -188,7 +188,7 @@ pub mod payload {
         pub stop_reason: Option<String>,
     }
 
-    #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+    #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
     pub struct FileSummary {
         pub path: String,
         pub status: String,
