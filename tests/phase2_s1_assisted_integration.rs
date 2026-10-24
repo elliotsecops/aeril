@@ -1354,3 +1354,40 @@ fn cli_confirm_before_subcommand_does_not_bypass_gate() {
         0
     );
 }
+
+// ── Legacy no-op keeps completed semantics without duplicating ──────────────
+
+#[test]
+fn i8c_legacy_noop_preserves_completed_contract() {
+    let fx = Fx::new("p2s1-i8c");
+    fx.validate_ok();
+    let mut store = fx.store();
+    let first = session::integrate(
+        &mut store,
+        &fx.thread,
+        &fx.snapshot,
+        "destino",
+        Some(&fx.base),
+    )
+    .expect("legacy first");
+    assert!(first.performed);
+    let second = session::integrate(
+        &mut store,
+        &fx.thread,
+        &fx.snapshot,
+        "destino",
+        Some(&fx.source),
+    )
+    .expect("legacy no-op");
+    assert!(!second.performed);
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_COMPLETED),
+        1,
+        "el no-op legacy no duplica completed"
+    );
+    assert_eq!(
+        count_kind(&fx.env, &fx.thread, events::K_INTEGRATION_BLOCKED),
+        0,
+        "el no-op legacy conserva completed, no blocked"
+    );
+}

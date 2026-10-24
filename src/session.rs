@@ -1601,9 +1601,9 @@ fn integrate_inner(
             };
             if append_completed_once(store, thread_id, target_branch, &ready.oid, &completed)? {
                 Ok(outcome)
-            } else {
-                // Ya existía un éxito para el mismo target/source: no se
-                // duplica completed; se resuelve este intento como no-op.
+            } else if expected_source_oid.is_some() {
+                // Asistido: un segundo éxito no se duplica; se resuelve como
+                // no-op terminal.
                 append_integration_blocked(
                     store,
                     thread_id,
@@ -1613,19 +1613,36 @@ fn integrate_inner(
                     "ya existía un integration.completed para el mismo target/source; esta llamada no agrega otro éxito",
                 )?;
                 Ok(outcome)
+            } else {
+                // Legacy: conservar el contrato previo sin duplicar completed.
+                Ok(outcome)
             }
         }
         Ok(outcome) => {
-            // No-op idempotente: otro writer ya había aplicado el source (o
-            // el target ya estaba en source). No es un éxito nuevo.
-            append_integration_blocked(
-                store,
-                thread_id,
-                target_branch,
-                &ready.oid,
-                Some(outcome.target_oid_after.clone()),
-                "la rama destino ya apuntaba al source; no se movió ninguna ref",
-            )?;
+            if expected_source_oid.is_some() {
+                // Asistido: otro writer ya había aplicado el source (o el
+                // target ya estaba en source). No es un éxito nuevo.
+                append_integration_blocked(
+                    store,
+                    thread_id,
+                    target_branch,
+                    &ready.oid,
+                    Some(outcome.target_oid_after.clone()),
+                    "la rama destino ya apuntaba al source; no se movió ninguna ref",
+                )?;
+            } else {
+                // Legacy: el no-op histórico registraba completed; se
+                // conserva ese contrato, deduplicado.
+                crash::point("integrate_committed");
+                let completed = payload::IntegrationCompleted {
+                    target_branch: target_branch.to_string(),
+                    source_oid: ready.oid.clone(),
+                    target_oid_before: outcome.target_oid_before.clone(),
+                    target_oid_after: outcome.target_oid_after.clone(),
+                    recovered: false,
+                };
+                append_completed_once(store, thread_id, target_branch, &ready.oid, &completed)?;
+            }
             Ok(outcome)
         }
         Err(blocked) => {

@@ -564,11 +564,18 @@ pub fn apply(
             outcome.target_oid_after
         )));
     }
+    let performed = outcome.performed;
     Ok(AppliedIntegration {
         target_branch: target_branch.to_string(),
         source_oid: source.to_string(),
-        target_oid_before: outcome.target_oid_before,
+        // Un no-op concurrente no debe reportar un "before" obsoleto como si
+        // esta llamada hubiera movido la ref.
+        target_oid_before: if performed {
+            outcome.target_oid_before
+        } else {
+            source.to_string()
+        },
         target_oid_after: outcome.target_oid_after,
-        noop: false,
+        noop: !performed,
     })
 }
