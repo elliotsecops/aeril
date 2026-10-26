@@ -47,6 +47,7 @@ pub const K_INTEGRATION_REQUESTED: &str = "integration.requested";
 pub const K_INTEGRATION_COMPLETED: &str = "integration.completed";
 pub const K_INTEGRATION_BLOCKED: &str = "integration.blocked";
 pub const K_VALIDATION_RECORDED: &str = "validation.recorded";
+pub const K_REVIEW_ACKNOWLEDGED: &str = "review.acknowledged";
 
 // ── payloads tipados (v1) ────────────────────────────────────────────────────
 pub mod payload {
@@ -187,7 +188,7 @@ pub mod payload {
         pub stop_reason: Option<String>,
     }
 
-    #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+    #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
     pub struct FileSummary {
         pub path: String,
         pub status: String,
@@ -348,6 +349,12 @@ pub mod payload {
         #[serde(default)]
         pub target_oid_current: Option<String>,
         pub reason: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Default)]
+    pub struct ReviewAcknowledged {
+        pub snapshot_id: String,
+        pub oid: String,
     }
 
     #[derive(Debug, Serialize, Deserialize, Default)]

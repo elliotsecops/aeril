@@ -5,6 +5,7 @@
 //! con presupuestos de arranque/RAM/tamaño medidos en la laptop objetivo.
 
 pub mod agent;
+pub mod attention;
 pub mod bench;
 pub mod checkpoint;
 pub mod cli;

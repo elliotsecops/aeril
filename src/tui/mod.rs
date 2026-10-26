@@ -2,6 +2,7 @@
 //! Mantiene las acciones del corte vertical (comentar, feedback, integrar y
 //! cancelar) sobre el estado durable de la Fase 0/1.
 
+use crate::attention;
 use crate::bench;
 use crate::checkpoint;
 use crate::error::{Error, Result};
@@ -39,6 +40,9 @@ pub struct ThreadDetail {
     pub run_summary: Option<ThreadRunSummary>,
     pub progress: events::RunProgress,
     pub checkpoint: Option<CheckpointPanel>,
+    /// Snapshot/OID cuyo patch está realmente visible. Es la única identidad
+    /// que la tecla `a` puede marcar como revisada.
+    pub displayed_snapshot: Option<(String, String)>,
 }
 
 pub struct CheckpointPanel {
@@ -121,6 +125,7 @@ pub struct App {
     pub db_path: PathBuf,
     pub threads: Vec<ThreadRow>,
     pub run_summaries: HashMap<String, ThreadRunSummary>,
+    pub attention: HashMap<String, attention::TaskAttention>,
     pub thread_sel: usize,
     pub detail: Option<ThreadDetail>,
     pub mode: Mode,
@@ -138,6 +143,11 @@ pub struct App {
     pub thread_opened_beacon: bool,
 }
 
+/// Identidad que la tecla `a` puede marcar: exactamente el patch visible.
+fn review_target(detail: &ThreadDetail) -> Option<(String, String)> {
+    detail.displayed_snapshot.clone()
+}
+
 impl App {
     fn reload_threads(&mut self) -> Result<()> {
         // S3: preservar la selección por IDENTIDAD. Con runs concurrentes el
@@ -150,6 +160,10 @@ impl App {
             .or_else(|| self.threads.get(self.thread_sel).map(|t| t.id.clone()));
         self.threads = threads::list_projection(&self.store.conn, 200)?;
         self.run_summaries = threads::run_summaries(&self.store.conn, 200)?;
+        self.attention = attention::project_all(&self.store, 200)?
+            .into_iter()
+            .map(|a| (a.thread_id.clone(), a))
+            .collect();
         if let Some(id) = prev_sel_id
             && let Some(idx) = self.threads.iter().position(|t| t.id == id)
         {
@@ -223,6 +237,7 @@ impl App {
             run_summary: None,
             progress: events::RunProgress::default(),
             checkpoint: None,
+            displayed_snapshot: None,
         };
         self.detail = Some(detail);
         self.refresh_detail()?;
@@ -259,6 +274,7 @@ impl App {
         detail.patch.clear();
         detail.patch_scroll = 0;
         detail.checkpoint = None;
+        detail.displayed_snapshot = None;
         let selected_ready = if let Some(ev) = detail
             .events
             .get(detail.sel)
@@ -284,6 +300,7 @@ impl App {
                 ev.seq,
             )? as usize;
             detail.patch = ready.patch.lines().map(str::to_string).collect();
+            detail.displayed_snapshot = Some((ready.snapshot_id.clone(), ready.oid.clone()));
             detail.checkpoint = Some(CheckpointPanel {
                 ready,
                 run_id: ev.run_id.clone(),
@@ -301,6 +318,11 @@ impl App {
                 review::view_comment(&self.store, &detail.thread_id, &ev.id, repo.as_ref())
             {
                 detail.patch = view.original_patch.lines().map(str::to_string).collect();
+                // El panel derecho no debe seguir mostrando el último ready si
+                // el patch visible pertenece al snapshot anclado del comentario.
+                detail.checkpoint = None;
+                detail.displayed_snapshot =
+                    Some((view.anchor.snapshot_id.clone(), view.snapshot_oid.clone()));
             }
         }
         Ok(())
@@ -351,10 +373,8 @@ impl App {
             self.status = "el checkpoint no tiene archivos anclables (lado nuevo)".into();
             return Ok(());
         };
-        let desc = format!(
-            "{path} líneas {start}-{end} · snapshot {}",
-            &ready.snapshot_id[..8]
-        );
+        let short_snapshot: String = ready.snapshot_id.chars().take(8).collect();
+        let desc = format!("{path} líneas {start}-{end} · snapshot {short_snapshot}");
         self.mode = Mode::CommentInput {
             buf: String::new(),
             anchor_desc: desc,
@@ -399,10 +419,9 @@ impl App {
             buf.trim(),
         ) {
             Ok(id) => {
-                self.status = format!(
-                    "comentario {} agregado (abierto, f para enviar feedback)",
-                    &id[..8]
-                );
+                let short_id: String = id.chars().take(8).collect();
+                self.status =
+                    format!("comentario {short_id} agregado (abierto, f para enviar feedback)");
                 self.refresh_detail()?;
             }
             Err(e) => {
@@ -513,6 +532,32 @@ impl App {
                 self.status = format!("preview falló: {e}");
             }
         }
+        Ok(())
+    }
+
+    /// Marca explícitamente revisado el checkpoint cuyo patch está visible.
+    /// La identidad sale de `displayed_snapshot`, no de "el último ready":
+    /// un comentario puede mostrar el patch de un snapshot anterior.
+    fn mark_reviewed(&mut self) -> Result<()> {
+        let Some(detail) = self.detail.as_ref() else {
+            self.status = "abrí un thread para marcar un checkpoint revisado".into();
+            return Ok(());
+        };
+        let thread_id = detail.thread_id.clone();
+        let Some((snapshot_id, oid)) = review_target(detail) else {
+            self.status = "seleccioná un checkpoint listo para marcar revisado".into();
+            return Ok(());
+        };
+        match review::acknowledge(&mut self.store, &thread_id, &snapshot_id, &oid) {
+            Ok(true) => {
+                let short: String = snapshot_id.chars().take(8).collect();
+                self.status = format!("checkpoint {short} marcado revisado");
+                self.reload_threads()?;
+            }
+            Ok(false) => self.status = "el checkpoint ya estaba marcado revisado".into(),
+            Err(e) => self.status = format!("no se pudo marcar revisado: {e}"),
+        }
+        self.refresh_detail()?;
         Ok(())
     }
 
@@ -874,6 +919,7 @@ impl App {
                     self.detail = None;
                 }
                 KeyCode::Char('c') => self.start_comment()?,
+                KeyCode::Char('a') => self.mark_reviewed()?,
                 KeyCode::Char('n') => self.start_run_prompt()?,
                 KeyCode::Char('f') => self.send_feedback()?,
                 KeyCode::Char('i') => self.start_integrate()?,
@@ -923,6 +969,10 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
 
     let threads = threads::list_projection(&store.conn, 200)?;
     let run_summaries = threads::run_summaries(&store.conn, 200)?;
+    let attention = attention::project_all(&store, 200)?
+        .into_iter()
+        .map(|a| (a.thread_id.clone(), a))
+        .collect();
     let (ui_tx, ui_rx) = mpsc::channel();
     let mut app = App {
         store,
@@ -930,6 +980,7 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
         db_path: db_path.clone(),
         threads,
         run_summaries,
+        attention,
         thread_sel: 0,
         detail: None,
         mode: Mode::Normal,
@@ -1208,9 +1259,9 @@ fn render(f: &mut Frame, app: &mut App) {
         }
     } else {
         let body = Layout::horizontal([
-            Constraint::Percentage(24),
+            Constraint::Percentage(28),
             Constraint::Percentage(44),
-            Constraint::Percentage(32),
+            Constraint::Percentage(28),
         ])
         .split(chunks[1]);
         render_tasks(f, app, body[0]);
@@ -1268,6 +1319,7 @@ fn render_integration_preview(
     };
     let review = match preview.review {
         integration::ReviewState::Clear => "clear".to_string(),
+        integration::ReviewState::Required => "required — press Esc, then `a` in Aeril".into(),
         integration::ReviewState::Pending => {
             format!("{} unresolved comment(s)", preview.unresolved_comments)
         }
@@ -1453,10 +1505,23 @@ fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let running = running_thread_count(app);
-    let summary = if area.width >= 34 {
-        format!("{} total  ·  {} running ", app.threads.len(), running)
+    let attention_count = app.attention.values().filter(|a| a.is_actionable()).count();
+    let summary = if area.width >= 46 {
+        format!(
+            "{} total · {} attention · {} running ",
+            app.threads.len(),
+            attention_count,
+            running
+        )
+    } else if area.width >= 32 {
+        format!(
+            "{} · {} attn · {} run ",
+            app.threads.len(),
+            attention_count,
+            running
+        )
     } else {
-        format!("{} · {} active ", app.threads.len(), running)
+        format!("{} · {} attn ", app.threads.len(), attention_count)
     };
     let block = panel();
     let inner = block.inner(area).inner(Margin {
@@ -1511,14 +1576,27 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         .iter()
         .enumerate()
         .map(|(idx, thread)| {
-            let (state, color) = task_state(app, &thread.id);
+            let (state, state_color) = task_state(app, &thread.id);
+            let att = app.attention.get(&thread.id);
+            let color = att
+                .map(|a| match a.priority {
+                    0..=3 => MAGENTA,
+                    4..=6 => YELLOW,
+                    7 => GREEN,
+                    _ => MUTED,
+                })
+                .unwrap_or(state_color);
             let summary = app.run_summaries.get(&thread.id);
             let elapsed = elapsed_for(summary);
             let selected = idx == app.thread_sel;
             let branch = summary
                 .and_then(|s| s.latest_branch.clone())
                 .unwrap_or_else(|| "—".into());
-            let status = format!("{state}  ·  {elapsed}");
+            let status = match att {
+                Some(a) if a.historical_checkpoint => "checkpoint previo".to_string(),
+                Some(a) => format!("{}  ·  {elapsed}", a.status_label),
+                None => format!("{state}  ·  {elapsed}"),
+            };
             let mut status_line = vec![
                 Span::styled("      ", Style::default()),
                 Span::styled(status.clone(), Style::default().fg(color)),
@@ -1546,15 +1624,25 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 status_line.push(Span::raw(" ".repeat(padding)));
                 status_line.push(Span::styled(branch_text, Style::default().fg(DIM)));
                 lines.push(Line::from(status_line));
-            } else if compact_items {
-                lines.push(Line::from(status_line));
             } else {
                 lines.push(Line::from(status_line));
+                if !compact_items {
+                    lines.push(Line::from(vec![
+                        Span::styled("      ", Style::default()),
+                        Span::styled(
+                            format!("↳ {}", truncate_chars(&branch, title_width.max(8))),
+                            Style::default().fg(DIM),
+                        ),
+                    ]));
+                }
+            }
+            if let Some(att) = att {
+                let action = format!("→ {}", att.next_action);
                 lines.push(Line::from(vec![
                     Span::styled("      ", Style::default()),
                     Span::styled(
-                        format!("↳ {}", truncate_chars(&branch, title_width.max(8))),
-                        Style::default().fg(DIM),
+                        truncate_chars(&action, list_area.width.saturating_sub(6).max(8) as usize),
+                        Style::default().fg(color),
                     ),
                 ]));
             }
@@ -2334,6 +2422,8 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     Span::raw(" refresh   "),
                     key_badge("c"),
                     Span::raw(" comment   "),
+                    key_badge("a"),
+                    Span::raw(" reviewed   "),
                     key_badge("x"),
                     Span::raw(" cancel   "),
                     key_badge("?"),
@@ -2462,7 +2552,7 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 if compact {
                     "↑↓ select · Enter open · n run · c comment · Tab view · r refresh · q quit"
                 } else {
-                    "↑↓ select · Enter open · n run · c comment · f feedback · i integrate · x cancel · PgUp/PgDn patch · r refresh · q quit"
+                    "↑↓ select · Enter open · n run · c comment · a reviewed · f feedback · i integrate · x cancel · PgUp/PgDn patch · r refresh · q quit"
                 },
                 Style::default().fg(MUTED),
             )),
@@ -2954,6 +3044,7 @@ mod tests {
                 ordinal: 1,
                 total: 1,
             }),
+            displayed_snapshot: None,
         }
     }
 
@@ -2996,7 +3087,21 @@ mod tests {
                 ordinal: 1,
                 total: 1,
             }),
+            displayed_snapshot: None,
         }
+    }
+
+    #[test]
+    fn review_target_is_the_displayed_snapshot_not_the_latest_checkpoint() {
+        let mut detail = detail_with_two_runs();
+        detail.displayed_snapshot = Some(("snap-a".into(), "oid-a".into()));
+        assert_eq!(
+            review_target(&detail),
+            Some(("snap-a".into(), "oid-a".into())),
+            "la tecla `a` no debe caer al último ready si el patch visible es otro"
+        );
+        detail.displayed_snapshot = None;
+        assert_eq!(review_target(&detail), None);
     }
 
     #[test]
@@ -3045,6 +3150,7 @@ mod tests {
             }),
             progress,
             checkpoint,
+            displayed_snapshot: None,
         }
     }
 
