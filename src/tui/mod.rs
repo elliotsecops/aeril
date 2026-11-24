@@ -1371,7 +1371,7 @@ fn render_help_modal(f: &mut Frame, area: ratatui::layout::Rect) {
         area.width.saturating_sub(4).max(36)
     };
     let height = if area.height >= 26 {
-        19
+        21
     } else {
         area.height.saturating_sub(4).max(12)
     };
@@ -1395,12 +1395,12 @@ fn render_help_modal(f: &mut Frame, area: ratatui::layout::Rect) {
         .style(Style::default().bg(PANEL_BG));
     let inner = block.inner(rect).inner(Margin {
         horizontal: 2,
-        vertical: 1,
+        vertical: if area.height >= 26 { 1 } else { 0 },
     });
     f.render_widget(block, rect);
     let row = |k: &'static str, desc: &'static str| {
         Line::from(vec![
-            key_badge(k),
+            key_badge(&format!("{k:<7}")),
             Span::styled("  ", Style::default()),
             Span::styled(desc, Style::default().fg(TEXT)),
         ])
@@ -1693,7 +1693,7 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let focused = app.detail.is_none();
     let block = panel_with_focus(focused);
     let inner = block.inner(area).inner(Margin {
-        horizontal: if area.width < 34 { 1 } else { 2 },
+        horizontal: if area.width < 38 { 1 } else { 2 },
         vertical: 0,
     });
     f.render_widget(block, area);
@@ -1776,7 +1776,10 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             };
             let mut status_line = vec![
                 Span::styled("      ", Style::default()),
-                Span::styled(status.clone(), Style::default().fg(color)),
+                Span::styled(
+                    truncate_chars(&status, list_area.width.saturating_sub(6).max(8) as usize),
+                    Style::default().fg(color),
+                ),
             ];
             let mut lines = vec![Line::from(vec![
                 Span::styled(
@@ -1994,7 +1997,7 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let status_width = (status_text.chars().count() + 2) as u16;
     let header_cols =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(status_width)]).split(header[0]);
-    let title_width = header_cols[0].width.saturating_sub(14) as usize;
+    let title_width = header_cols[0].width.saturating_sub(10) as usize;
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(if focused { "▸ " } else { "" }, Style::default().fg(ACCENT)),
@@ -2321,7 +2324,7 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .unwrap_or_default();
     let block = panel_with_focus(focused);
     let inner = block.inner(area).inner(Margin {
-        horizontal: if area.width < 34 { 1 } else { 2 },
+        horizontal: if area.width < 38 { 1 } else { 2 },
         vertical: 0,
     });
     f.render_widget(block, area);
@@ -2489,7 +2492,13 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 Span::styled("State     ", Style::default().fg(MUTED)),
                 Span::styled(
                     if checkpoint.ready.recovered {
-                        "✓ recovered · verified"
+                        if area.width < 38 {
+                            "✓ recovered"
+                        } else {
+                            "✓ recovered · verified"
+                        }
+                    } else if area.width < 38 {
+                        "✓ verified"
                     } else {
                         "✓ verified · immutable"
                     },
@@ -2820,11 +2829,11 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ),
     };
     let right_width = if compact {
-        22
+        15
     } else if area.width >= 140 {
         58
     } else {
-        30
+        26
     };
     let row =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(rows[0]);
