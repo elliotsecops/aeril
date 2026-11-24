@@ -1179,7 +1179,51 @@ fn cmd_integrate_preview(p: &Parsed, db_path: &Path) -> Result<i32> {
     let to = p.require("to")?;
     let store = open_store(db_path)?;
     let preview = integration::preview(&store, &thread_id, &snapshot_id, &to)?;
-    print_json(&serde_json::to_value(preview)?)?;
+    if p.yes("text") {
+        println!(
+            "Integration preview: {} ({})",
+            preview.status_label(),
+            preview.operation
+        );
+        println!("Thread:   {} ({})", preview.thread_title, preview.thread_id);
+        println!("Snapshot: {}", preview.snapshot_id);
+        println!("Source:   {}", preview.source_oid.as_deref().unwrap_or("—"));
+        println!(
+            "Target:   {} @ {}",
+            preview.target_branch,
+            preview.target_oid.as_deref().unwrap_or("—")
+        );
+        if let Some(expected) = &preview.expected_target_oid {
+            println!("Expected: {expected}");
+        }
+        if let Some(path) = &preview.checked_out_path {
+            println!(
+                "Checkout: {path} ({})",
+                if preview.target_dirty == Some(true) {
+                    "dirty — uncommitted changes"
+                } else {
+                    "clean"
+                }
+            );
+        }
+        if let Some(reason) = &preview.reason {
+            println!("Reason:   {reason}");
+        }
+        if let Some(summary) = &preview.manual_summary {
+            println!("Summary:  {summary}");
+        }
+        if !preview.manual_commands.is_empty() {
+            println!("Commands:");
+            for cmd in &preview.manual_commands {
+                println!("  $ {cmd}");
+            }
+        }
+        for note in &preview.manual_notes {
+            println!("Note:     {note}");
+        }
+    } else {
+        print_json(&serde_json::to_value(preview)?)?;
+    }
     Ok(0)
 }
 

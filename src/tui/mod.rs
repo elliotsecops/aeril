@@ -902,6 +902,7 @@ impl App {
                 "no confirmable: {}",
                 preview.reason.clone().unwrap_or_else(|| "bloqueado".into())
             );
+            self.mode = Mode::IntegrationPreview { preview };
             return Ok(());
         }
         let (Some(source), Some(target)) = (&preview.source_oid, &preview.target_oid) else {
@@ -921,6 +922,7 @@ impl App {
                     "ya integrado: {} apunta a {}",
                     outcome.target_branch, outcome.target_oid_after
                 );
+                self.reload_threads()?;
             }
             Ok(outcome) => {
                 self.status = format!(
@@ -929,12 +931,57 @@ impl App {
                     &outcome.target_oid_before[..8.min(outcome.target_oid_before.len())],
                     &outcome.target_oid_after[..8.min(outcome.target_oid_after.len())]
                 );
+                self.reload_threads()?;
             }
             Err(e) => {
-                self.status = format!("integración bloqueada: {e}");
+                if let Ok(updated) = integration::stale_preview(
+                    &self.store,
+                    &preview.thread_id,
+                    &preview.snapshot_id,
+                    &preview.target_branch,
+                    target,
+                ) {
+                    self.status =
+                        format!("integración bloqueada ({}): {e}", updated.status_label());
+                    self.mode = Mode::IntegrationPreview {
+                        preview: Box::new(updated),
+                    };
+                } else {
+                    self.status = format!("integración bloqueada: {e}");
+                }
             }
         }
         self.refresh_detail()?;
+        Ok(())
+    }
+
+    /// Re-evalúa el preview de integración actual sin mover refs ni confirmar.
+    fn refresh_integration_preview(&mut self) -> Result<()> {
+        let Mode::IntegrationPreview { preview } = &self.mode else {
+            return Ok(());
+        };
+        let thread_id = preview.thread_id.clone();
+        let snapshot_id = preview.snapshot_id.clone();
+        let target_branch = preview.target_branch.clone();
+        match integration::preview(&self.store, &thread_id, &snapshot_id, &target_branch) {
+            Ok(fresh) => {
+                self.status = if fresh.eligible {
+                    "preview actualizado: y confirma · Esc cancela".into()
+                } else {
+                    format!(
+                        "preview actualizado: {} · {}",
+                        fresh.status_label(),
+                        fresh.reason.clone().unwrap_or_default()
+                    )
+                };
+                self.mode = Mode::IntegrationPreview {
+                    preview: Box::new(fresh),
+                };
+            }
+            Err(e) => {
+                self.status = format!("no se pudo refrescar preview: {e}");
+            }
+        }
         Ok(())
     }
 
@@ -1154,6 +1201,7 @@ impl App {
                     self.mode = Mode::Normal;
                     self.status = "integración cancelada (sin cambios)".into();
                 }
+                KeyCode::Char('r') => self.refresh_integration_preview()?,
                 KeyCode::Char('y') => self.confirm_integration()?,
                 // Enter y cualquier otra tecla NO ejecutan: la confirmación
                 // explícita es obligatoria.
@@ -1839,15 +1887,20 @@ fn render_integration_preview(
     preview: &integration::IntegrationPreview,
     area: ratatui::layout::Rect,
 ) {
-    let width = if area.width >= 120 {
+    let compact = area.width < 100 || area.height < 30;
+    let width = if area.width >= 140 {
+        118
+    } else if area.width >= 110 {
         104
     } else {
-        area.width.saturating_sub(4).max(40)
+        area.width.saturating_sub(2).max(40)
     };
-    let height = if area.height >= 36 {
-        22
+    let height = if area.height >= 40 {
+        30
+    } else if area.height >= 32 {
+        26
     } else {
-        area.height.saturating_sub(4).max(12)
+        area.height.saturating_sub(2).max(14)
     };
     let rect = ratatui::layout::Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
@@ -1856,144 +1909,232 @@ fn render_integration_preview(
         height: height.min(area.height),
     };
     f.render_widget(Clear, rect);
-    let accent = if preview.eligible { GREEN } else { RED };
+    let accent = if preview.eligible {
+        GREEN
+    } else if matches!(
+        preview.status,
+        integration::IntegrationStatus::AlreadyIntegrated
+    ) {
+        ACCENT
+    } else {
+        RED
+    };
     let short = |s: &str| s[..12.min(s.len())].to_string();
     let validation = match preview.validation {
         integration::ValidationState::Passed => format!(
-            "PASS — {}",
+            "PASS ({})",
             preview
                 .validation_command
                 .as_deref()
                 .unwrap_or("validation")
         ),
-        integration::ValidationState::Missing => "MISSING — ejecutá la instrucción inferior".into(),
+        integration::ValidationState::Missing => "MISSING — ejecutá la validación".into(),
         integration::ValidationState::Failed
         | integration::ValidationState::WrongOid
         | integration::ValidationState::Invalid => format!(
-            "BLOCKED — {}",
-            preview
-                .reason
-                .clone()
-                .unwrap_or_else(|| "evidencia inválida".into())
+            "BLOCKED ({})",
+            preview.reason.as_deref().unwrap_or("evidencia inválida")
         ),
     };
     let review = match preview.review {
         integration::ReviewState::Clear => "clear".to_string(),
-        integration::ReviewState::Required => "required — press Esc, then `a` in Aeril".into(),
+        integration::ReviewState::Required => "required — Esc, luego `a`".into(),
         integration::ReviewState::Pending => {
             format!("{} unresolved comment(s)", preview.unresolved_comments)
         }
         integration::ReviewState::Invalid => "invalid evidence".into(),
     };
-    let lines = vec![
-        Line::from(Span::styled(
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
             "Integration preview",
             Style::default()
                 .fg(TEXT_BRIGHT)
                 .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
+        ),
+        Span::styled("   ", Style::default()),
+        Span::styled(
+            preview.status_label(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    if compact {
+        lines.push(Line::from(vec![
+            Span::styled("Thread/Snap ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!(
+                    "{} ({}) · {} · {} files (+{}/-{})",
+                    preview.thread_title,
+                    short(&preview.thread_id),
+                    short(&preview.snapshot_id),
+                    preview.files_changed,
+                    preview.additions,
+                    preview.deletions
+                ),
+                Style::default().fg(TEXT),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
             Span::styled("Thread      ", Style::default().fg(MUTED)),
             Span::styled(
                 format!("{} ({})", preview.thread_title, short(&preview.thread_id)),
                 Style::default().fg(TEXT),
             ),
-        ]),
-        Line::from(vec![
+        ]));
+        lines.push(Line::from(vec![
             Span::styled("Snapshot    ", Style::default().fg(MUTED)),
-            Span::styled(short(&preview.snapshot_id), Style::default().fg(TEXT)),
-        ]),
-        Line::from(vec![
-            Span::styled("Source      ", Style::default().fg(MUTED)),
+            Span::styled(preview.snapshot_id.clone(), Style::default().fg(TEXT)),
             Span::styled(
-                preview
-                    .source_oid
-                    .as_deref()
-                    .map(short)
-                    .unwrap_or_else(|| "—".into()),
-                Style::default().fg(TEXT),
+                format!(
+                    "   ({} files · +{} / -{})",
+                    preview.files_changed, preview.additions, preview.deletions
+                ),
+                Style::default().fg(MUTED),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Target      ", Style::default().fg(MUTED)),
-            Span::styled(preview.target_branch.clone(), Style::default().fg(TEXT)),
-            Span::styled("  @ ", Style::default().fg(MUTED)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("Source OID  ", Style::default().fg(MUTED)),
+        Span::styled(
+            preview.source_oid.clone().unwrap_or_else(|| "—".into()),
+            Style::default().fg(TEXT_BRIGHT),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Target OID  ", Style::default().fg(MUTED)),
+        Span::styled(
+            format!(
+                "{} @ {}",
+                preview.target_branch,
+                preview.target_oid.as_deref().unwrap_or("—")
+            ),
+            Style::default().fg(TEXT_BRIGHT),
+        ),
+    ]));
+    if let Some(expected) = &preview.expected_target_oid {
+        lines.push(Line::from(vec![
+            Span::styled("Expected    ", Style::default().fg(YELLOW)),
+            Span::styled(expected.clone(), Style::default().fg(YELLOW)),
+        ]));
+    }
+    if let Some(co_path) = &preview.checked_out_path {
+        let dirty_tag = if preview.target_dirty == Some(true) {
+            " [DIRTY — uncommitted changes]"
+        } else {
+            " [clean checkout]"
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Checkout    ", Style::default().fg(MUTED)),
             Span::styled(
-                preview
-                    .target_oid
-                    .as_deref()
-                    .map(short)
-                    .unwrap_or_else(|| "—".into()),
-                Style::default().fg(TEXT),
+                format!("{co_path}{dirty_tag}"),
+                Style::default().fg(if preview.target_dirty == Some(true) {
+                    YELLOW
+                } else {
+                    TEXT
+                }),
             ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Files       ", Style::default().fg(MUTED)),
-            Span::styled(
-                format!("{} changed", preview.files_changed),
-                Style::default().fg(TEXT),
-            ),
-            Span::styled("   Changes ", Style::default().fg(MUTED)),
-            Span::styled(
-                format!("+{} / -{}", preview.additions, preview.deletions),
-                Style::default().fg(TEXT),
-            ),
-        ]),
-        Line::from(vec![
+        ]));
+    }
+    if compact {
+        lines.push(Line::from(vec![
+            Span::styled("Gates       ", Style::default().fg(MUTED)),
+            Span::styled(format!("Val: {validation}"), Style::default().fg(accent)),
+            Span::styled(format!("  |  Rev: {review}"), Style::default().fg(TEXT)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
             Span::styled("Validation  ", Style::default().fg(MUTED)),
             Span::styled(validation, Style::default().fg(accent)),
-        ]),
-        Line::from(vec![
+        ]));
+        lines.push(Line::from(vec![
             Span::styled("Review      ", Style::default().fg(MUTED)),
             Span::styled(review, Style::default().fg(TEXT)),
-        ]),
-        Line::from(vec![
-            Span::styled("Git         ", Style::default().fg(MUTED)),
-            Span::styled(
-                preview.status_label(),
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            preview.reason.clone().unwrap_or_else(|| {
-                if preview.eligible {
-                    "Fast-forward verificado. La ref solo se moverá con [y].".into()
-                } else {
-                    "Operación bloqueada: no se moverá ninguna ref.".into()
-                }
-            }),
-            Style::default().fg(MUTED),
-        )),
-        Line::from(Span::styled(
-            if preview.validation == integration::ValidationState::Missing {
-                preview.validation_instruction.clone()
-            } else {
-                String::new()
-            },
-            Style::default().fg(YELLOW),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
+        ]));
+        lines.push(Line::from(""));
+    }
+    let summary = preview
+        .manual_summary
+        .clone()
+        .or_else(|| preview.reason.clone())
+        .unwrap_or_else(|| {
             if preview.eligible {
-                "[y] Confirm fast-forward    [Esc] Cancel"
+                "Fast-forward verificado. La ref solo se moverá con [y].".into()
             } else {
-                "[Esc] Close"
+                "Operación bloqueada: no se moverá ninguna ref.".into()
+            }
+        });
+    lines.push(Line::from(vec![
+        Span::styled("Detail      ", Style::default().fg(MUTED)),
+        Span::styled(summary, Style::default().fg(TEXT)),
+    ]));
+    if let Some(reason) = &preview.reason
+        && preview.manual_summary.as_deref() != Some(reason.as_str())
+        && !compact
+    {
+        lines.push(Line::from(vec![
+            Span::styled("Reason      ", Style::default().fg(MUTED)),
+            Span::styled(reason.clone(), Style::default().fg(MUTED)),
+        ]));
+    }
+    if !preview.manual_commands.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if preview.target_dirty == Some(true) {
+                "Safe manual recovery commands (non-destructive):"
+            } else {
+                "Safe commands:"
             },
-            Style::default().fg(TEXT_BRIGHT),
-        )),
-    ];
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        )));
+        for cmd in &preview.manual_commands {
+            lines.push(Line::from(Span::styled(
+                format!("  $ {cmd}"),
+                Style::default().fg(YELLOW),
+            )));
+        }
+    }
+    for note in preview
+        .manual_notes
+        .iter()
+        .take(if compact { 1 } else { 3 })
+    {
+        lines.push(Line::from(Span::styled(
+            format!("• {note}"),
+            Style::default().fg(MUTED),
+        )));
+    }
+    let footer_hint = if preview.eligible {
+        "[y] Confirm fast-forward   [r] Refresh   [Esc] Cancel"
+    } else {
+        "[r] Refresh preview   [Esc] Close"
+    };
     let block = Block::default()
         .title(" assisted integration ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(accent))
         .style(Style::default().bg(PANEL_BG));
+    let inner = block.inner(rect).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    f.render_widget(block, rect);
+    let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     f.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
-        rect,
+        Paragraph::new(lines)
+            .style(Style::default().bg(PANEL_BG))
+            .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer_hint,
+            Style::default()
+                .fg(TEXT_BRIGHT)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .style(Style::default().bg(PANEL_BG)),
+        sections[1],
     );
 }
 
@@ -3267,23 +3408,27 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 ),
                 Span::styled(
                     if preview.eligible {
-                        " · [y] confirm   [Esc] cancel"
+                        " · [y] confirm   [r] refresh   [Esc] cancel"
                     } else {
-                        " · [Esc] close"
+                        " · [r] refresh   [Esc] close"
                     },
                     Style::default().fg(MUTED),
                 ),
             ]),
             Line::from(Span::styled(
-                preview.reason.clone().unwrap_or_else(|| {
-                    format!(
-                        "{} · {} files · +{} / -{}",
-                        preview.target_branch,
-                        preview.files_changed,
-                        preview.additions,
-                        preview.deletions
-                    )
-                }),
+                preview
+                    .manual_summary
+                    .clone()
+                    .or_else(|| preview.reason.clone())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{} · {} files · +{} / -{}",
+                            preview.target_branch,
+                            preview.files_changed,
+                            preview.additions,
+                            preview.deletions
+                        )
+                    }),
                 Style::default().fg(TEXT),
             )),
         ),

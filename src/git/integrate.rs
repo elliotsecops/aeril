@@ -200,13 +200,48 @@ pub fn fast_forward_with_hook(
     })
 }
 
-/// Devuelve una descripción del worktree que tiene la rama chequeada, si hay.
-pub fn checked_out_worktree(repo: &Repository, branch: &str) -> Option<String> {
-    if let Ok(head) = repo.head()
+/// Checkout activo que tiene actualmente la rama destino revisada.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedOutTarget {
+    pub label: String,
+    pub path: String,
+    pub dirty: bool,
+}
+
+fn clean_workdir_path(repo: &Repository) -> String {
+    let raw = repo.workdir().unwrap_or_else(|| repo.path());
+    let s = raw.to_string_lossy();
+    if s.len() > 1 {
+        s.trim_end_matches('/').to_string()
+    } else {
+        s.into_owned()
+    }
+}
+
+fn worktree_is_dirty(repo: &Repository) -> bool {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .exclude_submodules(true);
+    match repo.statuses(Some(&mut opts)) {
+        Ok(statuses) => !statuses.is_empty(),
+        Err(_) => true,
+    }
+}
+
+/// Detecta qué checkout principal o worktree tiene `branch` checked out, junto
+/// con su ruta en disco y si tiene cambios sin commitear.
+pub fn checked_out_target(repo: &Repository, branch: &str) -> Option<CheckedOutTarget> {
+    if !repo.is_bare()
+        && let Ok(head) = repo.head()
         && head.is_branch()
         && head.shorthand().ok() == Some(branch)
     {
-        return Some("checkout principal".to_string());
+        return Some(CheckedOutTarget {
+            label: "checkout principal".to_string(),
+            path: clean_workdir_path(repo),
+            dirty: worktree_is_dirty(repo),
+        });
     }
     if let Ok(names) = repo.worktrees() {
         for name in names.iter() {
@@ -221,9 +256,18 @@ pub fn checked_out_worktree(repo: &Repository, branch: &str) -> Option<String> {
                 && head.is_branch()
                 && head.shorthand().ok() == Some(branch)
             {
-                return Some(format!("worktree {name}"));
+                return Some(CheckedOutTarget {
+                    label: format!("worktree {name}"),
+                    path: clean_workdir_path(&wr),
+                    dirty: worktree_is_dirty(&wr),
+                });
             }
         }
     }
     None
+}
+
+/// Devuelve una descripción del worktree que tiene la rama chequeada, si hay.
+pub fn checked_out_worktree(repo: &Repository, branch: &str) -> Option<String> {
+    checked_out_target(repo, branch).map(|target| target.label)
 }
