@@ -20,7 +20,8 @@ use ratatui::layout::{Alignment, Constraint, Layout, Margin};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -100,20 +101,27 @@ pub struct RunSlot {
 pub const MAX_SUPERVISED_RUNS: usize = 2;
 
 const BG: Color = Color::Rgb(13, 16, 21);
-const PANEL_BG: Color = Color::Rgb(21, 24, 31);
-const PANEL_BG_ALT: Color = Color::Rgb(25, 29, 38);
-const BORDER: Color = Color::Rgb(43, 49, 61);
-const TEXT: Color = Color::Rgb(201, 209, 217);
-const TEXT_BRIGHT: Color = Color::Rgb(235, 239, 244);
-const MUTED: Color = Color::Rgb(125, 133, 144);
-const DIM: Color = Color::Rgb(82, 89, 101);
-const ACCENT: Color = Color::Rgb(111, 158, 232);
-const ACCENT_BG: Color = Color::Rgb(38, 59, 89);
-const GREEN: Color = Color::Rgb(127, 179, 107);
-const RED: Color = Color::Rgb(214, 110, 110);
-const YELLOW: Color = Color::Rgb(214, 179, 106);
-const MAGENTA: Color = Color::Rgb(180, 142, 173);
-const CYAN: Color = Color::Rgb(111, 168, 163);
+const PANEL_BG: Color = Color::Rgb(20, 24, 31);
+const PANEL_BG_ALT: Color = Color::Rgb(27, 32, 42);
+const BORDER: Color = Color::Rgb(46, 53, 66);
+const BORDER_ACTIVE: Color = Color::Rgb(92, 138, 214);
+const TEXT: Color = Color::Rgb(204, 212, 221);
+const TEXT_BRIGHT: Color = Color::Rgb(239, 243, 248);
+const MUTED: Color = Color::Rgb(132, 141, 153);
+const DIM: Color = Color::Rgb(86, 94, 107);
+const ACCENT: Color = Color::Rgb(111, 163, 240);
+const ACCENT_BG: Color = Color::Rgb(35, 57, 88);
+const ACCENT_SOFT: Color = Color::Rgb(25, 39, 60);
+const BADGE_BG: Color = Color::Rgb(30, 36, 48);
+const DIFF_ADD_BG: Color = Color::Rgb(20, 41, 29);
+const DIFF_DEL_BG: Color = Color::Rgb(49, 24, 28);
+const DIFF_HUNK_BG: Color = Color::Rgb(23, 37, 54);
+const DIFF_HEADER_BG: Color = Color::Rgb(27, 33, 45);
+const GREEN: Color = Color::Rgb(129, 189, 110);
+const RED: Color = Color::Rgb(224, 114, 114);
+const YELLOW: Color = Color::Rgb(222, 184, 108);
+const MAGENTA: Color = Color::Rgb(189, 149, 184);
+const CYAN: Color = Color::Rgb(112, 178, 173);
 
 fn is_hermes_backend(backend: &str) -> bool {
     backend == "hermes" || backend.starts_with("hermes:")
@@ -1112,12 +1120,16 @@ fn summarize_recovery(
 
 // ── render ───────────────────────────────────────────────────────────────────
 
-fn panel() -> Block<'static> {
+fn panel_with_focus(focused: bool) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER))
+        .border_style(Style::default().fg(if focused { BORDER_ACTIVE } else { BORDER }))
         .style(Style::default().bg(PANEL_BG).fg(TEXT))
+}
+
+fn panel() -> Block<'static> {
+    panel_with_focus(false)
 }
 
 fn label_style() -> Style {
@@ -1128,10 +1140,82 @@ fn key_badge(key: &str) -> Span<'static> {
     Span::styled(
         format!(" {key} "),
         Style::default()
-            .fg(TEXT_BRIGHT)
+            .fg(ACCENT)
             .bg(PANEL_BG_ALT)
             .add_modifier(Modifier::BOLD),
     )
+}
+
+fn chip(text: &str, fg: Color, bg: Color) -> Span<'static> {
+    Span::styled(
+        format!(" {text} "),
+        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn state_icon(state: &str) -> &'static str {
+    match state {
+        "running" | "starting" => "▶",
+        "cancelling" => "◐",
+        "completed" => "✓",
+        "failed" => "✕",
+        "cancelled" => "⊘",
+        _ => "○",
+    }
+}
+
+fn status_color(status: &str) -> Color {
+    let lower = status.to_lowercase();
+    if lower.starts_with("error:")
+        || lower.contains("bloquead")
+        || lower.contains("falló")
+        || lower.contains("no se pudo")
+        || lower.contains("no se lanzó")
+    {
+        RED
+    } else if lower.contains("cancel")
+        || lower.contains("vacío")
+        || lower.contains("solo se")
+        || lower.contains("pendient")
+    {
+        YELLOW
+    } else if lower.contains("complet")
+        || lower.contains("marcado")
+        || lower.contains("integrado")
+        || lower.contains("agregado")
+        || lower.contains("refrescado")
+    {
+        GREEN
+    } else if lower.starts_with("▶") || lower.contains("enviando") {
+        ACCENT
+    } else {
+        MUTED
+    }
+}
+
+fn render_divider(f: &mut Frame, area: ratatui::layout::Rect) {
+    f.render_widget(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(PANEL_BG)),
+        area,
+    );
+}
+
+fn render_scrollbar(f: &mut Frame, area: ratatui::layout::Rect, total: usize, position: usize) {
+    if total <= area.height as usize || area.height == 0 || area.width == 0 {
+        return;
+    }
+    let mut sb_state = ScrollbarState::new(total).position(position);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .thumb_symbol("┃")
+        .track_style(Style::default().fg(BORDER))
+        .thumb_style(Style::default().fg(DIM));
+    f.render_stateful_widget(scrollbar, area, &mut sb_state);
 }
 
 fn task_state(app: &App, thread_id: &str) -> (String, Color) {
@@ -1269,9 +1353,86 @@ fn render(f: &mut Frame, app: &mut App) {
         render_checkpoint(f, app, body[2]);
     }
     render_footer(f, app, chunks[2]);
-    if let Mode::IntegrationPreview { preview } = &app.mode {
-        render_integration_preview(f, preview, f.area());
+    match &app.mode {
+        Mode::IntegrationPreview { preview } => {
+            render_integration_preview(f, preview, f.area());
+        }
+        Mode::Help => {
+            render_help_modal(f, f.area());
+        }
+        _ => {}
     }
+}
+
+fn render_help_modal(f: &mut Frame, area: ratatui::layout::Rect) {
+    let width = if area.width >= 96 {
+        76
+    } else {
+        area.width.saturating_sub(4).max(36)
+    };
+    let height = if area.height >= 26 {
+        19
+    } else {
+        area.height.saturating_sub(4).max(12)
+    };
+    let rect = ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(Span::styled(
+            " Keyboard shortcuts ",
+            Style::default()
+                .fg(TEXT_BRIGHT)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER_ACTIVE))
+        .style(Style::default().bg(PANEL_BG));
+    let inner = block.inner(rect).inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    f.render_widget(block, rect);
+    let row = |k: &'static str, desc: &'static str| {
+        Line::from(vec![
+            key_badge(k),
+            Span::styled("  ", Style::default()),
+            Span::styled(desc, Style::default().fg(TEXT)),
+        ])
+    };
+    let lines = vec![
+        Line::from(Span::styled("Navigation", label_style())),
+        row("↑ / ↓", "Select task or timeline event"),
+        row("Enter", "Open selected task thread"),
+        row("Esc", "Back to tasks / close modal"),
+        row("Tab", "Switch Run / Review (narrow layout)"),
+        row("PgUp/Dn", "Scroll checkpoint diff patch"),
+        Line::from(""),
+        Line::from(Span::styled("Execution & Review", label_style())),
+        row("n", "Start a new run on open thread"),
+        row("c", "Comment on selected checkpoint"),
+        row("a", "Mark visible checkpoint as reviewed"),
+        row("f", "Send open comments as feedback"),
+        row("i", "Open assisted fast-forward integration"),
+        row("x", "Cancel active run on selected thread"),
+        row("r / q", "Refresh view / quit (blocked if runs active)"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press ? or Esc to return.",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(PANEL_BG))
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
 }
 
 fn render_integration_preview(
@@ -1439,15 +1600,15 @@ fn render_integration_preview(
 
 fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let compact = area.width < 110;
-    let title = vec![
-        Span::styled(
-            " Aeril",
-            Style::default()
-                .fg(TEXT_BRIGHT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  |  Agent workspace", Style::default().fg(MUTED)),
+    let active = running_thread_count(app);
+    let mut title = vec![
+        chip("◆ Aeril", TEXT_BRIGHT, ACCENT_BG),
+        Span::styled("  Agent workspace", Style::default().fg(MUTED)),
     ];
+    if active > 0 {
+        title.push(Span::styled("  ", Style::default()));
+        title.push(chip(&format!("▶ {active} active"), ACCENT, ACCENT_SOFT));
+    }
     let block = panel();
     f.render_widget(block, area);
     let inner = area.inner(Margin {
@@ -1455,14 +1616,14 @@ fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         vertical: 1,
     });
     if compact {
-        let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(22)]).split(inner);
+        let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(20)]).split(inner);
         f.render_widget(
             Paragraph::new(Line::from(title)).style(Style::default().bg(PANEL_BG)),
             cols[0],
         );
         f.render_widget(
             Paragraph::new(now_clock())
-                .style(Style::default().fg(MUTED))
+                .style(Style::default().fg(DIM))
                 .alignment(Alignment::Right),
             cols[1],
         );
@@ -1478,7 +1639,7 @@ fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let cols = Layout::horizontal([
         Constraint::Min(34),
         Constraint::Length(workspace_width),
-        Constraint::Length(22),
+        Constraint::Length(20),
     ])
     .split(inner);
     f.render_widget(
@@ -1487,17 +1648,23 @@ fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
     let repo = selected_repo(app);
     let workspace = if repo.is_empty() {
-        "workspace  no task selected".to_string()
+        Line::from(vec![
+            Span::styled("repo  ", Style::default().fg(DIM)),
+            Span::styled("no task selected", Style::default().fg(MUTED)),
+        ])
     } else {
-        format!("workspace  {}", short_repo(&repo))
+        Line::from(vec![
+            Span::styled("repo  ", Style::default().fg(DIM)),
+            Span::styled(short_repo(&repo), Style::default().fg(TEXT)),
+        ])
     };
     f.render_widget(
-        Paragraph::new(workspace).style(Style::default().fg(MUTED)),
+        Paragraph::new(workspace).style(Style::default().bg(PANEL_BG)),
         cols[1],
     );
     f.render_widget(
         Paragraph::new(now_clock())
-            .style(Style::default().fg(MUTED))
+            .style(Style::default().fg(DIM))
             .alignment(Alignment::Right),
         cols[2],
     );
@@ -1523,9 +1690,10 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     } else {
         format!("{} · {} attn ", app.threads.len(), attention_count)
     };
-    let block = panel();
+    let focused = app.detail.is_none();
+    let block = panel_with_focus(focused);
     let inner = block.inner(area).inner(Margin {
-        horizontal: 2,
+        horizontal: if area.width < 34 { 1 } else { 2 },
         vertical: 0,
     });
     f.render_widget(block, area);
@@ -1539,12 +1707,16 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let header_cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(summary_width)])
         .split(header[0]);
     f.render_widget(
-        Paragraph::new("Tasks").style(
-            Style::default()
-                .fg(TEXT_BRIGHT)
-                .bg(PANEL_BG)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Paragraph::new(Line::from(vec![
+            Span::styled(if focused { "▸ " } else { "" }, Style::default().fg(ACCENT)),
+            Span::styled(
+                "Tasks",
+                Style::default()
+                    .fg(TEXT_BRIGHT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(Style::default().bg(PANEL_BG)),
         header_cols[0],
     );
     f.render_widget(
@@ -1553,13 +1725,14 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             .alignment(Alignment::Right),
         header_cols[1],
     );
+    render_divider(f, header[1]);
     let list_area = header[2];
     if app.threads.is_empty() {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled("No tasks yet.", Style::default().fg(MUTED))),
                 Line::from(Span::styled(
-                    "Create one from the CLI, then refresh.",
+                    "Create one from the CLI, then refresh (r).",
                     Style::default().fg(DIM),
                 )),
             ])
@@ -1586,6 +1759,10 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                     _ => MUTED,
                 })
                 .unwrap_or(state_color);
+            let icon = match att {
+                Some(a) if a.is_actionable() => "◆",
+                _ => state_icon(&state),
+            };
             let summary = app.run_summaries.get(&thread.id);
             let elapsed = elapsed_for(summary);
             let selected = idx == app.thread_sel;
@@ -1607,10 +1784,14 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                     Style::default().fg(if selected { ACCENT } else { PANEL_BG }),
                 ),
                 Span::styled(format!("{:>2}  ", idx + 1), Style::default().fg(DIM)),
-                Span::styled("● ", Style::default().fg(color)),
+                Span::styled(format!("{icon} "), Style::default().fg(color)),
                 Span::styled(
                     truncate_chars(&thread.title, title_width.max(8)),
-                    Style::default().fg(TEXT_BRIGHT),
+                    Style::default().fg(TEXT_BRIGHT).add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
                 ),
             ])];
             if show_branch_inline {
@@ -1648,7 +1829,6 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             }
             if !compact_items {
                 lines.push(Line::from(""));
-                lines.push(Line::from(""));
             }
             ListItem::new(lines).style(if selected {
                 Style::default().bg(ACCENT_BG)
@@ -1664,6 +1844,9 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let mut state = ListState::default();
     state.select(Some(app.thread_sel));
     f.render_stateful_widget(list, list_area, &mut state);
+    if app.threads.len() * 3 > list_area.height as usize {
+        render_scrollbar(f, list_area, app.threads.len(), app.thread_sel);
+    }
 }
 
 fn latest_goal(detail: &ThreadDetail) -> Option<String> {
@@ -1748,29 +1931,39 @@ fn checklist(detail: &ThreadDetail) -> Vec<(String, Color, String)> {
 }
 
 fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let focused = app.detail.is_some() && (area.width >= 110 || app.narrow_view == NarrowView::Run);
+    let narrow_pane = area.width < 110;
     let detail_meta = app
         .detail
         .as_ref()
         .map(|d| (d.thread_id.clone(), d.title.clone()));
     let Some((thread_id, thread_title)) = detail_meta else {
-        let block = panel();
+        let block = panel_with_focus(false);
         let inner = block.inner(area).inner(Margin {
-            horizontal: 1,
-            vertical: 0,
+            horizontal: 2,
+            vertical: 1,
         });
         f.render_widget(block, area);
         f.render_widget(
             Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "No task open",
+                    Style::default()
+                        .fg(TEXT_BRIGHT)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Select a task with ↑↓ and press Enter.",
+                    "Select a task with ↑ / ↓ and press Enter.",
                     Style::default().fg(MUTED),
                 )),
                 Line::from(""),
-                Line::from(Span::styled(
-                    "  n starts a run · c comments on a verified checkpoint",
-                    Style::default().fg(DIM),
-                )),
+                Line::from(vec![
+                    key_badge("n"),
+                    Span::styled(" start a run   ", Style::default().fg(DIM)),
+                    key_badge("c"),
+                    Span::styled(" comment on checkpoint", Style::default().fg(DIM)),
+                ]),
             ])
             .style(Style::default().bg(PANEL_BG)),
             inner,
@@ -1783,9 +1976,10 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         .get(&thread_id)
         .map(|s| s.run_count)
         .unwrap_or(0);
-    let block = panel();
+    let elapsed = elapsed_for(app.run_summaries.get(&thread_id));
+    let block = panel_with_focus(focused);
     let inner = block.inner(area).inner(Margin {
-        horizontal: 2,
+        horizontal: if narrow_pane { 1 } else { 2 },
         vertical: 0,
     });
     f.render_widget(block, area);
@@ -1795,18 +1989,15 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         Constraint::Min(0),
     ])
     .split(inner);
-    let status = format!(
-        "{}  ·  {}",
-        state,
-        elapsed_for(app.run_summaries.get(&thread_id))
-    );
-    let status_width = status.chars().count() as u16;
+    let status_text = format!("{} {}  ·  {}", state_icon(&state), state, elapsed);
+    let status_chip = chip(&status_text, state_color, BADGE_BG);
+    let status_width = (status_text.chars().count() + 2) as u16;
     let header_cols =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(status_width + 2)])
-            .split(header[0]);
-    let title_width = header_cols[0].width.saturating_sub(16) as usize;
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(status_width)]).split(header[0]);
+    let title_width = header_cols[0].width.saturating_sub(14) as usize;
     f.render_widget(
         Paragraph::new(Line::from(vec![
+            Span::styled(if focused { "▸ " } else { "" }, Style::default().fg(ACCENT)),
             Span::styled(
                 format!(
                     "Run {}",
@@ -1818,29 +2009,30 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 ),
                 Style::default()
                     .fg(TEXT_BRIGHT)
-                    .bg(PANEL_BG)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" — ", Style::default().fg(DIM).bg(PANEL_BG)),
+            Span::styled(" — ", Style::default().fg(DIM)),
             Span::styled(
                 truncate_chars(&thread_title, title_width.max(8)),
-                Style::default().fg(TEXT_BRIGHT).bg(PANEL_BG),
+                Style::default().fg(TEXT_BRIGHT),
             ),
-        ])),
+        ]))
+        .style(Style::default().bg(PANEL_BG)),
         header_cols[0],
     );
     f.render_widget(
-        Paragraph::new(status)
-            .style(Style::default().fg(state_color).bg(PANEL_BG))
+        Paragraph::new(Line::from(status_chip))
+            .style(Style::default().bg(PANEL_BG))
             .alignment(Alignment::Right),
         header_cols[1],
     );
+    render_divider(f, header[1]);
     let Some(detail) = app.detail.as_mut() else {
         return;
     };
     let compact = area.width < 70;
     let sections = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(if compact { 3 } else { 4 }),
         Constraint::Length(if compact { 2 } else { 7 }),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -1852,7 +2044,7 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         .unwrap_or_else(|| "No run yet. Press n to describe the next task.".to_string());
     f.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(" Goal", label_style())),
+            Line::from(Span::styled("Goal", label_style())),
             Line::from(Span::styled(goal, Style::default().fg(TEXT))),
         ])
         .wrap(Wrap { trim: true })
@@ -1863,7 +2055,7 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let steps = checklist(detail);
     let checklist_lines: Vec<Line> = if steps.is_empty() {
         vec![Line::from(Span::styled(
-            "  Waiting for the first run.",
+            "Waiting for the first run.",
             Style::default().fg(DIM),
         ))]
     } else if compact {
@@ -1881,10 +2073,16 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                         Style::default().fg(*color),
                     )
                 });
-        let mut line = vec![Span::styled(
-            format!("  {done}/{} steps complete", steps.len()),
-            Style::default().fg(MUTED),
-        )];
+        let filled = "█".repeat(done);
+        let empty = "░".repeat(steps.len().saturating_sub(done));
+        let mut line = vec![
+            Span::styled(filled, Style::default().fg(GREEN)),
+            Span::styled(empty, Style::default().fg(BORDER)),
+            Span::styled(
+                format!("  {done}/{} steps complete", steps.len()),
+                Style::default().fg(MUTED),
+            ),
+        ];
         if let Some(active) = active {
             line.push(active);
         }
@@ -1893,9 +2091,10 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         steps
             .into_iter()
             .map(|(icon, color, text)| {
+                let text_color = if icon == "○" { DIM } else { TEXT };
                 Line::from(vec![
                     Span::styled(format!("  {icon}  "), Style::default().fg(color)),
-                    Span::styled(text, Style::default().fg(TEXT)),
+                    Span::styled(text, Style::default().fg(text_color)),
                 ])
             })
             .collect()
@@ -1904,12 +2103,7 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         Paragraph::new(checklist_lines).style(Style::default().bg(PANEL_BG)),
         sections[1],
     );
-    f.render_widget(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(BORDER)),
-        sections[2],
-    );
+    render_divider(f, sections[2]);
     let file_count = detail
         .checkpoint
         .as_ref()
@@ -1918,16 +2112,11 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let comments = detail.comments.len();
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                " Agent output",
-                Style::default()
-                    .fg(ACCENT)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            ),
-            Span::styled(
-                format!("   Files {file_count}   Reviews {comments}"),
-                Style::default().fg(MUTED),
-            ),
+            chip("Agent output", TEXT_BRIGHT, ACCENT_BG),
+            Span::raw(" "),
+            chip(&format!("Files {file_count}"), MUTED, BADGE_BG),
+            Span::raw(" "),
+            chip(&format!("Reviews {comments}"), MUTED, BADGE_BG),
         ]))
         .style(Style::default().bg(PANEL_BG)),
         sections[3],
@@ -1938,7 +2127,7 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  The timeline will appear after the first run.",
+                    "The timeline will appear after the first run.",
                     Style::default().fg(DIM),
                 )),
             ])
@@ -1955,10 +2144,11 @@ fn render_run(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let list = List::new(items)
         .style(Style::default().bg(PANEL_BG))
         .highlight_style(Style::default().bg(PANEL_BG_ALT))
-        .highlight_symbol("");
+        .highlight_symbol("▸ ");
     let mut list_state = ListState::default();
     list_state.select(Some(detail.sel));
     f.render_stateful_widget(list, sections[4], &mut list_state);
+    render_scrollbar(f, sections[4], detail.events.len(), detail.sel);
 }
 
 fn parse_hunk(line: &str) -> Option<(i64, i64)> {
@@ -1976,6 +2166,19 @@ fn patch_line(
     old_available: bool,
     new_available: bool,
 ) -> Line<'static> {
+    let row_bg = if line.starts_with('+') {
+        Some(DIFF_ADD_BG)
+    } else if line.starts_with('-') {
+        Some(DIFF_DEL_BG)
+    } else if line.starts_with("@@") {
+        Some(DIFF_HUNK_BG)
+    } else {
+        None
+    };
+    let num_style = match row_bg {
+        Some(bg) => Style::default().fg(DIM).bg(bg),
+        None => Style::default().fg(DIM),
+    };
     let numbers = Span::styled(
         format!(
             "{:>4} {:>4}  ",
@@ -1990,14 +2193,14 @@ fn patch_line(
                 String::new()
             }
         ),
-        Style::default().fg(DIM),
+        num_style,
     );
-    let body_style = if line.starts_with('+') {
+    let mut body_style = if line.starts_with('+') {
         Style::default().fg(GREEN)
     } else if line.starts_with('-') {
         Style::default().fg(RED)
     } else if line.starts_with("@@") {
-        Style::default().fg(CYAN)
+        Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
     } else if line.starts_with("diff --git") || line.starts_with("index ") {
         Style::default().fg(MUTED)
     } else if line.starts_with('\\') {
@@ -2005,7 +2208,14 @@ fn patch_line(
     } else {
         Style::default().fg(TEXT)
     };
-    Line::from(vec![numbers, Span::styled(line.to_string(), body_style)])
+    if let Some(bg) = row_bg {
+        body_style = body_style.bg(bg);
+    }
+    let out = Line::from(vec![numbers, Span::styled(line.to_string(), body_style)]);
+    match row_bg {
+        Some(bg) => out.style(Style::default().bg(bg)),
+        None => out,
+    }
 }
 
 fn diff_path(line: &str) -> Option<String> {
@@ -2042,10 +2252,16 @@ fn patch_display_lines(detail: &ThreadDetail) -> Vec<Line<'static>> {
         if let Some((old_start, new_start)) = parse_hunk(line) {
             old = old_start;
             new = new_start;
-            out.push(Line::from(Span::styled(
-                format!("  {line}"),
-                Style::default().fg(CYAN),
-            )));
+            out.push(
+                Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default()
+                        .fg(CYAN)
+                        .bg(DIFF_HUNK_BG)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .style(Style::default().bg(DIFF_HUNK_BG)),
+            );
         } else if line.starts_with("diff --git ") {
             if !out.is_empty() {
                 out.push(Line::from(""));
@@ -2053,25 +2269,26 @@ fn patch_display_lines(detail: &ThreadDetail) -> Vec<Line<'static>> {
             let path = diff_path(line).unwrap_or_else(|| line.clone());
             let (additions, deletions) = stats.get(path.as_str()).copied().unwrap_or((0, 0));
             let mut header = vec![
-                Span::styled("▾ ", Style::default().fg(ACCENT)),
+                Span::styled("▾ ", Style::default().fg(ACCENT).bg(DIFF_HEADER_BG)),
                 Span::styled(
                     path,
                     Style::default()
                         .fg(TEXT_BRIGHT)
+                        .bg(DIFF_HEADER_BG)
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
             if additions > 0 || deletions > 0 {
                 header.push(Span::styled(
                     format!("   +{additions}"),
-                    Style::default().fg(GREEN),
+                    Style::default().fg(GREEN).bg(DIFF_HEADER_BG),
                 ));
                 header.push(Span::styled(
                     format!("  -{deletions}"),
-                    Style::default().fg(RED),
+                    Style::default().fg(RED).bg(DIFF_HEADER_BG),
                 ));
             }
-            out.push(Line::from(header));
+            out.push(Line::from(header).style(Style::default().bg(DIFF_HEADER_BG)));
         } else if is_git_metadata(line) {
             out.push(Line::from(Span::styled(
                 format!("  {line}"),
@@ -2097,13 +2314,14 @@ fn patch_display_lines(detail: &ThreadDetail) -> Vec<Line<'static>> {
 }
 
 fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let focused = app.detail.is_some() && area.width < 110 && app.narrow_view == NarrowView::Review;
     let checkpoint = app.detail.as_ref().and_then(|d| d.checkpoint.as_ref());
     let ordinal = checkpoint
         .map(|c| format!("{} / {}", c.ordinal, c.total))
         .unwrap_or_default();
-    let block = panel();
+    let block = panel_with_focus(focused);
     let inner = block.inner(area).inner(Margin {
-        horizontal: 2,
+        horizontal: if area.width < 34 { 1 } else { 2 },
         vertical: 0,
     });
     f.render_widget(block, area);
@@ -2113,24 +2331,40 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Constraint::Min(0),
     ])
     .split(inner);
-    let ordinal_width = ordinal.chars().count() as u16;
+    let ordinal_chip = if ordinal.is_empty() {
+        None
+    } else {
+        Some(chip(&ordinal, MUTED, BADGE_BG))
+    };
+    let ordinal_width = if ordinal.is_empty() {
+        0
+    } else {
+        (ordinal.chars().count() + 2) as u16
+    };
     let header_cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(ordinal_width)])
         .split(header[0]);
     f.render_widget(
-        Paragraph::new("Checkpoint").style(
-            Style::default()
-                .fg(TEXT_BRIGHT)
-                .bg(PANEL_BG)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Paragraph::new(Line::from(vec![
+            Span::styled(if focused { "▸ " } else { "" }, Style::default().fg(ACCENT)),
+            Span::styled(
+                "Checkpoint",
+                Style::default()
+                    .fg(TEXT_BRIGHT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(Style::default().bg(PANEL_BG)),
         header_cols[0],
     );
-    f.render_widget(
-        Paragraph::new(ordinal)
-            .style(Style::default().fg(MUTED).bg(PANEL_BG))
-            .alignment(Alignment::Right),
-        header_cols[1],
-    );
+    if let Some(ord_chip) = ordinal_chip {
+        f.render_widget(
+            Paragraph::new(Line::from(ord_chip))
+                .style(Style::default().bg(PANEL_BG))
+                .alignment(Alignment::Right),
+            header_cols[1],
+        );
+    }
+    render_divider(f, header[1]);
     let content = header[2];
     let Some(detail) = app.detail.as_ref() else {
         f.render_widget(
@@ -2208,16 +2442,14 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     format!("{} files  ", checkpoint.ready.files.len()),
                     Style::default().fg(TEXT),
                 ),
-                Span::styled(
-                    format!("+{additions}  -{deletions}"),
-                    Style::default().fg(GREEN),
-                ),
+                Span::styled(format!("+{additions} "), Style::default().fg(GREEN)),
+                Span::styled(format!("-{deletions}"), Style::default().fg(RED)),
             ]),
             Line::from(Span::styled(
                 if checkpoint.ready.recovered {
-                    "recovered · verified"
+                    "✓ recovered · verified"
                 } else {
-                    "verified · immutable"
+                    "✓ verified · immutable"
                 },
                 Style::default().fg(GREEN),
             )),
@@ -2232,19 +2464,19 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 Span::styled("Snapshot  ", Style::default().fg(MUTED)),
                 Span::styled(
                     snapshot[..8.min(snapshot.len())].to_string(),
-                    Style::default().fg(TEXT_BRIGHT),
+                    Style::default()
+                        .fg(TEXT_BRIGHT)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
                 Span::styled("Files     ", Style::default().fg(MUTED)),
                 Span::styled(
-                    format!("{} changed", checkpoint.ready.files.len()),
+                    format!("{} changed   ", checkpoint.ready.files.len()),
                     Style::default().fg(TEXT),
                 ),
-                Span::styled(
-                    format!("   +{additions}  -{deletions}"),
-                    Style::default().fg(GREEN),
-                ),
+                Span::styled(format!("+{additions}  "), Style::default().fg(GREEN)),
+                Span::styled(format!("-{deletions}"), Style::default().fg(RED)),
             ]),
             Line::from(vec![
                 Span::styled("OID       ", Style::default().fg(MUTED)),
@@ -2257,9 +2489,9 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 Span::styled("State     ", Style::default().fg(MUTED)),
                 Span::styled(
                     if checkpoint.ready.recovered {
-                        "recovered · verified"
+                        "✓ recovered · verified"
                     } else {
-                        "verified · immutable"
+                        "✓ verified · immutable"
                     },
                     Style::default().fg(GREEN),
                 ),
@@ -2277,35 +2509,33 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Paragraph::new(summary_lines).style(Style::default().bg(PANEL_BG)),
         sections[0],
     );
-    f.render_widget(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(BORDER)),
-        sections[1],
-    );
+    render_divider(f, sections[1]);
     let total = detail.patch.len();
     let scroll = (detail.patch_scroll as usize).min(total.saturating_sub(1));
     let available = sections[3].height as usize;
     let visible_end = (scroll + available).min(total);
     let title = if total == 0 {
-        "Patch  ·  pending".to_string()
+        chip("Patch · pending", MUTED, BADGE_BG)
     } else if area.width < 46 {
-        format!("Patch  {}-{}/{}", scroll + 1, visible_end, total)
+        chip(
+            &format!("Patch {}-{}/{}", scroll + 1, visible_end, total),
+            ACCENT,
+            ACCENT_SOFT,
+        )
     } else {
-        format!(
-            "Patch  ·  lines {}-{} of {}  ·  PgUp/PgDn",
-            scroll + 1,
-            visible_end,
-            total
+        chip(
+            &format!(
+                "Patch {}-{} of {} · PgUp/PgDn",
+                scroll + 1,
+                visible_end,
+                total
+            ),
+            ACCENT,
+            ACCENT_SOFT,
         )
     };
     f.render_widget(
-        Paragraph::new(title).style(
-            Style::default()
-                .fg(ACCENT)
-                .bg(PANEL_BG)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Paragraph::new(Line::from(title)).style(Style::default().bg(PANEL_BG)),
         sections[2],
     );
     let lines: Vec<Line> = patch_display_lines(detail)
@@ -2317,12 +2547,8 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Paragraph::new(lines).style(Style::default().bg(PANEL_BG)),
         sections[3],
     );
-    f.render_widget(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(BORDER)),
-        sections[4],
-    );
+    render_scrollbar(f, sections[3], total, scroll);
+    render_divider(f, sections[4]);
     let notes = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(sections[5]);
     let mut note_header = vec![Line::from(vec![
         Span::styled(
@@ -2331,17 +2557,32 @@ fn render_checkpoint(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 .fg(TEXT_BRIGHT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!("  {} comment(s)", detail.comments.len()),
-            Style::default().fg(MUTED),
+        Span::styled("  ", Style::default()),
+        chip(
+            &format!("{} comment(s)", detail.comments.len()),
+            if detail.comments.is_empty() {
+                MUTED
+            } else {
+                MAGENTA
+            },
+            BADGE_BG,
         ),
     ])];
     if let Some(comment) = detail.comments.last() {
+        let comment_state_color = match comment.state.as_str() {
+            "resolved" | "delivered" => GREEN,
+            "sent" => ACCENT,
+            _ => MAGENTA,
+        };
         note_header.push(Line::from(vec![
-            Span::styled("● ", Style::default().fg(ACCENT)),
+            Span::styled("● ", Style::default().fg(comment_state_color)),
             Span::styled("You", Style::default().fg(TEXT_BRIGHT)),
             Span::styled(
-                format!("  {}", format_relative(comment.created_ms)),
+                format!("  [{}]  ", comment.state.as_str()),
+                Style::default().fg(comment_state_color),
+            ),
+            Span::styled(
+                format_relative(comment.created_ms),
                 Style::default().fg(DIM),
             ),
         ]));
@@ -2400,16 +2641,16 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             let keys = if compact {
                 Line::from(vec![
                     key_badge("n"),
-                    Span::raw(" run   "),
+                    Span::raw(" run  "),
                     key_badge("r"),
-                    Span::raw(" refresh   "),
+                    Span::raw(" refresh  "),
                     key_badge("c"),
-                    Span::raw(" comment   "),
+                    Span::raw(" comment  "),
                     key_badge("Tab"),
                     Span::raw(if app.narrow_view == NarrowView::Run {
-                        " review   "
+                        " review  "
                     } else {
-                        " run   "
+                        " run  "
                     }),
                     key_badge("q"),
                     Span::raw(" quit"),
@@ -2417,99 +2658,111 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             } else if medium {
                 Line::from(vec![
                     key_badge("n"),
-                    Span::raw(" run   "),
+                    Span::raw(" run  "),
                     key_badge("r"),
-                    Span::raw(" refresh   "),
+                    Span::raw(" refresh  "),
                     key_badge("c"),
-                    Span::raw(" comment   "),
+                    Span::raw(" comment  "),
                     key_badge("a"),
-                    Span::raw(" reviewed   "),
+                    Span::raw(" reviewed  "),
                     key_badge("x"),
-                    Span::raw(" cancel   "),
+                    Span::raw(" cancel  "),
                     key_badge("?"),
-                    Span::raw(" help   "),
+                    Span::raw(" help  "),
                     key_badge("q"),
                     Span::raw(" quit"),
                 ])
             } else {
                 Line::from(vec![
                     key_badge("n"),
-                    Span::raw(" new run   "),
+                    Span::raw(" new run  "),
                     key_badge("r"),
-                    Span::raw(" refresh   "),
+                    Span::raw(" refresh  "),
                     key_badge("c"),
-                    Span::raw(" comment   "),
+                    Span::raw(" comment  "),
+                    key_badge("a"),
+                    Span::raw(" reviewed  "),
                     key_badge("i"),
-                    Span::raw(" integrate   "),
+                    Span::raw(" integrate  "),
                     key_badge("x"),
-                    Span::raw(" cancel   "),
+                    Span::raw(" cancel  "),
                     key_badge("?"),
-                    Span::raw(" help   "),
+                    Span::raw(" help  "),
                     key_badge("q"),
                     Span::raw(" quit"),
                 ])
             };
+            let st_color = status_color(&app.status);
             let status = app.status.clone();
             (
                 keys,
-                Line::from(Span::styled(status, Style::default().fg(MUTED))),
+                Line::from(Span::styled(status, Style::default().fg(st_color))),
             )
         }
         Mode::CommentInput { anchor_desc, .. } => (
             Line::from(vec![
-                Span::styled(
-                    if compact {
-                        "COMENTARIO ".to_string()
+                chip(
+                    &if compact {
+                        "COMMENT".to_string()
                     } else {
-                        format!("COMENTARIO [{anchor_desc}] ")
+                        format!("COMMENT [{anchor_desc}]")
                     },
-                    Style::default().fg(MAGENTA).add_modifier(Modifier::BOLD),
+                    TEXT_BRIGHT,
+                    ACCENT_BG,
                 ),
-                Span::styled("Enter guarda · Esc cancela", Style::default().fg(MUTED)),
+                Span::styled("  Enter save · Esc cancel", Style::default().fg(MUTED)),
             ]),
-            Line::from(Span::styled(
-                format!(
-                    "> {}",
+            Line::from(vec![
+                Span::styled("> ", Style::default().fg(ACCENT)),
+                Span::styled(
                     match &app.mode {
-                        Mode::CommentInput { buf, .. } => buf,
+                        Mode::CommentInput { buf, .. } => buf.as_str(),
                         _ => "",
                     }
+                    .to_string(),
+                    Style::default().fg(TEXT_BRIGHT),
                 ),
-                Style::default().fg(TEXT_BRIGHT),
-            )),
+                Span::styled("▏", Style::default().fg(ACCENT)),
+            ]),
         ),
         Mode::BranchInput { .. } => (
-            Line::from(Span::styled(
-                if compact {
-                    "INTEGRAR · Enter inspecciona · Esc cancela"
-                } else {
-                    "INTEGRAR fast-forward: rama destino · Enter abre preview · Esc cancela"
-                },
-                Style::default().fg(MAGENTA),
-            )),
-            Line::from(Span::styled(
-                format!(
-                    "rama> {}",
+            Line::from(vec![
+                chip("INTEGRATE", TEXT_BRIGHT, ACCENT_BG),
+                Span::styled(
+                    if compact {
+                        "  Enter preview · Esc cancel"
+                    } else {
+                        "  target branch · Enter opens fast-forward preview · Esc cancel"
+                    },
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("branch> ", Style::default().fg(MAGENTA)),
+                Span::styled(
                     match &app.mode {
-                        Mode::BranchInput { buf, .. } => buf,
+                        Mode::BranchInput { buf, .. } => buf.as_str(),
                         _ => "",
                     }
+                    .to_string(),
+                    Style::default().fg(TEXT_BRIGHT),
                 ),
-                Style::default().fg(TEXT_BRIGHT),
-            )),
+                Span::styled("▏", Style::default().fg(MAGENTA)),
+            ]),
         ),
         Mode::IntegrationPreview { preview } => (
             Line::from(vec![
-                Span::styled("INTEGRACIÓN ", Style::default().fg(MAGENTA)),
+                chip("INTEGRATION", TEXT_BRIGHT, ACCENT_BG),
+                Span::raw(" "),
                 Span::styled(
                     preview.status_label(),
                     Style::default().fg(if preview.eligible { GREEN } else { RED }),
                 ),
                 Span::styled(
                     if preview.eligible {
-                        " · [y] confirmar   [Esc] cancelar"
+                        " · [y] confirm   [Esc] cancel"
                     } else {
-                        " · [Esc] cerrar"
+                        " · [Esc] close"
                     },
                     Style::default().fg(MUTED),
                 ),
@@ -2517,7 +2770,7 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Line::from(Span::styled(
                 preview.reason.clone().unwrap_or_else(|| {
                     format!(
-                        "{} · {} archivos · +{} / -{}",
+                        "{} · {} files · +{} / -{}",
                         preview.target_branch,
                         preview.files_changed,
                         preview.additions,
@@ -2528,34 +2781,38 @@ fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             )),
         ),
         Mode::RunInput { .. } => (
-            Line::from(Span::styled(
-                if compact {
-                    "NUEVO RUN · Enter lanza · Esc cancela"
-                } else {
-                    "NUEVO RUN: escribí el objetivo en el thread abierto · Enter lanza · Esc cancela"
-                },
-                Style::default().fg(ACCENT),
-            )),
-            Line::from(Span::styled(
-                format!(
-                    "objetivo> {}",
+            Line::from(vec![
+                chip("NEW RUN", TEXT_BRIGHT, ACCENT_BG),
+                Span::styled(
+                    if compact {
+                        "  Enter launch · Esc cancel"
+                    } else {
+                        "  describe goal on open thread · Enter launch · Esc cancel"
+                    },
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("goal> ", Style::default().fg(ACCENT)),
+                Span::styled(
                     match &app.mode {
-                        Mode::RunInput { buf } => buf,
+                        Mode::RunInput { buf } => buf.as_str(),
                         _ => "",
                     }
+                    .to_string(),
+                    Style::default().fg(TEXT_BRIGHT),
                 ),
-                Style::default().fg(TEXT_BRIGHT),
-            )),
+                Span::styled("▏", Style::default().fg(ACCENT)),
+            ]),
         ),
         Mode::Help => (
-            Line::from(Span::styled(
-                if compact {
-                    "↑↓ select · Enter open · n run · c comment · Tab view · r refresh · q quit"
-                } else {
-                    "↑↓ select · Enter open · n run · c comment · a reviewed · f feedback · i integrate · x cancel · PgUp/PgDn patch · r refresh · q quit"
-                },
-                Style::default().fg(MUTED),
-            )),
+            Line::from(vec![
+                chip("HELP", TEXT_BRIGHT, ACCENT_BG),
+                Span::styled(
+                    "  Keyboard shortcuts overlay active",
+                    Style::default().fg(MUTED),
+                ),
+            ]),
             Line::from(Span::styled(
                 "Press ? or Esc to return.",
                 Style::default().fg(DIM),
