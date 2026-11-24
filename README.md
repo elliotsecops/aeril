@@ -6,7 +6,7 @@ Keep track of what your AI coding assistants are doing, review what they changed
 
 > **Built for modest hardware.** Aeril itself uses very little memory, so you can run it smoothly on a basic laptop, VM, or low-cost Linux VPS. *(Keep in mind that external AI models and agent tools have their own memory and API requirements.)*
 
-![Aeril main view: task pane, run details, and verified checkpoint](docs/phase2-tui-acceptance/screenshots/tui-120x40.png)
+![Aeril main view: task pane, run details, and verified checkpoint](docs/assets/aeril-tui-preview.png)
 
 ---
 
