@@ -377,6 +377,14 @@ fn ready_for_snapshot_run_conn(
     Ok(Some((ev, parsed)))
 }
 
+/// Lookup exacto de `checkpoint.prepared` fijando el índice de identidad del
+/// checkpoint para evitar recorridos completos por `idx_events_thread_seq`.
+const PREPARED_FOR_SNAPSHOT_SQL: &str = "SELECT run_id, payload FROM events
+      INDEXED BY idx_events_checkpoint_snapshot
+      WHERE thread_id = ?1 AND kind = ?2
+        AND json_extract(payload, '$.snapshot_id') = ?3
+      ORDER BY seq DESC LIMIT 1";
+
 fn prepared_for_snapshot_conn(
     conn: &rusqlite::Connection,
     thread_id: &str,
@@ -384,10 +392,7 @@ fn prepared_for_snapshot_conn(
 ) -> Result<Option<(Option<String>, payload::CheckpointPrepared)>> {
     let row: Option<(Option<String>, String)> = conn
         .query_row(
-            "SELECT run_id, payload FROM events
-              WHERE thread_id = ?1 AND kind = ?2
-                AND json_extract(payload, '$.snapshot_id') = ?3
-              ORDER BY seq DESC LIMIT 1",
+            PREPARED_FOR_SNAPSHOT_SQL,
             rusqlite::params![thread_id, events::K_CHECKPOINT_PREPARED, snapshot_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )

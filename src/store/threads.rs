@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::ids::new_id;
 use crate::store::events::{self, payload};
 use crate::timeutil::now_ms;
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -89,6 +89,39 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<ThreadRow>> {
         Some(row) => Ok(Some(row?)),
         None => Ok(None),
     }
+}
+
+/// Watermarks de varios threads en una sola consulta.
+pub fn watermarks(conn: &Connection, thread_ids: &[String]) -> Result<HashMap<String, i64>> {
+    if thread_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = std::iter::repeat_n("?", thread_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, next_seq FROM threads WHERE id IN ({placeholders})"
+    ))?;
+    let rows = stmt.query_map(params_from_iter(thread_ids.iter()), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (id, seq) = row?;
+        out.insert(id, seq);
+    }
+    Ok(out)
+}
+
+/// Watermark durable de eventos de un thread (`next_seq`).
+pub fn next_seq(conn: &Connection, thread_id: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT next_seq FROM threads WHERE id = ?1",
+        params![thread_id],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| Error::not_found(format!("thread {thread_id}")))
 }
 
 /// Proyección de arranque: solo metadatos del thread, sin contar eventos ni

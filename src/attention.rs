@@ -204,9 +204,26 @@ fn latest_integration(store: &Store, thread_id: &str) -> Result<Option<Integrati
     let row: Option<(i64, String, String)> = store
         .conn
         .query_row(
-            "SELECT seq, kind, payload FROM events
-              WHERE thread_id = ?1 AND kind IN (?2, ?3, ?4)
-              ORDER BY seq DESC LIMIT 1",
+            "SELECT seq, kind, payload FROM (
+                SELECT seq, kind, payload FROM (
+                    SELECT seq, kind, payload FROM events
+                     WHERE thread_id = ?1 AND kind = ?2
+                     ORDER BY seq DESC LIMIT 1
+                )
+                UNION ALL
+                SELECT seq, kind, payload FROM (
+                    SELECT seq, kind, payload FROM events
+                     WHERE thread_id = ?1 AND kind = ?3
+                     ORDER BY seq DESC LIMIT 1
+                )
+                UNION ALL
+                SELECT seq, kind, payload FROM (
+                    SELECT seq, kind, payload FROM events
+                     WHERE thread_id = ?1 AND kind = ?4
+                     ORDER BY seq DESC LIMIT 1
+                )
+             )
+             ORDER BY seq DESC LIMIT 1",
             rusqlite::params![
                 thread_id,
                 events::K_INTEGRATION_REQUESTED,

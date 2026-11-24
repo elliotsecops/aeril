@@ -2,7 +2,8 @@
 //! Mantiene las acciones del corte vertical (comentar, feedback, integrar y
 //! cancelar) sobre el estado durable de la Fase 0/1.
 
-use crate::attention;
+mod attention_worker;
+
 use crate::bench;
 use crate::checkpoint;
 use crate::error::{Error, Result};
@@ -14,6 +15,9 @@ use crate::store::Store;
 use crate::store::events::{self, EventRecord};
 use crate::store::threads::{self, ThreadRow, ThreadRunSummary};
 use crate::timeutil::format_relative;
+use attention_worker::{
+    AttentionCoverage, AttentionView, AttentionWorker, EvaluationState, WorkerEvent, WorkerOutcome,
+};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Layout, Margin};
@@ -23,9 +27,9 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Wrap,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -133,7 +137,19 @@ pub struct App {
     pub db_path: PathBuf,
     pub threads: Vec<ThreadRow>,
     pub run_summaries: HashMap<String, ThreadRunSummary>,
-    pub attention: HashMap<String, attention::TaskAttention>,
+    pub attention: HashMap<String, AttentionView>,
+    pub attention_rx: mpsc::Receiver<WorkerEvent>,
+    pub attention_worker: Option<AttentionWorker>,
+    pub attention_generations: Arc<Mutex<HashMap<String, u64>>>,
+    pub attention_inflight: HashSet<String>,
+    pub visible_capacity: usize,
+    pub initial_visible: Vec<String>,
+    pub selected_attention_beacon: bool,
+    pub visible_coverage_beacon: bool,
+    pub full_inbox_beacon: bool,
+    pub attention_resumed: bool,
+    pub attention_resume_at: Instant,
+    pub last_watermark_check: Instant,
     pub thread_sel: usize,
     pub detail: Option<ThreadDetail>,
     pub mode: Mode,
@@ -168,10 +184,6 @@ impl App {
             .or_else(|| self.threads.get(self.thread_sel).map(|t| t.id.clone()));
         self.threads = threads::list_projection(&self.store.conn, 200)?;
         self.run_summaries = threads::run_summaries(&self.store.conn, 200)?;
-        self.attention = attention::project_all(&self.store, 200)?
-            .into_iter()
-            .map(|a| (a.thread_id.clone(), a))
-            .collect();
         if let Some(id) = prev_sel_id
             && let Some(idx) = self.threads.iter().position(|t| t.id == id)
         {
@@ -180,7 +192,308 @@ impl App {
         if self.thread_sel >= self.threads.len() {
             self.thread_sel = self.threads.len().saturating_sub(1);
         }
+        self.sync_attention_threads();
+        self.prioritize_selection();
+        self.attention_beacons();
         Ok(())
+    }
+
+    fn visible_thread_ids(&self) -> Vec<String> {
+        if self.threads.is_empty() {
+            return Vec::new();
+        }
+        let capacity = self.visible_capacity.max(1);
+        let max_start = self.threads.len().saturating_sub(capacity);
+        let start = self.thread_sel.saturating_sub(capacity / 2).min(max_start);
+        let end = (start + capacity).min(self.threads.len());
+        self.threads[start..end]
+            .iter()
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    fn sync_attention_threads(&mut self) {
+        let ids: Vec<String> = self.threads.iter().map(|t| t.id.clone()).collect();
+        self.attention
+            .retain(|id, _| ids.iter().any(|known| known == id));
+        for id in &ids {
+            self.attention
+                .entry(id.clone())
+                .or_insert_with(AttentionView::pending);
+            if let Ok(mut map) = self.attention_generations.lock()
+                && !map.contains_key(id)
+            {
+                map.insert(id.clone(), 1);
+            }
+        }
+        if let Ok(watermarks) = threads::watermarks(&self.store.conn, &ids) {
+            let stale: Vec<String> = ids
+                .iter()
+                .filter(|id| {
+                    matches!(
+                        self.attention.get(*id).map(|v| &v.state),
+                        Some(EvaluationState::Verified { through_seq })
+                            if watermarks.get(*id).copied() != Some(*through_seq)
+                    )
+                })
+                .cloned()
+                .collect();
+            for id in stale {
+                self.invalidate_attention(&id);
+            }
+        }
+        let pending: Vec<String> = ids
+            .iter()
+            .filter(|id| {
+                matches!(
+                    self.attention.get(*id).map(|v| &v.state),
+                    Some(EvaluationState::Pending)
+                )
+            })
+            .cloned()
+            .collect();
+        for id in pending {
+            let prio = self.attention_priority(&id);
+            self.submit_attention(&id, prio, 0);
+        }
+    }
+
+    fn attention_priority(&self, id: &str) -> u8 {
+        if self.threads.get(self.thread_sel).map(|t| t.id.as_str()) == Some(id) {
+            0
+        } else if self
+            .visible_thread_ids()
+            .iter()
+            .any(|visible| visible == id)
+        {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn submit_attention(&mut self, id: &str, priority: u8, attempts: u8) {
+        let Some(worker) = self.attention_worker.as_ref() else {
+            return;
+        };
+        let generation = worker.generation(id);
+        if generation == 0 || self.attention_inflight.contains(id) {
+            return;
+        }
+        self.attention_inflight.insert(id.to_string());
+        worker.submit(id.to_string(), priority, generation, attempts);
+    }
+
+    fn invalidate_attention(&mut self, id: &str) {
+        let generation = if let Some(worker) = self.attention_worker.as_ref() {
+            worker.invalidate(id)
+        } else {
+            let mut guard = match self.attention_generations.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let next = guard.get(id).copied().unwrap_or(0) + 1;
+            guard.insert(id.to_string(), next);
+            next
+        };
+        if generation > 0 {
+            self.attention_inflight.remove(id);
+            self.attention
+                .insert(id.to_string(), AttentionView::pending());
+            let prio = self.attention_priority(id);
+            self.submit_attention(id, prio, 0);
+        }
+    }
+
+    fn evaluate_sync_into(&mut self, id: &str) {
+        match attention_worker::evaluate_stable(&self.store, id) {
+            Ok(view) if view.is_verified() => {
+                self.attention_inflight.remove(id);
+                self.attention.insert(id.to_string(), view);
+            }
+            Ok(_) => {
+                self.attention
+                    .insert(id.to_string(), AttentionView::pending());
+                self.submit_attention(id, 0, 0);
+            }
+            Err(e) => {
+                self.attention_inflight.remove(id);
+                self.attention
+                    .insert(id.to_string(), AttentionView::error(e.to_string()));
+            }
+        }
+    }
+
+    fn prioritize_selection(&mut self) {
+        let selected = self.threads.get(self.thread_sel).map(|t| t.id.clone());
+        if let Some(id) = selected {
+            let needs_eval = match (
+                threads::next_seq(&self.store.conn, &id).ok(),
+                self.attention.get(&id).map(|v| &v.state),
+            ) {
+                (Some(now), Some(EvaluationState::Verified { through_seq })) => *through_seq != now,
+                (None, Some(EvaluationState::Verified { .. })) => true,
+                (_, Some(EvaluationState::Pending) | None) => true,
+                (_, Some(EvaluationState::Error { .. })) => false,
+            };
+            if needs_eval {
+                if let Some(worker) = self.attention_worker.as_ref() {
+                    worker.invalidate(&id);
+                }
+                self.evaluate_sync_into(&id);
+            }
+        }
+        for id in self.visible_thread_ids() {
+            if matches!(
+                self.attention.get(&id).map(|v| &v.state),
+                Some(EvaluationState::Pending) | None
+            ) {
+                self.submit_attention(&id, 1, 0);
+            }
+        }
+        self.attention_beacons();
+    }
+
+    fn reconcile_watermarks(&mut self) {
+        if self.last_watermark_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_watermark_check = Instant::now();
+        let ids: Vec<String> = self.threads.iter().map(|t| t.id.clone()).collect();
+        let Ok(watermarks) = threads::watermarks(&self.store.conn, &ids) else {
+            return;
+        };
+        let stale: Vec<String> = ids
+            .iter()
+            .filter(|id| {
+                matches!(
+                    self.attention.get(*id).map(|v| &v.state),
+                    Some(EvaluationState::Verified { through_seq })
+                        if watermarks.get(*id).copied() != Some(*through_seq)
+                )
+            })
+            .cloned()
+            .collect();
+        for id in stale {
+            self.invalidate_attention(&id);
+        }
+    }
+
+    fn retry_error_attention(&mut self) {
+        let ids: Vec<String> = self
+            .attention
+            .iter()
+            .filter(|(_, view)| matches!(view.state, EvaluationState::Error { .. }))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.invalidate_attention(&id);
+        }
+    }
+
+    fn drain_attention_events(&mut self) {
+        loop {
+            match self.attention_rx.try_recv() {
+                Ok(WorkerEvent::Result {
+                    thread_id,
+                    generation,
+                    attempts,
+                    outcome,
+                }) => {
+                    self.attention_inflight.remove(&thread_id);
+                    let current = self
+                        .attention_generations
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&thread_id).copied());
+                    if current != Some(generation) {
+                        continue;
+                    }
+                    match outcome {
+                        WorkerOutcome::Verified {
+                            attention,
+                            through_seq,
+                        } => {
+                            self.attention.insert(
+                                thread_id,
+                                AttentionView::verified(*attention, through_seq),
+                            );
+                        }
+                        WorkerOutcome::Stale if attempts < 2 => {
+                            self.attention
+                                .insert(thread_id.clone(), AttentionView::pending());
+                            let prio = self.attention_priority(&thread_id);
+                            self.submit_attention(&thread_id, prio, attempts + 1);
+                        }
+                        WorkerOutcome::Stale => {
+                            self.attention.insert(
+                                thread_id,
+                                AttentionView::error("los eventos cambiaron durante la evaluación"),
+                            );
+                        }
+                        WorkerOutcome::Error { detail } => {
+                            self.attention
+                                .insert(thread_id, AttentionView::error(detail));
+                        }
+                    }
+                }
+                Ok(WorkerEvent::Fatal { detail }) => {
+                    self.attention_inflight.clear();
+                    for view in self.attention.values_mut() {
+                        if matches!(view.state, EvaluationState::Pending) {
+                            *view = AttentionView::error(detail.clone());
+                        }
+                    }
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        self.attention_beacons();
+    }
+
+    fn attention_coverage(&self) -> AttentionCoverage {
+        let mut coverage = AttentionCoverage {
+            total: self.threads.len(),
+            ..AttentionCoverage::default()
+        };
+        for thread in &self.threads {
+            match self.attention.get(&thread.id).map(|v| &v.state) {
+                Some(EvaluationState::Verified { .. }) => coverage.verified += 1,
+                Some(EvaluationState::Error { .. }) => coverage.errors += 1,
+                _ => coverage.pending += 1,
+            }
+        }
+        coverage
+    }
+
+    fn attention_beacons(&mut self) {
+        if !self.selected_attention_beacon
+            && let Some(id) = self.threads.get(self.thread_sel).map(|t| &t.id)
+            && matches!(
+                self.attention.get(id).map(|v| &v.state),
+                Some(EvaluationState::Verified { .. })
+            )
+        {
+            self.selected_attention_beacon = true;
+            bench::beacon("selected_attention", self.t0);
+        }
+        if !self.visible_coverage_beacon
+            && self.initial_visible.iter().all(|id| {
+                !matches!(
+                    self.attention.get(id).map(|v| &v.state),
+                    None | Some(EvaluationState::Pending)
+                )
+            })
+        {
+            self.visible_coverage_beacon = true;
+            bench::beacon("visible_coverage", self.t0);
+        }
+        if !self.full_inbox_beacon && self.attention_coverage().pending == 0 {
+            self.full_inbox_beacon = true;
+            bench::beacon("full_inbox", self.t0);
+        }
     }
 
     fn slot_index_by_invocation(&self, invocation: &str) -> Option<usize> {
@@ -888,6 +1201,7 @@ impl App {
                 }
                 KeyCode::Char('?') => self.mode = Mode::Help,
                 KeyCode::Char('r') => {
+                    self.retry_error_attention();
                     self.reload_threads()?;
                     self.refresh_detail()?;
                     self.status = "refrescado".into();
@@ -898,6 +1212,7 @@ impl App {
                         self.refresh_detail()?;
                     } else {
                         self.thread_sel = self.thread_sel.saturating_sub(1);
+                        self.prioritize_selection();
                     }
                 }
                 KeyCode::Down => {
@@ -906,6 +1221,7 @@ impl App {
                         self.refresh_detail()?;
                     } else if !self.threads.is_empty() {
                         self.thread_sel = (self.thread_sel + 1).min(self.threads.len() - 1);
+                        self.prioritize_selection();
                     }
                 }
                 KeyCode::PageDown => {
@@ -921,10 +1237,12 @@ impl App {
                 KeyCode::Enter => {
                     if self.detail.is_none() {
                         self.open_thread(self.thread_sel)?;
+                        self.prioritize_selection();
                     }
                 }
                 KeyCode::Esc => {
                     self.detail = None;
+                    self.prioritize_selection();
                 }
                 KeyCode::Char('c') => self.start_comment()?,
                 KeyCode::Char('a') => self.mark_reviewed()?,
@@ -977,10 +1295,66 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
 
     let threads = threads::list_projection(&store.conn, 200)?;
     let run_summaries = threads::run_summaries(&store.conn, 200)?;
-    let attention = attention::project_all(&store, 200)?
-        .into_iter()
-        .map(|a| (a.thread_id.clone(), a))
+
+    let (term_w, term_h) = ratatui::crossterm::terminal::size().unwrap_or((120, 40));
+    let visible_capacity = attention_worker::visible_task_capacity(term_w, term_h);
+    let initial_visible: Vec<String> = threads
+        .iter()
+        .take(visible_capacity.max(1))
+        .map(|t| t.id.clone())
         .collect();
+    let selected_id = threads.first().map(|t| t.id.clone());
+
+    let mut attention: HashMap<String, AttentionView> = threads
+        .iter()
+        .map(|t| (t.id.clone(), AttentionView::pending()))
+        .collect();
+    // PA0-PERF-R: evaluar sincrónicamente la tarea seleccionada y todas las
+    // filas visibles iniciales antes del primer frame; el resto queda Pending
+    // hasta que el worker en segundo plano lo verifique.
+    for id in &initial_visible {
+        match attention_worker::evaluate_stable(&store, id) {
+            Ok(view) => {
+                attention.insert(id.clone(), view);
+            }
+            Err(e) => {
+                attention.insert(id.clone(), AttentionView::error(e.to_string()));
+            }
+        }
+    }
+
+    let mut generations = HashMap::new();
+    for thread in &threads {
+        generations.insert(thread.id.clone(), 1_u64);
+    }
+    let generations = Arc::new(Mutex::new(generations));
+    let (job_tx, job_rx) = mpsc::channel();
+    let (attention_tx, attention_rx) = mpsc::channel();
+    let worker = AttentionWorker::spawn(
+        db_path.clone(),
+        generations.clone(),
+        job_tx,
+        job_rx,
+        attention_tx,
+    );
+    let mut attention_inflight = HashSet::new();
+    for thread in &threads {
+        if matches!(
+            attention.get(&thread.id).map(|v| &v.state),
+            Some(EvaluationState::Pending) | None
+        ) {
+            let priority = if selected_id.as_deref() == Some(thread.id.as_str()) {
+                0
+            } else if initial_visible.iter().any(|id| id == &thread.id) {
+                1
+            } else {
+                2
+            };
+            attention_inflight.insert(thread.id.clone());
+            worker.submit(thread.id.clone(), priority, 1, 0);
+        }
+    }
+
     let (ui_tx, ui_rx) = mpsc::channel();
     let mut app = App {
         store,
@@ -989,6 +1363,18 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
         threads,
         run_summaries,
         attention,
+        attention_rx,
+        attention_worker: Some(worker),
+        attention_generations: generations,
+        attention_inflight,
+        visible_capacity,
+        initial_visible,
+        selected_attention_beacon: false,
+        visible_coverage_beacon: false,
+        full_inbox_beacon: false,
+        attention_resumed: false,
+        attention_resume_at: Instant::now() + Duration::from_secs(3600),
+        last_watermark_check: Instant::now(),
         thread_sel: 0,
         detail: None,
         mode: Mode::Normal,
@@ -1005,6 +1391,7 @@ pub fn run(data_dir: PathBuf, db_path: PathBuf, backend: String, t0: Instant) ->
         input_processed: false,
         thread_opened_beacon: false,
     };
+    app.attention_beacons();
 
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut app);
@@ -1019,10 +1406,19 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
         while let Ok(note) = app.ui_rx.try_recv() {
             app.on_note(note);
         }
+        app.drain_attention_events();
+        app.reconcile_watermarks();
         terminal.draw(|f| render(f, app))?;
         if !app.first_draw_done {
             app.first_draw_done = true;
+            app.attention_resume_at = Instant::now() + Duration::from_millis(15);
             bench::beacon("first_draw", app.t0);
+        }
+        if !app.attention_resumed && Instant::now() >= app.attention_resume_at {
+            if let Some(worker) = app.attention_worker.as_ref() {
+                worker.resume();
+            }
+            app.attention_resumed = true;
         }
         while let Ok(note) = app.ui_rx.try_recv() {
             app.on_note(note);
@@ -1032,6 +1428,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
             && key.kind == KeyEventKind::Press
         {
             app.on_key(key)?;
+            app.drain_attention_events();
+            app.reconcile_watermarks();
             if !app.input_processed {
                 app.input_processed = true;
                 bench::beacon("input_processed", app.t0);
@@ -1314,6 +1712,7 @@ fn running_thread_count(app: &App) -> usize {
 }
 
 fn render(f: &mut Frame, app: &mut App) {
+    app.visible_capacity = attention_worker::visible_task_capacity(f.area().width, f.area().height);
     f.render_widget(Block::default().style(Style::default().bg(BG)), f.area());
     let footer_height =
         if matches!(app.mode, Mode::Normal) && app.status.is_empty() && app.recovery_note.is_none()
@@ -1670,26 +2069,91 @@ fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 }
 
-fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
-    let running = running_thread_count(app);
-    let attention_count = app.attention.values().filter(|a| a.is_actionable()).count();
-    let summary = if area.width >= 46 {
+fn attention_color(priority: u8) -> Color {
+    match priority {
+        0..=3 => MAGENTA,
+        4..=6 => YELLOW,
+        7 => GREEN,
+        _ => MUTED,
+    }
+}
+
+fn format_coverage(coverage: AttentionCoverage, actionable: usize, available_width: u16) -> String {
+    let err_long = if coverage.errors > 0 {
+        format!(" · {} err", coverage.errors)
+    } else {
+        String::new()
+    };
+    let full = if coverage.pending > 0 {
         format!(
-            "{} total · {} attention · {} running ",
-            app.threads.len(),
-            attention_count,
-            running
+            "{}/{} evaluated · {} pending{} · {} attn",
+            coverage.verified, coverage.total, coverage.pending, err_long, actionable
         )
-    } else if area.width >= 32 {
+    } else if coverage.errors > 0 {
         format!(
-            "{} · {} attn · {} run ",
-            app.threads.len(),
-            attention_count,
-            running
+            "{}/{} evaluated · {} err · {} attn",
+            coverage.verified, coverage.total, coverage.errors, actionable
         )
     } else {
-        format!("{} · {} attn ", app.threads.len(), attention_count)
+        format!(
+            "{}/{} evaluated · {} attn",
+            coverage.verified, coverage.total, actionable
+        )
     };
+    if full.chars().count() <= available_width as usize {
+        return full;
+    }
+    let medium = if coverage.pending > 0 {
+        format!(
+            "{}/{} eval · {} pend{}",
+            coverage.verified, coverage.total, coverage.pending, err_long
+        )
+    } else if coverage.errors > 0 {
+        format!(
+            "{}/{} eval · {} err · {} attn",
+            coverage.verified, coverage.total, coverage.errors, actionable
+        )
+    } else {
+        format!(
+            "{}/{} eval · {} attn",
+            coverage.verified, coverage.total, actionable
+        )
+    };
+    if medium.chars().count() <= available_width as usize {
+        return medium;
+    }
+    if coverage.errors > 0 {
+        format!(
+            "{}/{}·{}p·{}a·{}e",
+            coverage.verified, coverage.total, coverage.pending, actionable, coverage.errors
+        )
+    } else {
+        format!(
+            "{}/{}·{}p·{}a",
+            coverage.verified, coverage.total, coverage.pending, actionable
+        )
+    }
+}
+
+fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let running = running_thread_count(app);
+    let coverage = app.attention_coverage();
+    debug_assert_eq!(
+        coverage.total,
+        coverage.verified + coverage.pending + coverage.errors
+    );
+    let actionable = app
+        .attention
+        .values()
+        .filter(|view| {
+            matches!(view.state, EvaluationState::Verified { .. })
+                && view
+                    .attention
+                    .as_ref()
+                    .map(|att| att.is_actionable())
+                    .unwrap_or(false)
+        })
+        .count();
     let focused = app.detail.is_none();
     let block = panel_with_focus(focused);
     let inner = block.inner(area).inner(Margin {
@@ -1700,11 +2164,17 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let header = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Min(0),
     ])
     .split(inner);
-    let summary_width = summary.chars().count() as u16;
-    let header_cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(summary_width)])
+    let running_text = if area.width < 32 {
+        format!("{running} run ")
+    } else {
+        format!("{running} running ")
+    };
+    let running_width = running_text.chars().count() as u16;
+    let header_cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(running_width)])
         .split(header[0]);
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -1720,13 +2190,28 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         header_cols[0],
     );
     f.render_widget(
-        Paragraph::new(summary)
+        Paragraph::new(running_text)
             .style(Style::default().fg(MUTED).bg(PANEL_BG))
             .alignment(Alignment::Right),
         header_cols[1],
     );
-    render_divider(f, header[1]);
-    let list_area = header[2];
+    let coverage_text = format_coverage(coverage, actionable, header[1].width);
+    f.render_widget(
+        Paragraph::new(coverage_text).style(
+            Style::default()
+                .fg(if coverage.errors > 0 {
+                    RED
+                } else if coverage.pending > 0 {
+                    YELLOW
+                } else {
+                    MUTED
+                })
+                .bg(PANEL_BG),
+        ),
+        header[1],
+    );
+    render_divider(f, header[2]);
+    let list_area = header[3];
     if app.threads.is_empty() {
         f.render_widget(
             Paragraph::new(vec![
@@ -1749,30 +2234,46 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         .iter()
         .enumerate()
         .map(|(idx, thread)| {
-            let (state, state_color) = task_state(app, &thread.id);
-            let att = app.attention.get(&thread.id);
-            let color = att
-                .map(|a| match a.priority {
-                    0..=3 => MAGENTA,
-                    4..=6 => YELLOW,
-                    7 => GREEN,
-                    _ => MUTED,
-                })
-                .unwrap_or(state_color);
-            let icon = match att {
-                Some(a) if a.is_actionable() => "◆",
-                _ => state_icon(&state),
-            };
+            let (state, _) = task_state(app, &thread.id);
+            let view = app.attention.get(&thread.id);
+            let selected = idx == app.thread_sel;
             let summary = app.run_summaries.get(&thread.id);
             let elapsed = elapsed_for(summary);
-            let selected = idx == app.thread_sel;
             let branch = summary
                 .and_then(|s| s.latest_branch.clone())
                 .unwrap_or_else(|| "—".into());
-            let status = match att {
-                Some(a) if a.historical_checkpoint => "checkpoint previo".to_string(),
-                Some(a) => format!("{}  ·  {elapsed}", a.status_label),
-                None => format!("{state}  ·  {elapsed}"),
+            let (status, action, color, icon) = match view.map(|v| (&v.state, v.attention.as_ref()))
+            {
+                Some((EvaluationState::Verified { .. }, Some(att))) => {
+                    let status = if att.historical_checkpoint {
+                        "checkpoint previo".to_string()
+                    } else {
+                        format!("{}  ·  {elapsed}", att.status_label)
+                    };
+                    let icon = if att.is_actionable() {
+                        "◆"
+                    } else {
+                        state_icon(&state)
+                    };
+                    (
+                        status,
+                        format!("→ {}", att.next_action),
+                        attention_color(att.priority),
+                        icon,
+                    )
+                }
+                Some((EvaluationState::Error { .. }, _)) => (
+                    "error de evaluación".to_string(),
+                    "→ reintentar (r)".to_string(),
+                    RED,
+                    "✕",
+                ),
+                _ => (
+                    format!("pendiente de evaluación  ·  {elapsed}"),
+                    "→ evaluando estado durable".to_string(),
+                    DIM,
+                    "○",
+                ),
             };
             let mut status_line = vec![
                 Span::styled("      ", Style::default()),
@@ -1820,16 +2321,13 @@ fn render_tasks(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                     ]));
                 }
             }
-            if let Some(att) = att {
-                let action = format!("→ {}", att.next_action);
-                lines.push(Line::from(vec![
-                    Span::styled("      ", Style::default()),
-                    Span::styled(
-                        truncate_chars(&action, list_area.width.saturating_sub(6).max(8) as usize),
-                        Style::default().fg(color),
-                    ),
-                ]));
-            }
+            lines.push(Line::from(vec![
+                Span::styled("      ", Style::default()),
+                Span::styled(
+                    truncate_chars(&action, list_area.width.saturating_sub(6).max(8) as usize),
+                    Style::default().fg(color),
+                ),
+            ]));
             if !compact_items {
                 lines.push(Line::from(""));
             }

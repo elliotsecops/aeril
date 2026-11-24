@@ -10,7 +10,7 @@ pub mod schema;
 pub mod threads;
 
 use crate::error::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -91,6 +91,20 @@ impl Store {
         // Caché de páginas acotada (2 MiB) — parte del presupuesto de RSS idle.
         conn.pragma_update(None, "cache_size", -2048)?;
         schema::migrate(&mut conn)?;
+        Ok(Store { conn })
+    }
+
+    /// Conexión de solo lectura para proyecciones en background (p. ej. Attention
+    /// progresivo). Nunca ejecuta migraciones ni permite escrituras.
+    pub fn open_read_only(path: &Path) -> Result<Store> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(STORE_BUSY_TIMEOUT)?;
+        conn.pragma_update(None, "query_only", "ON")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "cache_size", -2048)?;
         Ok(Store { conn })
     }
 
@@ -222,5 +236,37 @@ mod tests {
             &payload,
         );
         assert!(err.is_err(), "la FK debe impedir eventos huérfanos");
+    }
+
+    #[test]
+    fn migracion_v5_a_v6_crea_indice() {
+        let dir = std::env::temp_dir().join(format!("aeril-mig6-{}", crate::ids::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aeril.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(super::schema::SCHEMA_V1).unwrap();
+            conn.execute_batch(super::schema::SCHEMA_V2).unwrap();
+            conn.execute_batch(super::schema::SCHEMA_V3).unwrap();
+            conn.execute_batch(super::schema::SCHEMA_V4).unwrap();
+            conn.execute_batch(super::schema::SCHEMA_V5).unwrap();
+            conn.pragma_update(None, "user_version", 5).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let v: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, super::schema::SCHEMA_VERSION);
+        let idx_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_thread_kind_seq'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

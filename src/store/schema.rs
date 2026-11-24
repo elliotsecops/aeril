@@ -73,7 +73,16 @@ CREATE INDEX IF NOT EXISTS idx_events_checkpoint_snapshot
   ON events(thread_id, kind, json_extract(payload, '$.snapshot_id'));
 "#;
 
-pub const SCHEMA_VERSION: i64 = 5;
+/// v6 (PA0-PERF-R): índice `(thread_id, kind, seq)` para que consultas por tipo
+/// de evento (`checkpoint.ready`, `checkpoint.prepared`, `validation.recorded`,
+/// `permission.*`, `integration.*`) con `ORDER BY seq DESC LIMIT 1` salten
+/// directamente al último evento del tipo sin recorrer mensajes de chat.
+pub const SCHEMA_V6: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_events_thread_kind_seq
+  ON events(thread_id, kind, seq);
+"#;
+
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// v2: lease de workspace activo (exclusión entre procesos de Aeril).
 /// Tabla pequeña y dedicada: el `INSERT ... ON CONFLICT` dentro de una
@@ -139,6 +148,9 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     }
     if current < 5 {
         tx.execute_batch(SCHEMA_V5)?;
+    }
+    if current < 6 {
+        tx.execute_batch(SCHEMA_V6)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
