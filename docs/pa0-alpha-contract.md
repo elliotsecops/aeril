@@ -176,8 +176,7 @@ puede explicar por qué está bloqueado y qué haría a continuación.
 
 **No soportado:** merges genéricos, resolución automática de divergencias,
 preparación automática de checkouts y publicación de releases. El camino B
-corresponde a PA0-C y todavía no está implementado: E2E-5 no puede certificarse
-hasta que PA0-C esté disponible.
+corresponde a PA0-C (implementado en esta rama junto con `tests/pa0_c_blocked_integration.rs`); la certificación externa con participante queda sujeta a PA0-D y PA0-E.
 
 ### E2E-6 — Recuperación y reapertura
 
@@ -394,7 +393,7 @@ recuperación exitosa no demuestra reversibilidad de acciones externas.
 | --- | --- | --- |
 | PA0-A | Este contrato revisado y congelado antes de implementar PA0-B. | Entregado en esta rama |
 | PA0-B | Attention determinista, read-only, visible en TUI/CLI y cubierta por tests de precedencia, integridad, permisos, recovery, read-only y tamaños 80×24 / 120×40 / 180×50. | Entregado en esta rama |
-| PA0-C | Camino manual visible para integración bloqueada, sin debilitar Git. | Pendiente |
+| PA0-C | Camino manual visible para integración bloqueada, sin debilitar Git. | Entregado en `main` (`2082505`, sobre `PA0-PERF-R` `8cce419`) |
 | PA0-D | Binario Linux reproducible + flujo Hermes real autenticado. | Pendiente |
 | PA0-E | 3–5 desarrolladores externos ejecutan el recorrido sin asistencia. | Pendiente |
 

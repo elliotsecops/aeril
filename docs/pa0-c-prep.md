@@ -1,6 +1,6 @@
 # PA0-C — Preparación: Integración bloqueada, instrucciones contextuales y guion de aceptación
 
-> **Estado:** Diseño y guion de aceptación (**sin código de PA0-C todavía**; implementación sujeta a cierre de `PA0-PERF-R`).
+> **Estado:** Implementado en `feat/pa0-c` (`2082505`) sobre `PA0-PERF-R` (`8cce419`) e integrado en `main` (`tests/pa0_c_blocked_integration.rs` C1–C6).
 > **Referencia contractual:** [`docs/pa0-alpha-contract.md`](pa0-alpha-contract.md) §3 (`E2E-5` Camino B) y §8 (`PA0-C`).
 > **Código actual inspeccionado:** `src/integration.rs`, `src/git/integrate.rs`, `src/review.rs`, `src/cli.rs`, `src/tui/mod.rs`.
 
