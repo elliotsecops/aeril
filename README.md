@@ -53,38 +53,58 @@ The TUI supports supervising up to two concurrent mock runs. Live Hermes executi
 
 ## Getting Started
 
-> **Status:** Early developer preview. Aeril currently requires building from source on Linux and has no packaged installer or universal compatibility guarantee yet.
+> **Status:** Early developer preview on Linux x86_64. No system-wide installer package is published yet, and live AI runs support **one authenticated Hermes ACP session at a time**.
 
 ### Prerequisites
 
-- Linux (tested on x86_64)
+- Linux (x86_64) with standard GNU userspace (`glibc`, `zlib`)
 - Git
-- Rust & Cargo (2024 edition)
-- A compatible external ACP agent (e.g., `hermes acp`) for live AI runs, or the built-in mock backend for development
+- Rust & Cargo (2024 edition) to build from source (or a verified Linux release tarball)
+- An external authenticated ACP agent (`hermes acp`) for live AI runs, or the built-in mock backend for local testing (`--backend mock:<script>`)
 
-### Build & Run
+Verify `hermes` before running live AI tasks (expected output: `Hermes ACP check OK`):
+
+```bash
+hermes acp --check
+```
+
+### Build, Package & Install
+
+**From source (reproducible release bundle):**
 
 ```bash
 git clone https://github.com/elliotsecops/aeril.git
 cd aeril
-cargo build --release
-./target/release/aeril
+make package-linux
 ```
 
-Running `aeril` without arguments launches the terminal UI. To register a Git repository and inspect threads from the CLI:
+This builds `target/release/aeril` with `--locked`, verifies size and runtime ABI dependency budgets, and emits `dist/aeril-0.1.0-linux-x86_64.tar.gz` plus its `.sha256` checksum. Install into `~/.local/bin`:
 
 ```bash
-./target/release/aeril thread new --repo /path/to/your/repo --title "Fix login flow"
-./target/release/aeril thread list
+tar -xzf dist/aeril-0.1.0-linux-x86_64.tar.gz
+sha256sum -c dist/aeril-0.1.0-linux-x86_64.tar.gz.sha256
+install -Dm755 aeril-0.1.0-linux-x86_64/aeril ~/.local/bin/aeril
 ```
 
-*(Creating a thread registers the task only; it does not start an agent run automatically.)*
+*(Ensure `~/.local/bin` is on your `PATH`. Aeril stores local task state under `~/.local/share/aeril`, overridable via `AERIL_DATA_DIR`, without requiring hidden configuration files. Make sure your project `.gitignore` ignores build/bytecode caches such as `__pycache__/`, `node_modules/`, or `target/`—snapshot v0 rejects unignored binary files.)*
+
+### Verify Installation & First Run
+
+```bash
+aeril version
+aeril --help
+aeril thread new --repo /path/to/your/repo --title "Fix login flow"
+aeril thread list
+aeril
+```
+
+Running `aeril` without arguments launches the terminal UI, where your new thread appears in the **Tasks** pane immediately. *(Creating a thread registers the task only; it does not start an agent run automatically. From CLI you can pass `--model <provider:model>` to `run start` or `feedback send` to override Hermes's default model.)*
 
 ---
 
 ## Current Status & Limitations
 
-Aeril already includes the terminal UI, durable task history, diff inspection, anchored review comments, immutable checkpoints, crash recovery, and workspace coordination. Final TUI integration passed **230/230 tests** across three consecutive runs, and release resource budgets pass.
+Aeril includes progressive verified Attention projection (`PA0-PERF-R`), contextual manual integration guidance (`PA0-C`), deterministic Linux x86_64 packaging and live authenticated single-session Hermes certification (`PA0-D`), alongside the terminal UI, durable task history, diff inspection, anchored review comments, immutable checkpoints, crash recovery, and workspace coordination. The current `main` baseline passed **357/357 Rust tests** (`35` unit + `322` integration), bit-for-bit reproducible Linux builds verified across separate directories, and release resource budgets.
 
 Managed Hermes profile isolation (P2-S1) is also implemented, with per-agent `HERMES_HOME` isolation and single-writer locks, and remains **disabled by default** (`AERIL_HERMES_PROFILES`).
 
@@ -113,18 +133,18 @@ Managed Hermes profile isolation (P2-S1) is also implemented, with per-agent `HE
 ## Architecture & Performance
 
 - **Stack:** Rust, `ratatui` (TUI), `rusqlite` (SQLite WAL), `git2` (libgit2 worktrees/snapshots/CAS), `tokio` (per-run ACP stdio client).
-- **Measured orchestrator footprint** (release build on Linux x86_64 — Intel i7-8550U, 15.4 GiB RAM, warm OS page cache; binary SHA-256 `64ed48a52a558e216bc400ab550759e30936bc3e77dab53226ce5eab71f3618c`):
+- **Measured orchestrator footprint** (release build on Linux x86_64 — Intel i7-8550U, 15.4 GiB RAM, `tmpfs`, warm OS page cache; binary SHA-256 `ca2cc34262b68c00e078691bd01df9d7242ba7b74c7198c0ec3bace1af8ed0c3`):
 
 | Metric | Measured |
 |---|---:|
-| Release binary size | **5,928,496 bytes** (5.93 MB) |
-| Idle RSS | **7,276 KiB** (7.1 MiB) |
-| RSS with one thread open | **8,248 KiB** (8.1 MiB) |
-| Additional memory per thread | **0.95 MiB** |
-| Startup latency (p95) | **22.21 ms** |
-| TUI with two mock runs | **8,912 KiB** |
-| Combined RSS, TUI + two mocks | **18,052 KiB** |
-| Rust test suite | **230/230 PASS** (three consecutive runs) |
+| Release binary size | **6,299,088 bytes** (6.3 MB) |
+| Idle RSS | **10,060 KiB** (9.8 MB) |
+| RSS with one thread open | **10,472 KiB** (10.2 MB) |
+| Additional memory per thread | **0.4 MiB** |
+| Startup latency (p95, 30 samples) | **11.82 ms** |
+| TUI with two mock runs | **9,628 KiB** |
+| Combined RSS, TUI + two mocks | **18,768 KiB** |
+| Rust test suite | **357/357 PASS** |
 | `cargo fmt` / Clippy | PASS |
 
 *These measurements reflect a specific hardware environment and are not guaranteed minimums. Memory used by Hermes or any external agent is **not** included in Aeril's idle RSS.*
@@ -133,6 +153,9 @@ Managed Hermes profile isolation (P2-S1) is also implemented, with per-agent `HE
 
 ## Documentation
 
+- [Private Alpha Contract (PA0)](docs/pa0-alpha-contract.md)
+- [PA0-C Blocked Integration Design & Acceptance](docs/pa0-c-prep.md)
+- [PA0-D Reproducible Linux & Live Hermes Evidence](docs/pa0-d-hermes-evidence.md)
 - [Phase 2 TUI Acceptance & Concurrency Evidence](docs/phase2-tui-acceptance.md)
 - [Manifesto & Performance Budgets](MANIFIESTO.md)
 - [Engineering Handoff & Current Limits](HANDOFF.md)

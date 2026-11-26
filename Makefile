@@ -16,7 +16,7 @@ BENCH_DIR := $(DATA_DIR)/bench
 JOBS ?= 2
 
 .PHONY: all build test fmt clippy budget budget-size budget-deps \
-        budget-mem budget-start budget-scale budget-two clean
+        budget-mem budget-start budget-scale budget-two package-linux clean
 
 all: build
 
@@ -80,6 +80,9 @@ budget-scale: $(BIN)
 
 budget: budget-size budget-deps budget-mem budget-start
 
+package-linux:
+	@scripts/release/package-linux.sh
+
 clean:
 	$(CARGO) clean
-	rm -rf $(DATA_DIR)
+	rm -rf $(DATA_DIR) dist

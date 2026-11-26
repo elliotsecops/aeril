@@ -123,8 +123,50 @@ pub fn run() -> i32 {
     }
 }
 
+fn print_help() {
+    println!(
+        "aeril {} — terminal workspace for AI coding agents
+
+USAGE:
+  aeril [--backend hermes|mock:<script>] [--data-dir <dir>]
+  aeril <command> [options]
+
+COMMANDS:
+  version                     Print version and exit
+  thread new --repo <dir>     Register a repository as a task thread
+  thread list                 List registered task threads
+  run start --thread <id> --prompt <text> [--backend hermes|mock:<script>] [--model <id>]
+  checkpoint list --thread <id>
+  comment add|list|show|resolve ...
+  review ack --thread <id> --snapshot <snap>
+  attention [--limit <n>] [--json]
+  validate --thread <id> --snapshot <snap> -- <cmd...>
+  integrate preview --thread <id> --snapshot <snap> --to <branch> [--text]
+  integrate apply --thread <id> --snapshot <snap> --to <branch> --source <oid> --expect <oid> --confirm
+  feedback send --thread <id> [--comments <ids>] [--backend ...] [--model <id>]
+  recover                     Reconcile interrupted runs and checkpoints
+  export --thread <id> [--format jsonl|md]
+
+OPTIONS:
+  -h, --help                  Show this help and exit
+  -V, --version               Print version and exit
+  --data-dir <dir>            Override data directory (or AERIL_DATA_DIR)",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 fn dispatch(args: &[String], t0: Instant) -> Result<i32> {
     let p = parse(args);
+    let pos0 = p.pos.first().map(String::as_str);
+    if p.yes("help") || matches!(pos0, Some("help" | "-h")) {
+        print_help();
+        return Ok(0);
+    }
+    if p.yes("version") || matches!(pos0, Some("version" | "-V")) {
+        println!("aeril {}", env!("CARGO_PKG_VERSION"));
+        return Ok(0);
+    }
+
     let data_dir = p
         .flag("data-dir")
         .map(PathBuf::from)
@@ -142,10 +184,6 @@ fn dispatch(args: &[String], t0: Instant) -> Result<i32> {
                 .or_else(|| std::env::var("AERIL_BACKEND").ok())
                 .unwrap_or_else(|| "hermes".into());
             crate::tui::run(data_dir, db_path, backend, t0)?;
-            Ok(0)
-        }
-        Some("version") => {
-            println!("aeril {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
         Some("thread") => cmd_thread(&p, &db_path),
@@ -1442,5 +1480,44 @@ fn cmd_bench(p: &Parsed, data_dir: &Path, db_path: &Path) -> Result<i32> {
             })
         }
         other => Err(Error::invalid(format!("bench {other:?} no soportado"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_and_version_flags_do_not_require_store_or_tui() {
+        let missing_dir =
+            std::env::temp_dir().join(format!("aeril-cli-test-{}", crate::ids::new_id()));
+        let missing_str = missing_dir.to_string_lossy().into_owned();
+        let t0 = Instant::now();
+        for flag in ["help", "--help", "-h", "version", "--version", "-V"] {
+            let args = vec!["--data-dir".into(), missing_str.clone(), flag.to_string()];
+            let code = dispatch(&args, t0).expect(flag);
+            assert_eq!(code, 0, "{flag}");
+        }
+        assert!(
+            !missing_dir.exists(),
+            "help/version no debe crear directorios innecesarios"
+        );
+    }
+
+    #[test]
+    fn help_flag_after_dashdash_passes_to_subcommand() {
+        let dir = std::env::temp_dir().join(format!("aeril-cli-dd-{}", crate::ids::new_id()));
+        let t0 = Instant::now();
+        let args = vec![
+            "--data-dir".into(),
+            dir.to_string_lossy().into_owned(),
+            "validate".into(),
+            "--".into(),
+            "--help".into(),
+        ];
+        // Falla por --thread faltante en `validate`, nunca secuestrado por print_help().
+        let err = dispatch(&args, t0).unwrap_err();
+        assert!(err.to_string().contains("--thread"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

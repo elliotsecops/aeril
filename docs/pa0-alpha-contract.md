@@ -394,7 +394,7 @@ recuperación exitosa no demuestra reversibilidad de acciones externas.
 | PA0-A | Este contrato revisado y congelado antes de implementar PA0-B. | Entregado en esta rama |
 | PA0-B | Attention determinista, read-only, visible en TUI/CLI y cubierta por tests de precedencia, integridad, permisos, recovery, read-only y tamaños 80×24 / 120×40 / 180×50. | Entregado en esta rama |
 | PA0-C | Camino manual visible para integración bloqueada, sin debilitar Git. | Entregado en `main` (`2082505`, sobre `PA0-PERF-R` `8cce419`) |
-| PA0-D | Binario Linux reproducible + flujo Hermes real autenticado. | Pendiente |
+| PA0-D | Binario Linux reproducible + flujo Hermes real autenticado. | Entregado en `main` ([`docs/pa0-d-hermes-evidence.md`](pa0-d-hermes-evidence.md)) |
 | PA0-E | 3–5 desarrolladores externos ejecutan el recorrido sin asistencia. | Pendiente |
 
 PA0 no se considera cerrado por tener tests verdes. El gate de producto es el
